@@ -20,6 +20,7 @@
         translating: boolean
         retranslate: boolean
         bodyRoot?: HTMLElement|null
+        isStreaming?: boolean
         modelShortName: string
     }
 
@@ -33,6 +34,7 @@
         translating = $bindable(false),
         retranslate = $bindable(false),
         bodyRoot,
+        isStreaming = false,
         modelShortName = '',
     }: Props =  $props()
 
@@ -70,7 +72,7 @@
                 lastChatId = chatID
                 let translateText = false
                 try {
-                    if(DBState.db.autoTranslate){
+                    if(DBState.db.autoTranslate && !isStreaming){
                         if(DBState.db.autoTranslateCachedOnly && DBState.db.translatorType === 'llm'){
                             const cache = DBState.db.translateBeforeHTMLFormatting
                             ? await getLLMCache(data)
@@ -100,7 +102,7 @@
                     console.error(error)
                 }
             }
-            if(retranslate || translated){
+            if(!isStreaming && (retranslate || translated)){
                 if (DBState.db.showTranslationLoading) {
                     lastParsed = `<div style="display:flex;justify-content:center;align-items:center;height:48px;"><div style="animation: spin 1s linear infinite; border-radius: 50%; height: 32px; width: 32px; border: 2px solid #3b82f6; border-top: 2px solid transparent;"></div></div><style>@keyframes spin { to { transform: rotate(360deg); } }</style>`
                 }

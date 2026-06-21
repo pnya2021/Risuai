@@ -74,13 +74,15 @@
         }
 
         const reloadPointerMap = get(ReloadChatPointer);
+        const currentChat = currentCharacter.chats?.[currentCharacter.chatPage];
 
         for(let i=loadStart ; i >= loadEnd; i--){
             if(i < 0) break; // Prevent out of bounds
             const message = messages[i];
             const messageLargePortrait = message.role === 'user' ? (userIconPortrait ?? false) : ((currentCharacter as character).largePortrait ?? false);
             const reloadPointer = reloadPointerMap[i] ?? 0;
-            let hashd = message.data + (message.chatId ?? '') + i.toString() + messageLargePortrait.toString() + message.disabled?.toString() + reloadPointer.toString();
+            const isStreaming = currentChat?.isStreaming === true && i === messages.length - 1 && message.role === 'char';
+            let hashd = message.data + (message.chatId ?? '') + i.toString() + messageLargePortrait.toString() + message.disabled?.toString() + reloadPointer.toString() + isStreaming.toString();
             const currentHash = hashCode(hashd);
             currentHashes.add(currentHash);
             if(!hashes.has(currentHash)){
@@ -102,6 +104,7 @@
                         largePortrait: message.role === 'user' ? (userIconPortrait ?? false) : ((currentCharacter as character).largePortrait ?? false),
                         messageGenerationInfo: message.generationInfo,
                         role: message.role,
+                        isStreaming,
                         name: message.role === 'user' ? currentUsername : currentCharacter.name,
                         isComment: message.isComment ?? false,
                         disabled: message.disabled ?? false,

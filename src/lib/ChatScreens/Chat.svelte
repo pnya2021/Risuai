@@ -52,6 +52,7 @@
         currentPage?: number;
         totalPages?: number;
         isComment?: boolean;
+        isStreaming?: boolean;
         disabled?: boolean | 'allBefore';
     }
 
@@ -74,6 +75,7 @@
         currentPage = 1,
         totalPages = 1,
         isComment = false,
+        isStreaming = false,
         disabled = false,
     }: Props = $props();
 
@@ -416,6 +418,7 @@
                     {msgDisplay}
                     {name}
                     {bodyRoot}
+                    {isStreaming}
                     modelShortName={
                         messageGenerationInfo ? getModelInfo(messageGenerationInfo?.model).shortName : ''
                     }
