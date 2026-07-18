@@ -1,3 +1,11 @@
+import type { PluginApiErrorShape } from './illustration/contracts'
+import {
+    deserializePluginApiError,
+    PluginApiError,
+    serializePluginApiError,
+} from './illustration/errors'
+import { GUEST_RPC_CODEC_SCRIPT, prepareRpcMessage } from './illustration/rpcCodec'
+
 type MsgType =
     | 'CALL_ROOT'
     | 'CALL_INSTANCE'
@@ -5,7 +13,21 @@ type MsgType =
     | 'CALLBACK_RETURN'
     | 'RESPONSE'
     | 'RELEASE_INSTANCE'
-    | 'ABORT_SIGNAL';
+    | 'RELEASE_CALLBACK'
+    | 'ABORT_SIGNAL'
+    | 'EXECUTE_CODE'
+    | 'EXEC_RESULT'
+    | 'TERMINATE'
+    | 'TERMINATE_ACK';
+
+const RPC_MESSAGE_TYPES = new Set<string>([
+    'CALL_ROOT', 'CALL_INSTANCE', 'INVOKE_CALLBACK', 'CALLBACK_RETURN',
+    'RESPONSE', 'RELEASE_INSTANCE', 'RELEASE_CALLBACK', 'ABORT_SIGNAL',
+    'EXECUTE_CODE', 'EXEC_RESULT', 'TERMINATE', 'TERMINATE_ACK'
+]);
+
+const rpcLogType = (value: unknown) =>
+    typeof value === 'string' && RPC_MESSAGE_TYPES.has(value) ? value : 'UNKNOWN';
 
 interface RpcMessage {
     type: MsgType;
@@ -14,7 +36,7 @@ interface RpcMessage {
     method?: string;
     args?: any[];
     result?: any;
-    error?: string;
+    error?: PluginApiErrorShape;
     abortId?: string;
 }
 
@@ -34,24 +56,475 @@ interface AbortSignalRef {
     aborted: boolean;
 }
 
+type CallbackWrapper = ((...args: any[]) => Promise<any>) & { release: () => void };
+
+interface CallbackWrapperEntry {
+    wrapper: CallbackWrapper;
+    refCount: number;
+}
+
+const NESTED_WORKER_GUARD_SOURCE = `
+(() => {
+    const deny = (name) => {
+        const error = new Error(name + ' is unavailable inside a plugin Worker');
+        error.name = 'PluginApiError';
+        error.code = 'UNSUPPORTED';
+        error.retryable = false;
+        throw error;
+    };
+    function Worker() { deny('Worker'); }
+    function SharedWorker() { deny('SharedWorker'); }
+    Object.freeze(Worker.prototype);
+    Object.freeze(SharedWorker.prototype);
+    Object.freeze(Worker);
+    Object.freeze(SharedWorker);
+    Object.defineProperty(globalThis, 'Worker', { value: Worker, writable: false, configurable: false });
+    Object.defineProperty(globalThis, 'SharedWorker', { value: SharedWorker, writable: false, configurable: false });
+})();
+`;
+
 
 const GUEST_BRIDGE_SCRIPT = `
 await (async function() {
     const pendingRequests = new Map();
     const callbackRegistry = new Map();
     const callbackIdByFunction = new WeakMap();
+    const callbackRefCounts = new Map();
     const proxyRefRegistry = new Map();
     const abortControllers = new Map();
+
+    const pluginApiErrorCodes = new Set([
+        'UNSUPPORTED', 'PERMISSION_DENIED', 'NOT_FOUND', 'INVALID_ARGUMENT',
+        'ABORTED', 'QUOTA_EXCEEDED', 'RESOURCE_LIMIT', 'CONFLICT', 'NETWORK',
+        'INTEGRITY_MISMATCH', 'DECODE_FAILED', 'PROVIDER_ERROR', 'INTERNAL'
+    ]);
+    const missingErrorDataProperty = Symbol('missingErrorDataProperty');
+    const nativeObjectEntries = Object.entries;
+    const nativeObjectGetOwnPropertyDescriptor = Object.getOwnPropertyDescriptor;
+    const nativeObjectGetOwnPropertyDescriptors = Object.getOwnPropertyDescriptors;
+    const nativeArrayIsArray = Array.isArray;
+
+    function internalPluginError() {
+        return { name: 'PluginApiError', code: 'INTERNAL', message: 'Internal plugin API error', retryable: false };
+    }
+
+    function ownErrorDataProperty(value, key) {
+        const descriptor = nativeObjectGetOwnPropertyDescriptor(value, key);
+        if (!descriptor || !('value' in descriptor)) return missingErrorDataProperty;
+        return descriptor.value;
+    }
+
+    function snapshotPluginError(value) {
+        try {
+            if (!value || typeof value !== 'object') return null;
+
+            const name = ownErrorDataProperty(value, 'name');
+            const code = ownErrorDataProperty(value, 'code');
+            const message = ownErrorDataProperty(value, 'message');
+            const retryable = ownErrorDataProperty(value, 'retryable');
+            if (name !== 'PluginApiError'
+                || typeof code !== 'string'
+                || !pluginApiErrorCodes.has(code)
+                || typeof message !== 'string'
+                || typeof retryable !== 'boolean') return null;
+
+            const retryAfterMs = ownErrorDataProperty(value, 'retryAfterMs');
+            if (retryAfterMs !== missingErrorDataProperty
+                && retryAfterMs !== undefined
+                && typeof retryAfterMs !== 'number') return null;
+
+            const detailsValue = ownErrorDataProperty(value, 'details');
+            let details;
+            if (detailsValue !== missingErrorDataProperty && detailsValue !== undefined) {
+                if (!detailsValue || typeof detailsValue !== 'object' || nativeArrayIsArray(detailsValue)) return null;
+                details = {};
+                const descriptors = nativeObjectGetOwnPropertyDescriptors(detailsValue);
+                for (const [key, descriptor] of nativeObjectEntries(descriptors)) {
+                    if (!descriptor.enumerable) continue;
+                    if (!('value' in descriptor)) return null;
+                    const detail = descriptor.value;
+                    if (!['string', 'number', 'boolean'].includes(typeof detail)) return null;
+                    details[key] = detail;
+                }
+            }
+
+            const shape = { name: 'PluginApiError', code, message, retryable };
+            if (retryAfterMs !== missingErrorDataProperty && retryAfterMs !== undefined) {
+                shape.retryAfterMs = retryAfterMs;
+            }
+            if (details !== undefined) shape.details = details;
+            return shape;
+        } catch {
+            return null;
+        }
+    }
+
+    function isPluginApiErrorShape(value) {
+        return snapshotPluginError(value) !== null;
+    }
+
+    function serializePluginError(error) {
+        return snapshotPluginError(error) || internalPluginError();
+    }
+
+    function deserializePluginError(value) {
+        const shape = serializePluginError(value);
+        const error = new Error(shape.message);
+        error.name = 'PluginApiError';
+        error.code = shape.code;
+        error.retryable = shape.retryable;
+        if (shape.retryAfterMs !== undefined) error.retryAfterMs = shape.retryAfterMs;
+        if (shape.details !== undefined) error.details = { ...shape.details };
+        return error;
+    }
+
+    function makePluginError(code, message, details) {
+        return deserializePluginError({
+            name: 'PluginApiError',
+            code,
+            message,
+            retryable: false,
+            ...(details ? { details } : {})
+        });
+    }
+
+    ${GUEST_RPC_CODEC_SCRIPT}
+
+    const NativeWorker = globalThis.Worker;
+    const NativeBlob = globalThis.Blob;
+    const NativeEventTarget = globalThis.EventTarget;
+    const NativeMessageEvent = globalThis.MessageEvent;
+    const NativeErrorEvent = globalThis.ErrorEvent;
+    const NativeUint32Array = globalThis.Uint32Array;
+    const nativeReflectApply = Reflect.apply;
+    const nativeJsonStringify = JSON.stringify;
+    const nativeNumberToString = Number.prototype.toString;
+    const nativeCreateObjectURL = URL.createObjectURL.bind(URL);
+    const nativeRevokeObjectURL = URL.revokeObjectURL.bind(URL);
+    const nativeGetRandomValues = globalThis.crypto && typeof globalThis.crypto.getRandomValues === 'function'
+        ? globalThis.crypto.getRandomValues.bind(globalThis.crypto)
+        : null;
+    const nativeBlobSizeGetter = NativeBlob
+        ? Object.getOwnPropertyDescriptor(NativeBlob.prototype, 'size')?.get
+        : null;
+    const nativeWorkerPrototype = typeof NativeWorker === 'function' ? NativeWorker.prototype : null;
+    const nativeWorkerTerminate = nativeWorkerPrototype?.terminate;
+    const nativeWorkerPostMessage = nativeWorkerPrototype?.postMessage;
+    const nativeWorkerAddEventListener = nativeWorkerPrototype?.addEventListener;
+    const nativeWorkerRemoveEventListener = nativeWorkerPrototype?.removeEventListener;
+    const nativeEventTargetAddEventListener = NativeEventTarget.prototype.addEventListener;
+    const nativeEventTargetRemoveEventListener = NativeEventTarget.prototype.removeEventListener;
+    const nativeEventTargetDispatchEvent = NativeEventTarget.prototype.dispatchEvent;
+    const trackedBlobUrls = new Map();
+    const activeWorkers = new Map();
+    const workerStates = new WeakMap();
+    const MAX_DIRECT_WORKERS = 4;
+    const MAX_DIRECT_WORKER_BYTES = 8 * 1024 * 1024;
+    let activeWorkerBytes = 0;
+    let workerControlCounter = 0;
+
+    function createWorkerControlToken() {
+        if (!nativeGetRandomValues) {
+            throw makePluginError('UNSUPPORTED', 'Secure Worker control tokens are unavailable');
+        }
+        const words = new NativeUint32Array(4);
+        nativeGetRandomValues(words);
+        workerControlCounter += 1;
+        let token = nativeReflectApply(nativeNumberToString, workerControlCounter, [36]);
+        for (let index = 0; index < words.length; index += 1) {
+            token += '-' + nativeReflectApply(nativeNumberToString, words[index], [36]);
+        }
+        return token;
+    }
+
+    function createWorkerCloseGuardSource(controlToken) {
+        const tokenLiteral = nativeJsonStringify(controlToken);
+        return '(() => {\\n'
+            + '    const controlToken = ' + tokenLiteral + ';\\n'
+            + '    const nativeClose = globalThis.close.bind(globalThis);\\n'
+            + '    const nativePostMessage = globalThis.postMessage.bind(globalThis);\\n'
+            + '    let controlSent = false;\\n'
+            + '    const safeClose = () => {\\n'
+            + '        if (!controlSent) {\\n'
+            + '            controlSent = true;\\n'
+            + '            nativePostMessage({ __risuWorkerControl: controlToken, action: "close" });\\n'
+            + '        }\\n'
+            + '        nativeClose();\\n'
+            + '    };\\n'
+            + '    Object.freeze(safeClose);\\n'
+            + '    Object.defineProperty(globalThis, "close", { value: safeClose, writable: false, configurable: false });\\n'
+            + '})();\\n';
+    }
+
+    function nativeBlobSize(value) {
+        if (!nativeBlobSizeGetter) return null;
+        try {
+            const size = nativeReflectApply(nativeBlobSizeGetter, value, []);
+            return typeof size === 'number' && size >= 0 ? size : null;
+        } catch {
+            return null;
+        }
+    }
+
+    function getWorkerState(worker) {
+        const state = workerStates.get(worker);
+        if (!state) throw new TypeError('Illegal invocation');
+        return state;
+    }
+
+    function setWorkerEventHandler(worker, type, value) {
+        const state = getWorkerState(worker);
+        const previous = state.eventHandlers[type];
+        if (previous) {
+            nativeReflectApply(nativeEventTargetRemoveEventListener, worker, [type, previous]);
+        }
+        const next = typeof value === 'function' ? value : null;
+        state.eventHandlers[type] = next;
+        if (next) {
+            nativeReflectApply(nativeEventTargetAddEventListener, worker, [type, next]);
+        }
+    }
+
+    function createForwardedWorkerEvent(event) {
+        if (event.type === 'error') {
+            return new NativeErrorEvent('error', {
+                message: event.message,
+                filename: event.filename,
+                lineno: event.lineno,
+                colno: event.colno,
+                error: event.error,
+                cancelable: event.cancelable
+            });
+        }
+        return new NativeMessageEvent(event.type, {
+            data: event.data,
+            origin: event.origin,
+            lastEventId: event.lastEventId,
+            source: event.source,
+            ports: event.ports
+        });
+    }
+
+    function forwardNativeWorkerEvent(worker, event) {
+        const record = activeWorkers.get(worker);
+        if (!record) return;
+        if (event.type === 'message'
+            && event.data
+            && event.data.__risuWorkerControl === record.controlToken
+            && event.data.action === 'close') {
+            if (!record.controlConsumed) {
+                record.controlConsumed = true;
+                releaseWorker(worker, true);
+            }
+            return;
+        }
+        const forwarded = createForwardedWorkerEvent(event);
+        const allowed = nativeReflectApply(nativeEventTargetDispatchEvent, worker, [forwarded]);
+        if (event.type === 'error' && !allowed) event.preventDefault();
+    }
+
+    function releaseWorker(worker, terminate) {
+        const record = activeWorkers.get(worker);
+        if (!record) return;
+        activeWorkers.delete(worker);
+        activeWorkerBytes -= record.payloadBytes;
+        if (activeWorkerBytes < 0) activeWorkerBytes = 0;
+        record.source.workers.delete(worker);
+        for (const [type, listener] of record.forwarders) {
+            try {
+                nativeReflectApply(nativeWorkerRemoveEventListener, record.nativeWorker, [type, listener]);
+            } catch { /* already detached */ }
+        }
+        const state = workerStates.get(worker);
+        if (state) {
+            state.released = true;
+            state.nativePostMessage = null;
+        }
+        if (terminate) {
+            try { record.nativeTerminate(); } catch { /* already terminated */ }
+        }
+        try { nativeRevokeObjectURL(record.bootstrapUrl); } catch { /* already revoked */ }
+    }
+
+    function revokeTrackedObjectURL(url) {
+        const key = String(url);
+        const source = trackedBlobUrls.get(key);
+        if (source) {
+            for (const worker of [...source.workers]) releaseWorker(worker, true);
+            trackedBlobUrls.delete(key);
+        }
+        nativeRevokeObjectURL(key);
+    }
+
+    function cleanupPluginWorkers() {
+        for (const worker of [...activeWorkers.keys()]) releaseWorker(worker, true);
+        for (const url of [...trackedBlobUrls.keys()]) {
+            try { nativeRevokeObjectURL(url); } catch { /* already revoked */ }
+        }
+        trackedBlobUrls.clear();
+        activeWorkerBytes = 0;
+    }
+
+    Object.defineProperty(URL, 'createObjectURL', {
+        configurable: false,
+        writable: false,
+        value(object) {
+            const url = nativeCreateObjectURL(object);
+            const payloadBytes = nativeBlobSize(object);
+            if (payloadBytes !== null) {
+                trackedBlobUrls.set(url, { blob: object, payloadBytes, workers: new Set() });
+            }
+            return url;
+        }
+    });
+    Object.defineProperty(URL, 'revokeObjectURL', {
+        configurable: false,
+        writable: false,
+        value: revokeTrackedObjectURL
+    });
+
+    class WorkerFacade extends NativeEventTarget {}
+
+    function SafeWorker(scriptURL, options) {
+        if (!new.target) throw new TypeError("Failed to construct 'Worker': Please use the 'new' operator");
+        if (typeof NativeWorker !== 'function'
+            || typeof nativeWorkerTerminate !== 'function'
+            || typeof nativeWorkerPostMessage !== 'function') {
+            throw makePluginError('UNSUPPORTED', 'Worker is unavailable');
+        }
+        const sourceUrl = String(scriptURL);
+        const source = trackedBlobUrls.get(sourceUrl);
+        if (!source) throw makePluginError('INVALID_ARGUMENT', 'Worker entry must be a tracked Blob URL');
+        if (activeWorkers.size >= MAX_DIRECT_WORKERS) {
+            throw makePluginError('RESOURCE_LIMIT', 'Direct Worker limit exceeded', { limit: MAX_DIRECT_WORKERS });
+        }
+        if (activeWorkerBytes + source.payloadBytes > MAX_DIRECT_WORKER_BYTES) {
+            throw makePluginError('RESOURCE_LIMIT', 'Direct Worker initial payload limit exceeded', {
+                limitBytes: MAX_DIRECT_WORKER_BYTES,
+                activeBytes: activeWorkerBytes
+            });
+        }
+
+        const controlToken = createWorkerControlToken();
+        const closeGuardSource = createWorkerCloseGuardSource(controlToken);
+        const nestedWorkerGuardSource = ${JSON.stringify(NESTED_WORKER_GUARD_SOURCE)};
+        const bootstrapUrl = nativeCreateObjectURL(new NativeBlob([
+            closeGuardSource,
+            nestedWorkerGuardSource,
+            '\\n',
+            source.blob
+        ], { type: 'text/javascript' }));
+        let nativeWorker;
+        try {
+            nativeWorker = new NativeWorker(bootstrapUrl, options);
+        } catch (error) {
+            nativeRevokeObjectURL(bootstrapUrl);
+            throw error;
+        }
+
+        const worker = new WorkerFacade();
+        const state = {
+            eventHandlers: { message: null, messageerror: null, error: null },
+            nativePostMessage: (message, transferOrOptions, hasSecondArgument) => nativeReflectApply(
+                nativeWorkerPostMessage,
+                nativeWorker,
+                hasSecondArgument ? [message, transferOrOptions] : [message]
+            ),
+            released: false
+        };
+        workerStates.set(worker, state);
+        const forwarders = [
+            ['message', (event) => forwardNativeWorkerEvent(worker, event)],
+            ['messageerror', (event) => forwardNativeWorkerEvent(worker, event)],
+            ['error', (event) => forwardNativeWorkerEvent(worker, event)]
+        ];
+        try {
+            for (const [type, listener] of forwarders) {
+                nativeReflectApply(nativeWorkerAddEventListener, nativeWorker, [type, listener]);
+            }
+        } catch (error) {
+            try { nativeReflectApply(nativeWorkerTerminate, nativeWorker, []); } catch { /* construction cleanup */ }
+            nativeRevokeObjectURL(bootstrapUrl);
+            throw error;
+        }
+
+        activeWorkerBytes += source.payloadBytes;
+        activeWorkers.set(worker, {
+            bootstrapUrl,
+            controlConsumed: false,
+            controlToken,
+            forwarders,
+            nativeTerminate: () => nativeReflectApply(nativeWorkerTerminate, nativeWorker, []),
+            nativeWorker,
+            payloadBytes: source.payloadBytes,
+            source
+        });
+        source.workers.add(worker);
+        return worker;
+    }
+
+    Object.defineProperties(WorkerFacade.prototype, {
+        constructor: { configurable: false, writable: false, value: SafeWorker },
+        postMessage: {
+            configurable: false,
+            writable: false,
+            value(message, transferOrOptions) {
+                const state = getWorkerState(this);
+                if (state.released || !state.nativePostMessage) return undefined;
+                return state.nativePostMessage(message, transferOrOptions, arguments.length > 1);
+            }
+        },
+        terminate: {
+            configurable: false,
+            writable: false,
+            value() { releaseWorker(this, true); }
+        },
+        onmessage: {
+            configurable: false,
+            get() { return getWorkerState(this).eventHandlers.message; },
+            set(value) { setWorkerEventHandler(this, 'message', value); }
+        },
+        onmessageerror: {
+            configurable: false,
+            get() { return getWorkerState(this).eventHandlers.messageerror; },
+            set(value) { setWorkerEventHandler(this, 'messageerror', value); }
+        },
+        onerror: {
+            configurable: false,
+            get() { return getWorkerState(this).eventHandlers.error; },
+            set(value) { setWorkerEventHandler(this, 'error', value); }
+        }
+    });
+    Object.defineProperty(SafeWorker, 'prototype', {
+        configurable: false,
+        writable: false,
+        value: WorkerFacade.prototype
+    });
+    Object.freeze(WorkerFacade.prototype);
+    Object.freeze(SafeWorker);
+
+    function SafeSharedWorker() {
+        throw makePluginError('UNSUPPORTED', 'SharedWorker is unavailable in the plugin sandbox');
+    }
+    Object.freeze(SafeSharedWorker.prototype);
+    Object.freeze(SafeSharedWorker);
+    Object.defineProperty(globalThis, 'Worker', { value: SafeWorker, writable: false, configurable: false });
+    Object.defineProperty(globalThis, 'SharedWorker', { value: SafeSharedWorker, writable: false, configurable: false });
+    addEventListener('pagehide', cleanupPluginWorkers, { once: true });
+    addEventListener('unload', cleanupPluginWorkers, { once: true });
 
     function serializeArg(arg) {
         if (typeof arg === 'function') {
             const existingId = callbackIdByFunction.get(arg);
             if (existingId) {
+                callbackRegistry.set(existingId, arg);
+                callbackRefCounts.set(existingId, (callbackRefCounts.get(existingId) || 0) + 1);
                 return { __type: 'CALLBACK_REF', id: existingId };
             }
             const id = 'cb_' + Math.random().toString(36).substring(2);
             callbackRegistry.set(id, arg);
             callbackIdByFunction.set(arg, id);
+            callbackRefCounts.set(id, 1);
             return { __type: 'CALLBACK_REF', id: id };
         }
         if (arg && typeof arg === 'object') {
@@ -113,30 +586,9 @@ await (async function() {
         return val;
     }
 
-    function collectTransferables(obj, transferables = []) {
-        if (!obj || typeof obj !== 'object') return transferables;
-
-        if (obj instanceof ArrayBuffer ||
-            obj instanceof MessagePort ||
-            obj instanceof ImageBitmap ||
-            (typeof OffscreenCanvas !== 'undefined' && obj instanceof OffscreenCanvas)) {
-            transferables.push(obj);
-        }
-        else if (ArrayBuffer.isView(obj) && obj.buffer instanceof ArrayBuffer) {
-            transferables.push(obj.buffer);
-        }
-        else if (Array.isArray(obj)) {
-            obj.forEach(item => collectTransferables(item, transferables));
-        }
-        else if (obj.constructor === Object) {
-            Object.values(obj).forEach(value => collectTransferables(value, transferables));
-        }
-
-        return transferables;
-    }
-
-    function send(payload, transferables = []) {
-        window.parent.postMessage(payload, '*', transferables);
+    function send(payload) {
+        const prepared = rpcPrepareMessage(payload);
+        window.parent.postMessage(prepared.message, '*', prepared.transferables);
     }
 
     function sendRequest(type, payload) {
@@ -150,8 +602,12 @@ await (async function() {
             }
 
             const message = { type: type, reqId: reqId, ...payload };
-            const transferables = collectTransferables(message);
-            send(message, transferables);
+            try {
+                send(message);
+            } catch {
+                pendingRequests.delete(reqId);
+                reject(deserializePluginError(undefined));
+            }
         });
     }
 
@@ -159,6 +615,7 @@ await (async function() {
     
     
     window.addEventListener('message', async (event) => {
+        if (event.source !== window.parent) return;
         const data = event.data;
         if (!data) return;
 
@@ -166,7 +623,7 @@ await (async function() {
         if (data.type === 'RESPONSE' && data.reqId) {
             const req = pendingRequests.get(data.reqId);
             if (req) {
-                if (data.error) req.reject(new Error(data.error));
+                if (data.error) req.reject(deserializePluginError(data.error));
                 else req.resolve(deserializeResult(data.result));
                 pendingRequests.delete(data.reqId);
             }
@@ -178,9 +635,13 @@ await (async function() {
                 const result = await eval('(async () => {' + data.code + '})()');
                 response.result = result;
             } catch (e) {
-                response.error = e.message || String(e);
+                response.error = serializePluginError(e);
             }
-            send(response);
+            try {
+                send(response);
+            } catch {
+                send({ type: 'EXEC_RESULT', reqId: data.reqId, error: serializePluginError(undefined) });
+            }
         }
 
         else if (data.type === 'ABORT_SIGNAL' && data.abortId) {
@@ -191,13 +652,23 @@ await (async function() {
             }
         }
 
+        else if (data.type === 'RELEASE_CALLBACK' && data.id) {
+            const refCount = callbackRefCounts.get(data.id) || 0;
+            if (refCount <= 1) {
+                callbackRefCounts.delete(data.id);
+                callbackRegistry.delete(data.id);
+            } else {
+                callbackRefCounts.set(data.id, refCount - 1);
+            }
+        }
+
         else if (data.type === 'INVOKE_CALLBACK' && data.id) {
             const fn = callbackRegistry.get(data.id);
             const response = { type: 'CALLBACK_RETURN', reqId: data.reqId };
             const usedAbortIds = [];
 
             try {
-                if (!fn) throw new Error("Callback not found or released");
+                if (!fn) throw makePluginError('NOT_FOUND', 'Callback not found or released');
                 const deserializedArgs = (data.args || []).map(function(a) {
                     if (a && typeof a === 'object' && a.__type === 'ABORT_SIGNAL_REF') {
                         const controller = new AbortController();
@@ -211,14 +682,29 @@ await (async function() {
                 const result = await fn(...deserializedArgs);
                 response.result = result;
             } catch (e) {
-                response.error = e.message || "Guest callback error";
+                response.error = serializePluginError(e);
             }
             // Clean up abort controllers after callback completes
             for (const id of usedAbortIds) {
                 abortControllers.delete(id);
             }
-            const transferables = collectTransferables(response);
-            send(response, transferables);
+            try {
+                send(response);
+            } catch {
+                send({ type: 'CALLBACK_RETURN', reqId: data.reqId, error: serializePluginError(undefined) });
+            }
+        }
+
+        else if (data.type === 'TERMINATE') {
+            const terminationError = makePluginError('ABORTED', 'Plugin sandbox terminated');
+            for (const pending of pendingRequests.values()) pending.reject(terminationError);
+            pendingRequests.clear();
+            for (const controller of abortControllers.values()) controller.abort();
+            abortControllers.clear();
+            callbackRegistry.clear();
+            callbackRefCounts.clear();
+            cleanupPluginWorkers();
+            try { send({ type: 'TERMINATE_ACK' }); } catch { /* iframe is being removed */ }
         }
     });
 
@@ -241,7 +727,6 @@ await (async function() {
     try {
         // Initialize cached properties
         const propsToInit = await window.risuai._getPropertiesForInitialization();
-        console.log('Initializing risuai properties:', JSON.stringify(propsToInit.list));
         for (let i = 0; i < propsToInit.list.length; i++) {
             const key = propsToInit.list[i];
             const value = propsToInit[key];
@@ -274,7 +759,7 @@ await (async function() {
             return result;
         });
     } catch (e) {
-        console.error('Failed to initialize risuai properties:', e);
+        console.error('[V3 RPC] guest initialization failed');
     }
 
     window.initOldApiGlobal = () => {
@@ -289,81 +774,82 @@ await (async function() {
 `;
 
 export class SandboxHost {
-    private iframe: HTMLIFrameElement;
+    private iframe!: HTMLIFrameElement;
     private apiFactory: any;
     private nonce = crypto.randomUUID();
-    private csp = `connect-src 'none'; script-src 'nonce-${this.nonce}' 'wasm-unsafe-eval'; frame-src 'none'; object-src 'none'; style-src * 'unsafe-inline'; default-src 'none'; img-src * data: blob:; font-src * data: blob:; media-src * data: blob:; base-uri 'none';`;
+    private csp = `connect-src 'none'; script-src 'nonce-${this.nonce}' 'wasm-unsafe-eval'; worker-src blob:; frame-src 'none'; object-src 'none'; style-src * 'unsafe-inline'; default-src 'none'; img-src * data: blob:; font-src * data: blob:; media-src * data: blob:; base-uri 'none';`;
 
     private instanceRegistry = new Map<string, any>();
     private abortControllers = new Map<string, AbortController>();
-    private callbackWrapperCache = new Map<string, Function>();
-
-    private pendingCallbacks = new Map<string, { resolve: Function, reject: Function }>();
+    private callbackWrapperCache = new Map<string, CallbackWrapperEntry>();
+    private pendingCallbacks = new Map<string, { resolve: (value: any) => void, reject: (reason?: any) => void }>();
+    private pendingExecutions = new Map<string, { resolve: (value: any) => void, reject: (reason?: any) => void }>();
+    private messageHandler?: (event: MessageEvent) => void;
+    private terminated = false;
+    private runGeneration = 0;
 
     constructor(apiFactory: any) {
         this.apiFactory = apiFactory;
     }
 
     public executeInIframe(code: string): Promise<any> {
+        if (this.terminated || !this.iframe?.contentWindow) {
+            return Promise.reject(new PluginApiError('ABORTED', 'Plugin sandbox terminated'));
+        }
         return new Promise((resolve, reject) => {
             const reqId = 'exec_' + Math.random().toString(36).substring(2);
-
-            const handler = (event: MessageEvent) => {
-                if (event.source !== this.iframe.contentWindow) return;
-                const data = event.data;
-
-                if (data.type === 'EXEC_RESULT' && data.reqId === reqId) {
-                    window.removeEventListener('message', handler);
-                    if (data.error) {
-                        reject(new Error(data.error));
-                    } else {
-                        resolve(data.result);
-                    }
-                }
-            };
-
-            window.addEventListener('message', handler);
-
-            this.iframe.contentWindow?.postMessage({
-                type: 'EXECUTE_CODE',
-                reqId,
-                code
-            }, '*');
+            this.pendingExecutions.set(reqId, { resolve, reject });
+            try {
+                this.postToGuest({ type: 'EXECUTE_CODE', reqId, code } as RpcMessage & { code: string });
+            } catch {
+                this.pendingExecutions.delete(reqId);
+                reject(deserializePluginApiError(undefined));
+            }
         });
     }
 
-    private collectTransferables(obj: any, transferables: Transferable[] = []): Transferable[] {
-        if (!obj || typeof obj !== 'object') return transferables;
+    private postToGuest(message: RpcMessage | (RpcMessage & Record<string, unknown>)) {
+        const target = this.iframe?.contentWindow;
+        if (!target) throw new PluginApiError('ABORTED', 'Plugin sandbox terminated');
+        const prepared = prepareRpcMessage(message);
+        console.log('[V3 RPC]', {
+            direction: 'host-to-guest',
+            type: rpcLogType(message.type),
+            transferCount: prepared.transferables.length,
+        });
+        target.postMessage(prepared.message, '*', prepared.transferables);
+    }
 
-        if (obj instanceof ArrayBuffer ||
-            obj instanceof MessagePort ||
-            obj instanceof ImageBitmap ||
-            obj instanceof ReadableStream ||
-            obj instanceof WritableStream ||
-            obj instanceof TransformStream ||
-            (typeof OffscreenCanvas !== 'undefined' && obj instanceof OffscreenCanvas)) {
-            transferables.push(obj);
-        }
-        else if (ArrayBuffer.isView(obj) && obj.buffer instanceof ArrayBuffer) {
-            transferables.push(obj.buffer);
-        }
-        else if (Array.isArray(obj)) {
-            obj.forEach(item => this.collectTransferables(item, transferables));
-        }
-        else if (obj.constructor === Object) {
-            Object.values(obj).forEach(value => this.collectTransferables(value, transferables));
-        }
+    private isCurrentRun(runGeneration: number) {
+        return !this.terminated && this.runGeneration === runGeneration;
+    }
 
-        return transferables;
+    private postResponse(response: RpcMessage, runGeneration: number) {
+        if (!this.isCurrentRun(runGeneration)) return;
+        try {
+            this.postToGuest(response);
+        } catch {
+            if (!this.isCurrentRun(runGeneration)) return;
+            try {
+                this.postToGuest({
+                    type: response.type,
+                    reqId: response.reqId,
+                    error: serializePluginApiError(undefined),
+                });
+            } catch {
+                console.error('[V3 RPC] postMessage failed', { type: response.type });
+            }
+        }
     }
 
 
-    private serialize(val: any): any {
+    private serialize(val: any, runGeneration?: number): any {
         if (
             val &&
             (typeof val === 'object' || typeof val === 'function') &&
             val.__classType === 'REMOTE_REQUIRED'
         ) {
+            if (runGeneration !== undefined && !this.isCurrentRun(runGeneration)) return undefined;
             if (val === null) return null;
             if (Array.isArray(val)) return val;
 
@@ -401,15 +887,21 @@ export class SandboxHost {
     }
 
 
-    private deserializeArgs(args: any[], usedAbortIds?: string[]) {
+    private deserializeArgs(args: any[], usedAbortIds?: string[], runGeneration = this.runGeneration) {
         return args.map(arg => {
             if (arg && arg.__type === 'CALLBACK_REF') {
                 const cbRef = arg as CallbackRef;
 
                 const cached = this.callbackWrapperCache.get(cbRef.id);
-                if (cached) return cached;
+                if (cached) {
+                    cached.refCount += 1;
+                    return cached.wrapper;
+                }
 
-                const wrapper = async (...innerArgs: any[]) => {
+                const wrapper = (async (...innerArgs: any[]) => {
+                    if (!this.isCurrentRun(runGeneration)) {
+                        throw new PluginApiError('ABORTED', 'Plugin sandbox terminated');
+                    }
                     return new Promise((resolve, reject) => {
                         const reqId = 'cb_req_' + Math.random().toString(36).substring(2);
                         this.pendingCallbacks.set(reqId, { resolve, reject });
@@ -427,11 +919,12 @@ export class SandboxHost {
                                 };
                                 if (!arg.aborted) {
                                     arg.addEventListener('abort', () => {
+                                        if (!this.isCurrentRun(runGeneration)) return;
                                         try {
-                                            this.iframe.contentWindow?.postMessage({
+                                            this.postToGuest({
                                                 type: 'ABORT_SIGNAL',
                                                 abortId
-                                            } as RpcMessage, '*');
+                                            });
                                         } catch (_) { /* iframe already removed */ }
                                     }, { once: true });
                                 }
@@ -446,11 +939,24 @@ export class SandboxHost {
                             reqId,
                             args: sanitizedArgs
                         };
-                        const transferables = this.collectTransferables(message);
-                        this.iframe.contentWindow?.postMessage(message, '*', transferables);
+                        try {
+                            this.postToGuest(message as RpcMessage);
+                        } catch {
+                            this.pendingCallbacks.delete(reqId);
+                            reject(deserializePluginApiError(undefined));
+                        }
                     });
+                }) as CallbackWrapper;
+                wrapper.release = () => {
+                    const entry = this.callbackWrapperCache.get(cbRef.id);
+                    if (!entry || entry.wrapper !== wrapper || entry.refCount <= 0) return;
+                    entry.refCount -= 1;
+                    try { this.postToGuest({ type: 'RELEASE_CALLBACK', id: cbRef.id }); } catch { /* unloading */ }
+                    if (entry.refCount === 0 && this.callbackWrapperCache.get(cbRef.id)?.wrapper === wrapper) {
+                        this.callbackWrapperCache.delete(cbRef.id);
+                    }
                 };
-                this.callbackWrapperCache.set(cbRef.id, wrapper);
+                this.callbackWrapperCache.set(cbRef.id, { wrapper, refCount: 1 });
                 return wrapper;
             }
             if (arg && arg.__type === 'REMOTE_REF') {
@@ -501,15 +1007,31 @@ export class SandboxHost {
 
         this.iframe.setAttribute('csp', this.csp);
 
+        this.terminated = false;
+        const runGeneration = ++this.runGeneration;
         const messageHandler = async (event: MessageEvent) => {
+            if (!this.isCurrentRun(runGeneration)) return;
             if (event.source !== this.iframe.contentWindow) return;
             const data = event.data as RpcMessage;
+            if (!data || typeof data !== 'object') return;
+
+            console.log('[V3 RPC]', { direction: 'guest-to-host', type: rpcLogType(data.type) });
+
+            if (data.type === 'EXEC_RESULT') {
+                const pending = this.pendingExecutions.get(data.reqId!);
+                if (pending) {
+                    this.pendingExecutions.delete(data.reqId!);
+                    if (data.error) pending.reject(deserializePluginApiError(data.error));
+                    else pending.resolve(data.result);
+                }
+                return;
+            }
 
 
             if (data.type === 'CALLBACK_RETURN') {
                 const req = this.pendingCallbacks.get(data.reqId!);
                 if (req) {
-                    if (data.error) req.reject(new Error(data.error));
+                    if (data.error) req.reject(deserializePluginApiError(data.error));
                     else req.resolve(data.result);
                     this.pendingCallbacks.delete(data.reqId!);
                 }
@@ -538,46 +1060,37 @@ export class SandboxHost {
 
                 try {
 
-                    const args = this.deserializeArgs(data.args || [], usedAbortIds);
+                    const args = this.deserializeArgs(data.args || [], usedAbortIds, runGeneration);
                     let result: any;
 
 
                     if (data.type === 'CALL_ROOT') {
                         const fn = this.apiFactory[data.method!];
-                        if (typeof fn !== 'function') throw new Error(`API method ${data.method} not found`);
+                        if (typeof fn !== 'function') throw new PluginApiError('NOT_FOUND', 'API method not found');
                         result = await fn(...args);
                     } else {
                         const instance = this.instanceRegistry.get(data.id!);
-                        if (!instance) throw new Error("Instance not found or released");
-                        if (typeof instance[data.method!] !== 'function') throw new Error(`Method ${data.method} missing on instance`);
+                        if (!instance) throw new PluginApiError('NOT_FOUND', 'Instance not found or released');
+                        if (typeof instance[data.method!] !== 'function') throw new PluginApiError('NOT_FOUND', 'Instance method not found');
                         result = await instance[data.method!](...args);
                     }
 
+                    if (!this.isCurrentRun(runGeneration)) return;
 
-                    response.result = this.serialize(result);
+                    response.result = this.serialize(result, runGeneration);
 
                 } catch (err: any) {
-                    response.error = err.message || "Host execution error";
+                    if (!this.isCurrentRun(runGeneration)) return;
+                    response.error = serializePluginApiError(err);
                 } finally {
                     for (const id of usedAbortIds) this.abortControllers.delete(id);
                 }
 
-                const transferables = this.collectTransferables(response);
-                console.log("Original request:", data);
-                console.log('Original response:', response, transferables);
-                try {
-                    this.iframe.contentWindow?.postMessage(response, '*', transferables);                    
-                } catch (error) {
-                    this.iframe.contentWindow?.postMessage({
-                        type: 'RESPONSE',
-                        reqId: data.reqId,
-                        error: 'Failed to post message to iframe: ' + (error as Error).message
-                    }, '*');
-                    console.error('Failed to post message to iframe:', error);
-                }
+                if (this.isCurrentRun(runGeneration)) this.postResponse(response, runGeneration);
             }
         };
 
+        this.messageHandler = messageHandler;
         window.addEventListener('message', messageHandler);
 
 
@@ -610,22 +1123,26 @@ export class SandboxHost {
 
         this.iframe.srcdoc = html;
 
-        return () => {
-            window.removeEventListener('message', messageHandler);
-            this.iframe.remove();
-            this.instanceRegistry.clear();
-            this.pendingCallbacks.clear();
-            this.abortControllers.clear();
-            this.callbackWrapperCache.clear();
-        };
+        return () => this.terminate();
     }
 
     public terminate() {
-        if (this.iframe) {
-            this.iframe.remove();
-        }
+        if (this.terminated) return;
+        this.terminated = true;
+        this.runGeneration += 1;
+
+        try { this.postToGuest({ type: 'TERMINATE' }); } catch { /* iframe may already be gone */ }
+        const terminationError = new PluginApiError('ABORTED', 'Plugin sandbox terminated');
+        for (const pending of this.pendingCallbacks.values()) pending.reject(terminationError);
+        for (const pending of this.pendingExecutions.values()) pending.reject(terminationError);
+        for (const controller of this.abortControllers.values()) controller.abort();
+
+        if (this.messageHandler) window.removeEventListener('message', this.messageHandler);
+        this.messageHandler = undefined;
+        this.iframe?.remove();
         this.instanceRegistry.clear();
         this.pendingCallbacks.clear();
+        this.pendingExecutions.clear();
         this.abortControllers.clear();
         this.callbackWrapperCache.clear();
     }
