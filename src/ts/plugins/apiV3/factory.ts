@@ -196,6 +196,9 @@ await (async function() {
     const NativeMessageEvent = globalThis.MessageEvent;
     const NativeErrorEvent = globalThis.ErrorEvent;
     const NativeUint32Array = globalThis.Uint32Array;
+    const NativeMap = globalThis.Map;
+    const NativeWeakMap = globalThis.WeakMap;
+    const NativeSet = globalThis.Set;
     const nativeReflectApply = Reflect.apply;
     const nativeJsonStringify = JSON.stringify;
     const nativeNumberToString = Number.prototype.toString;
@@ -215,13 +218,68 @@ await (async function() {
     const nativeEventTargetAddEventListener = NativeEventTarget.prototype.addEventListener;
     const nativeEventTargetRemoveEventListener = NativeEventTarget.prototype.removeEventListener;
     const nativeEventTargetDispatchEvent = NativeEventTarget.prototype.dispatchEvent;
-    const trackedBlobUrls = new Map();
-    const activeWorkers = new Map();
-    const workerStates = new WeakMap();
+    const nativeMapGet = NativeMap.prototype.get;
+    const nativeMapSet = NativeMap.prototype.set;
+    const nativeMapDelete = NativeMap.prototype.delete;
+    const nativeMapClear = NativeMap.prototype.clear;
+    const nativeMapForEach = NativeMap.prototype.forEach;
+    const nativeMapSizeGetter = Object.getOwnPropertyDescriptor(NativeMap.prototype, 'size')?.get;
+    const nativeWeakMapGet = NativeWeakMap.prototype.get;
+    const nativeWeakMapSet = NativeWeakMap.prototype.set;
+    const nativeSetAdd = NativeSet.prototype.add;
+    const nativeSetDelete = NativeSet.prototype.delete;
+    const nativeSetForEach = NativeSet.prototype.forEach;
+    const trackedBlobUrls = new NativeMap();
+    const activeWorkers = new NativeMap();
+    const workerStates = new NativeWeakMap();
     const MAX_DIRECT_WORKERS = 4;
     const MAX_DIRECT_WORKER_BYTES = 8 * 1024 * 1024;
     let activeWorkerBytes = 0;
     let workerControlCounter = 0;
+
+    function privateMapGet(map, key) {
+        return nativeReflectApply(nativeMapGet, map, [key]);
+    }
+
+    function privateMapSet(map, key, value) {
+        nativeReflectApply(nativeMapSet, map, [key, value]);
+    }
+
+    function privateMapDelete(map, key) {
+        nativeReflectApply(nativeMapDelete, map, [key]);
+    }
+
+    function privateMapClear(map) {
+        nativeReflectApply(nativeMapClear, map, []);
+    }
+
+    function privateMapForEach(map, callback) {
+        nativeReflectApply(nativeMapForEach, map, [callback]);
+    }
+
+    function privateMapSize(map) {
+        return nativeReflectApply(nativeMapSizeGetter, map, []);
+    }
+
+    function privateWeakMapGet(map, key) {
+        return nativeReflectApply(nativeWeakMapGet, map, [key]);
+    }
+
+    function privateWeakMapSet(map, key, value) {
+        nativeReflectApply(nativeWeakMapSet, map, [key, value]);
+    }
+
+    function privateSetAdd(set, value) {
+        nativeReflectApply(nativeSetAdd, set, [value]);
+    }
+
+    function privateSetDelete(set, value) {
+        nativeReflectApply(nativeSetDelete, set, [value]);
+    }
+
+    function privateSetForEach(set, callback) {
+        nativeReflectApply(nativeSetForEach, set, [callback]);
+    }
 
     function createWorkerControlToken() {
         if (!nativeGetRandomValues) {
@@ -267,7 +325,7 @@ await (async function() {
     }
 
     function getWorkerState(worker) {
-        const state = workerStates.get(worker);
+        const state = privateWeakMapGet(workerStates, worker);
         if (!state) throw new TypeError('Illegal invocation');
         return state;
     }
@@ -306,7 +364,7 @@ await (async function() {
     }
 
     function forwardNativeWorkerEvent(worker, event) {
-        const record = activeWorkers.get(worker);
+        const record = privateMapGet(activeWorkers, worker);
         if (!record) return;
         if (event.type === 'message'
             && event.data
@@ -324,18 +382,20 @@ await (async function() {
     }
 
     function releaseWorker(worker, terminate) {
-        const record = activeWorkers.get(worker);
+        const record = privateMapGet(activeWorkers, worker);
         if (!record) return;
-        activeWorkers.delete(worker);
+        privateMapDelete(activeWorkers, worker);
         activeWorkerBytes -= record.payloadBytes;
         if (activeWorkerBytes < 0) activeWorkerBytes = 0;
-        record.source.workers.delete(worker);
-        for (const [type, listener] of record.forwarders) {
+        privateSetDelete(record.source.workers, worker);
+        for (let index = 0; index < record.forwarders.length; index += 1) {
+            const type = record.forwarders[index][0];
+            const listener = record.forwarders[index][1];
             try {
                 nativeReflectApply(nativeWorkerRemoveEventListener, record.nativeWorker, [type, listener]);
             } catch { /* already detached */ }
         }
-        const state = workerStates.get(worker);
+        const state = privateWeakMapGet(workerStates, worker);
         if (state) {
             state.released = true;
             state.nativePostMessage = null;
@@ -348,20 +408,20 @@ await (async function() {
 
     function revokeTrackedObjectURL(url) {
         const key = String(url);
-        const source = trackedBlobUrls.get(key);
+        const source = privateMapGet(trackedBlobUrls, key);
         if (source) {
-            for (const worker of [...source.workers]) releaseWorker(worker, true);
-            trackedBlobUrls.delete(key);
+            privateSetForEach(source.workers, (worker) => releaseWorker(worker, true));
+            privateMapDelete(trackedBlobUrls, key);
         }
         nativeRevokeObjectURL(key);
     }
 
     function cleanupPluginWorkers() {
-        for (const worker of [...activeWorkers.keys()]) releaseWorker(worker, true);
-        for (const url of [...trackedBlobUrls.keys()]) {
+        privateMapForEach(activeWorkers, (_record, worker) => releaseWorker(worker, true));
+        privateMapForEach(trackedBlobUrls, (_source, url) => {
             try { nativeRevokeObjectURL(url); } catch { /* already revoked */ }
-        }
-        trackedBlobUrls.clear();
+        });
+        privateMapClear(trackedBlobUrls);
         activeWorkerBytes = 0;
     }
 
@@ -372,7 +432,7 @@ await (async function() {
             const url = nativeCreateObjectURL(object);
             const payloadBytes = nativeBlobSize(object);
             if (payloadBytes !== null) {
-                trackedBlobUrls.set(url, { blob: object, payloadBytes, workers: new Set() });
+                privateMapSet(trackedBlobUrls, url, { blob: object, payloadBytes, workers: new NativeSet() });
             }
             return url;
         }
@@ -393,9 +453,9 @@ await (async function() {
             throw makePluginError('UNSUPPORTED', 'Worker is unavailable');
         }
         const sourceUrl = String(scriptURL);
-        const source = trackedBlobUrls.get(sourceUrl);
+        const source = privateMapGet(trackedBlobUrls, sourceUrl);
         if (!source) throw makePluginError('INVALID_ARGUMENT', 'Worker entry must be a tracked Blob URL');
-        if (activeWorkers.size >= MAX_DIRECT_WORKERS) {
+        if (privateMapSize(activeWorkers) >= MAX_DIRECT_WORKERS) {
             throw makePluginError('RESOURCE_LIMIT', 'Direct Worker limit exceeded', { limit: MAX_DIRECT_WORKERS });
         }
         if (activeWorkerBytes + source.payloadBytes > MAX_DIRECT_WORKER_BYTES) {
@@ -432,14 +492,16 @@ await (async function() {
             ),
             released: false
         };
-        workerStates.set(worker, state);
+        privateWeakMapSet(workerStates, worker, state);
         const forwarders = [
             ['message', (event) => forwardNativeWorkerEvent(worker, event)],
             ['messageerror', (event) => forwardNativeWorkerEvent(worker, event)],
             ['error', (event) => forwardNativeWorkerEvent(worker, event)]
         ];
         try {
-            for (const [type, listener] of forwarders) {
+            for (let index = 0; index < forwarders.length; index += 1) {
+                const type = forwarders[index][0];
+                const listener = forwarders[index][1];
                 nativeReflectApply(nativeWorkerAddEventListener, nativeWorker, [type, listener]);
             }
         } catch (error) {
@@ -449,7 +511,7 @@ await (async function() {
         }
 
         activeWorkerBytes += source.payloadBytes;
-        activeWorkers.set(worker, {
+        privateMapSet(activeWorkers, worker, {
             bootstrapUrl,
             controlConsumed: false,
             controlToken,
@@ -459,7 +521,7 @@ await (async function() {
             payloadBytes: source.payloadBytes,
             source
         });
-        source.workers.add(worker);
+        privateSetAdd(source.workers, worker);
         return worker;
     }
 

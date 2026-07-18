@@ -452,6 +452,186 @@ describe('V3 plugin iframe CSP and direct Worker sandbox', () => {
     expect(result).toEqual({ kind: 'worker-self-close', replacementCount: 4, fifthBlocked: true })
   }, 20_000)
 
+  it('keeps Worker bookkeeping isolated from guest collection prototype changes', async () => {
+    const sandbox = startSandbox(`
+      const restores = [];
+      const privateCollections = [];
+      let privateRecordObserved = false;
+      let privateCollectionObserved = false;
+      const looksPrivate = (value) => {
+        if (!value || typeof value !== 'object') return false;
+        try {
+          const names = Object.getOwnPropertyNames(value);
+          return names.includes('nativeWorker')
+            || (names.includes('blob') && names.includes('payloadBytes') && names.includes('workers'))
+            || (names.includes('nativePostMessage') && names.includes('eventHandlers') && names.includes('released'));
+        } catch { return false; }
+      };
+      const remember = (receiver, args, result) => {
+        const values = [...args, result];
+        for (const value of values) {
+          if (!looksPrivate(value)) continue;
+          privateRecordObserved = true;
+          if (!privateCollections.includes(receiver)) privateCollections.push(receiver);
+          if (value.workers && !privateCollections.includes(value.workers)) privateCollections.push(value.workers);
+        }
+        if (privateCollections.includes(receiver)) privateCollectionObserved = true;
+      };
+      const patchMethod = (prototype, key) => {
+        const descriptor = Object.getOwnPropertyDescriptor(prototype, key);
+        if (!descriptor || typeof descriptor.value !== 'function' || descriptor.configurable === false) return;
+        const original = descriptor.value;
+        restores.push(() => Object.defineProperty(prototype, key, descriptor));
+        Object.defineProperty(prototype, key, {
+          ...descriptor,
+          value: function(...args) {
+            const result = Reflect.apply(original, this, args);
+            remember(this, args, result);
+            return result;
+          }
+        });
+      };
+      for (const key of ['get', 'set', 'delete', 'clear', 'keys', 'forEach']) patchMethod(Map.prototype, key);
+      for (const key of ['get', 'set', 'delete', 'has']) patchMethod(WeakMap.prototype, key);
+      for (const key of ['add', 'delete', 'has', 'values', 'forEach']) patchMethod(Set.prototype, key);
+      patchMethod(Set.prototype, Symbol.iterator);
+      const mapSize = Object.getOwnPropertyDescriptor(Map.prototype, 'size');
+      if (mapSize?.get && mapSize.configurable !== false) {
+        restores.push(() => Object.defineProperty(Map.prototype, 'size', mapSize));
+        Object.defineProperty(Map.prototype, 'size', {
+          ...mapSize,
+          get() {
+            const result = Reflect.apply(mapSize.get, this, []);
+            remember(this, [], result);
+            return result;
+          }
+        });
+      }
+
+      const outcome = { kind: 'collection-intrinsics' };
+      let pagehideDispatched = false;
+      try {
+        const idleUrl = URL.createObjectURL(new Blob(['setInterval(() => {}, 1000)']));
+        const countWorkers = [];
+        for (let index = 0; index < 4; index++) countWorkers.push(new Worker(idleUrl));
+        outcome.countAccepted = countWorkers.length;
+        try {
+          const extra = new Worker(idleUrl);
+          extra.terminate();
+          outcome.countOneOverBlocked = false;
+        } catch (error) {
+          outcome.countOneOverBlocked = error && error.code === 'RESOURCE_LIMIT';
+        }
+        countWorkers[0].terminate();
+        const countReplacement = new Worker(idleUrl);
+        outcome.countReplacement = true;
+        countReplacement.terminate();
+        for (const worker of countWorkers) worker.terminate();
+        URL.revokeObjectURL(idleUrl);
+
+        const LIMIT = 8 * 1024 * 1024;
+        const sizedScript = (size) => size < 4
+          ? new Blob([' '.repeat(size)], { type: 'text/javascript' })
+          : new Blob(['/*', new Uint8Array(size - 4), '*/'], { type: 'text/javascript' });
+        const byteUrls = [
+          URL.createObjectURL(sizedScript(LIMIT / 2)),
+          URL.createObjectURL(sizedScript(LIMIT / 2)),
+        ];
+        const byteWorkers = [new Worker(byteUrls[0]), new Worker(byteUrls[1])];
+        outcome.byteExactAccepted = true;
+        const oneByteUrl = URL.createObjectURL(sizedScript(1));
+        try {
+          const extra = new Worker(oneByteUrl);
+          extra.terminate();
+          outcome.byteOneOverBlocked = false;
+        } catch (error) {
+          outcome.byteOneOverBlocked = error && error.code === 'RESOURCE_LIMIT';
+        }
+        for (const worker of byteWorkers) worker.terminate();
+        for (const url of [...byteUrls, oneByteUrl]) URL.revokeObjectURL(url);
+
+        const closeUrl = URL.createObjectURL(new Blob([
+          'postMessage("ready");onmessage=()=>close();setInterval(()=>{},1000)'
+        ]));
+        const closingWorker = new Worker(closeUrl);
+        await new Promise((resolve, reject) => {
+          const timer = setTimeout(() => reject(new Error('close worker did not start')), 2000);
+          closingWorker.onmessage = (event) => {
+            if (event.data !== 'ready') return;
+            clearTimeout(timer);
+            closingWorker.postMessage('close');
+            resolve(undefined);
+          };
+        });
+        const replacementUrl = URL.createObjectURL(new Blob(['setInterval(() => {}, 1000)']));
+        const deadline = Date.now() + 3000;
+        let closeReplacement;
+        while (!closeReplacement && Date.now() < deadline) {
+          try { closeReplacement = new Worker(replacementUrl); }
+          catch (error) {
+            if (!error || error.code !== 'RESOURCE_LIMIT') throw error;
+            await new Promise((resolve) => setTimeout(resolve, 20));
+          }
+        }
+        outcome.closeReplacement = !!closeReplacement;
+        closeReplacement?.terminate();
+        closingWorker.terminate();
+        URL.revokeObjectURL(closeUrl);
+        URL.revokeObjectURL(replacementUrl);
+
+        const revokeUrl = URL.createObjectURL(new Blob(['setInterval(() => {}, 1000)']));
+        const revokedWorker = new Worker(revokeUrl);
+        URL.revokeObjectURL(revokeUrl);
+        revokedWorker.terminate();
+        outcome.revokeCompleted = true;
+
+        const unloadUrl = URL.createObjectURL(new Blob(['setInterval(() => {}, 1000)']));
+        for (let index = 0; index < 4; index++) new Worker(unloadUrl);
+        dispatchEvent(new Event('pagehide'));
+        pagehideDispatched = true;
+        const afterUnloadUrl = URL.createObjectURL(new Blob(['setInterval(() => {}, 1000)']));
+        const afterUnloadWorkers = [];
+        for (let index = 0; index < 4; index++) afterUnloadWorkers.push(new Worker(afterUnloadUrl));
+        outcome.unloadReplacementCount = afterUnloadWorkers.length;
+        try {
+          const extra = new Worker(afterUnloadUrl);
+          extra.terminate();
+          outcome.unloadOneOverBlocked = false;
+        } catch (error) {
+          outcome.unloadOneOverBlocked = error && error.code === 'RESOURCE_LIMIT';
+        }
+        for (const worker of afterUnloadWorkers) worker.terminate();
+        URL.revokeObjectURL(afterUnloadUrl);
+      } catch (error) {
+        outcome.operationError = { name: error && error.name, code: error && error.code };
+      } finally {
+        if (!pagehideDispatched) {
+          try { dispatchEvent(new Event('pagehide')); } catch { /* best effort */ }
+        }
+        outcome.privateRecordObserved = privateRecordObserved;
+        outcome.privateCollectionObserved = privateCollectionObserved;
+        while (restores.length) restores.pop()();
+      }
+      await risuai.report(outcome);
+    `)
+
+    const result = await waitForReport<any>(sandbox, (value) => value.kind === 'collection-intrinsics', 25_000)
+    expect(result.operationError).toBeUndefined()
+    expect(result).toMatchObject({
+      countAccepted: 4,
+      countOneOverBlocked: true,
+      countReplacement: true,
+      byteExactAccepted: true,
+      byteOneOverBlocked: true,
+      closeReplacement: true,
+      revokeCompleted: true,
+      unloadReplacementCount: 4,
+      unloadOneOverBlocked: true,
+      privateRecordObserved: false,
+      privateCollectionObserved: false,
+    })
+  }, 30_000)
+
   it('enforces the exact 8 MiB aggregate initial direct Blob payload boundary', async () => {
     const sandbox = startSandbox(`
       const LIMIT = 8 * 1024 * 1024;
