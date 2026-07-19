@@ -127,6 +127,9 @@ function harness(options: {
     thumbnail?: ContextResourceAdapter['createThumbnail']
     principalId?: string
     abortController?: AbortController
+    onPermission?: (permission: 'contextAssets' | 'installedModulesRead') => void | Promise<void>
+    cloneStateReads?: boolean
+    afterStateRead?: (call: number) => void
 } = {}) {
     let state = options.state ?? makeState()
     const bytes = defaultBytes()
@@ -135,7 +138,13 @@ function harness(options: {
         if (!value) throw new PluginApiError('NOT_FOUND', 'Asset missing')
         return value.slice()
     })
-    const getState = vi.fn(async () => state)
+    let stateReadCount = 0
+    const getState = vi.fn(async () => {
+        const result = options.cloneStateReads ? structuredClone(state) : state
+        stateReadCount += 1
+        options.afterStateRead?.(stateReadCount)
+        return result
+    })
     const adapter: ContextResourceAdapter = {
         getState,
         readAsset: reads,
@@ -158,6 +167,7 @@ function harness(options: {
         {
             requirePermission: async (permission) => {
                 permissionCalls.push(permission)
+                await options.onPermission?.(permission)
                 if (!granted.has(permission)) {
                     throw new PluginApiError('PERMISSION_DENIED', `Denied: ${permission}`, {
                         details: { permission },
@@ -238,6 +248,23 @@ describe('context snapshots', () => {
         state.current!.conversation.localLorebook[0].content = 'changed local lore'
         const loreChanged = await h.service.getCurrentContext()
         expect(loreChanged.conversationRevision).not.toBe(membership.conversationRevision)
+    })
+
+    it('re-resolves the authorized current card after an asynchronous permission decision', async () => {
+        const state = makeState()
+        let switched = false
+        const h = harness({
+            state,
+            cloneStateReads: true,
+            onPermission: () => {
+                if (switched) return
+                switched = true
+                state.current!.characterId = 'char-2'
+            },
+        })
+
+        await expect(h.service.getCharacterCardSnapshot()).resolves.toMatchObject({ id: 'char-2', name: 'Bob' })
+        await expect(h.service.getCharacterCardSnapshot('char-1')).rejects.toMatchObject({ code: 'PERMISSION_DENIED' })
     })
 
     it('allows the current group and its members but rejects unrelated selectors and conversations', async () => {
@@ -344,6 +371,41 @@ describe('module activation and module resources', () => {
         expect(installedOnly.permissionCalls).toEqual(['installedModulesRead'])
         const installedDenied = harness({ grants: ['contextAssets'] })
         expect(await errorCode(installedDenied.service.listContextModules({ scope: 'installed' }))).toBe('PERMISSION_DENIED')
+    })
+
+    it('does not return a module that deactivates during permission resolution', async () => {
+        const state = makeState()
+        const h = harness({
+            state,
+            cloneStateReads: true,
+            onPermission: (permission) => {
+                if (permission === 'contextAssets') state.activeModules = []
+            },
+        })
+
+        await expect(h.service.listContextModules({ scope: 'active' })).resolves.toEqual({ items: [] })
+    })
+
+    it('rejects a page whose module deactivates during snapshotting and clears its new cursor', async () => {
+        const state = makeState()
+        state.activeModules.push(moduleSource({ id: 'module-second-active', assets: [] }))
+        const cursors = new CursorRegistry()
+        const clearCursor = vi.spyOn(cursors, 'clear')
+        const h = harness({
+            state,
+            cursorRegistry: cursors,
+            cloneStateReads: true,
+            afterStateRead: (call) => {
+                if (call === 3) state.activeModules = []
+            },
+        })
+
+        await expect(h.service.listContextModules({ scope: 'active', limit: 1 })).rejects.toMatchObject({
+            code: 'CONFLICT',
+            retryable: true,
+        })
+        expect(clearCursor).toHaveBeenCalledOnce()
+        expect(clearCursor).toHaveBeenCalledWith(expect.any(String))
     })
 
     it('enforces active 100/101 and page 50/100/101 boundaries', async () => {
@@ -499,6 +561,43 @@ describe('opaque context assets', () => {
         await expect(missingInstalled.service.listContextAssets({ moduleScope: 'active' })).resolves.toBeDefined()
     })
 
+    it('fails closed when an active module deactivates while its asset metadata is being digested', async () => {
+        const state = makeState()
+        const h = harness({ state })
+        h.reads.mockImplementationOnce(async (source: ContextAssetSource) => {
+            state.activeModules = []
+            return h.bytes.get(source.storageKey)!.slice()
+        })
+
+        await expect(h.service.listContextAssets({ moduleScope: 'active', include: ['module'] }))
+            .rejects.toMatchObject({ code: 'CONFLICT' })
+        expect(h.permissionCalls).toEqual(['contextAssets'])
+    })
+
+    it('does not treat an installed asset as active when a persona module reuses its module ID', async () => {
+        const state = makeState()
+        const inactive = moduleSource({
+            id: 'collision',
+            activatedBy: [],
+            assets: [asset('installed-collision', 'installed-ref', 'module')],
+        })
+        const active = moduleSource({
+            id: 'collision',
+            activatedBy: ['persona'],
+            assets: [asset('persona-collision', 'module-ref', 'module')],
+        })
+        state.installedModules = [inactive]
+        state.activeModules = [active]
+        const principalId = '44444444-4444-4444-8444-444444444444'
+        const issued = harness({ state, principalId })
+        const listed = await issued.service.listContextAssets({ moduleScope: 'installed', include: ['module'] })
+        const reference = listed.assets[0]
+
+        const denied = harness({ state, principalId, grants: ['contextAssets'] })
+        await expect(denied.service.readContextAsset(reference.assetId, { ifRevision: reference.revision }))
+            .rejects.toMatchObject({ code: 'PERMISSION_DENIED' })
+    })
+
     it('re-authorizes character origin on every read without invalidating handles for unrelated conversation changes', async () => {
         const state = makeState()
         const h = harness({ state })
@@ -592,12 +691,26 @@ describe('opaque context assets', () => {
         expect(h.reads).toHaveBeenCalledTimes(assetReads)
     })
 
+    it('rejects an unissued handle without enumerating unrelated asset metadata', async () => {
+        const state = makeState()
+        Object.defineProperty(state.characters[2], 'assets', {
+            enumerable: true,
+            get: () => { throw new Error('unrelated assets were enumerated') },
+        })
+        const h = harness({ state })
+
+        await expect(h.service.readContextAsset(`ctxasset_${'0'.repeat(64)}`))
+            .rejects.toMatchObject({ code: 'NOT_FOUND' })
+        expect(h.reads).not.toHaveBeenCalled()
+    })
+
     it('charges syntactically valid unknown handles after context preflight and before asset scanning at 60/61', async () => {
         const h = harness({ now: () => 20_000 })
         const unknownHandle = `ctxasset_${'0'.repeat(64)}`
         for (let index = 0; index < 60; index++) {
             expect(await errorCode(h.service.readContextAsset(unknownHandle))).toBe('NOT_FOUND')
         }
+        expect(h.reads).not.toHaveBeenCalled()
         const stateCalls = h.getState.mock.calls.length
         const assetReads = h.reads.mock.calls.length
         await expect(h.service.readContextAsset(unknownHandle)).rejects.toMatchObject({
@@ -606,6 +719,24 @@ describe('opaque context assets', () => {
         })
         expect(h.getState).toHaveBeenCalledTimes(stateCalls + 1)
         expect(h.reads).toHaveBeenCalledTimes(assetReads)
+    })
+
+    it('recovers a persisted handle from its revision without reading unrelated asset bytes', async () => {
+        const principalId = '55555555-5555-4555-8555-555555555555'
+        const issued = harness({ principalId })
+        const listed = await issued.service.listContextAssets({ moduleScope: 'none', include: ['portrait'] })
+        const reference = listed.assets[0]
+        const restored = harness({ principalId })
+
+        await expect(restored.service.readContextAsset(reference.assetId, { ifRevision: reference.revision }))
+            .resolves.toMatchObject({ revision: reference.revision })
+        expect(restored.reads).toHaveBeenCalledTimes(1)
+
+        const unknown = harness({ principalId })
+        await expect(unknown.service.readContextAsset(`ctxasset_${'0'.repeat(64)}`, {
+            ifRevision: `sha256:${'1'.repeat(64)}`,
+        })).rejects.toMatchObject({ code: 'NOT_FOUND' })
+        expect(unknown.reads).not.toHaveBeenCalled()
     })
 
     it('charges stale handles after context preflight and before asset scanning at 60/61', async () => {

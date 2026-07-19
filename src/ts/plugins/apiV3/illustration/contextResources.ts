@@ -484,6 +484,22 @@ export class ContextResourceService {
         return snapshot
     }
 
+    private moduleSourceIdentity(source: ContextModuleSource) {
+        return JSON.stringify([
+            source.id,
+            source.namespace ?? null,
+            source.name,
+            source.description,
+            source.lorebook.map((entry) => [entry.id, entry.name, entry.content, entry.enabled]),
+            source.assets.map((asset) => [
+                asset.identity,
+                asset.storageKey,
+                this.storageRevision(asset),
+                asset.role,
+            ]),
+        ])
+    }
+
     private async currentRef(state: ContextHostState): Promise<CurrentContextRef> {
         const { current, character } = this.current(state)
         const [card, conversation] = await Promise.all([
@@ -512,35 +528,71 @@ export class ContextResourceService {
         return createRevision({ current, modules })
     }
 
+    private contextChanged() {
+        return new PluginApiError('CONFLICT', 'Current context changed while the operation was running', {
+            retryable: true,
+        })
+    }
+
+    private sameSelectors(
+        left: { characterId: string; conversationId: string },
+        right: { characterId: string; conversationId: string },
+    ) {
+        return left.characterId === right.characterId && left.conversationId === right.conversationId
+    }
+
     async getCurrentContext(): Promise<CurrentContextRef> {
-        const state = await this.state()
-        this.current(state)
+        const preflight = await this.state()
+        this.current(preflight)
         await this.dependencies.requirePermission('contextAssets')
-        return this.currentRef(state)
+        for (let attempt = 0; attempt < 4; attempt++) {
+            const state = await this.state()
+            const expected = this.resolveSelectors(state, {})
+            const snapshot = await this.currentRef(state)
+            const fresh = await this.state()
+            const actual = this.resolveSelectors(fresh, {})
+            if (this.sameSelectors(expected, actual)) return snapshot
+        }
+        throw this.contextChanged()
     }
 
     async getCharacterCardSnapshot(characterId?: CharacterId): Promise<CharacterCardSnapshot> {
-        const state = await this.state()
-        this.current(state)
+        const preflight = await this.state()
+        this.current(preflight)
         await this.dependencies.requirePermission('contextAssets')
-        const selectors = this.resolveSelectors(state, { characterId })
-        const source = state.characters.find((item) => item.id === selectors.characterId)
-        if (!source) throw new PluginApiError('NOT_FOUND', 'Character was not found')
-        return this.characterSnapshot(source)
+        for (let attempt = 0; attempt < 4; attempt++) {
+            const state = await this.state()
+            const selectors = this.resolveSelectors(state, { characterId })
+            const source = state.characters.find((item) => item.id === selectors.characterId)
+            if (!source) throw new PluginApiError('NOT_FOUND', 'Character was not found')
+            const snapshot = await this.characterSnapshot(source)
+            const fresh = await this.state()
+            const actual = this.resolveSelectors(fresh, { characterId })
+            if (this.sameSelectors(selectors, actual)) return snapshot
+        }
+        throw this.contextChanged()
     }
 
     async getConversationContextSnapshot(conversationId?: ConversationId): Promise<ConversationContextSnapshot> {
-        const state = await this.state()
-        this.current(state)
+        const preflight = await this.state()
+        this.current(preflight)
         await this.dependencies.requirePermission('contextAssets')
-        this.resolveSelectors(state, { conversationId })
-        return this.conversationSnapshot(this.current(state).current.conversation)
+        for (let attempt = 0; attempt < 4; attempt++) {
+            const state = await this.state()
+            const selectors = this.resolveSelectors(state, { conversationId })
+            const snapshot = await this.conversationSnapshot(this.current(state).current.conversation)
+            const fresh = await this.state()
+            const actual = this.resolveSelectors(fresh, { conversationId })
+            if (this.sameSelectors(selectors, actual)) return snapshot
+        }
+        throw this.contextChanged()
     }
 
     async getActiveModules(options: { characterId?: CharacterId; conversationId?: ConversationId } = {}) {
-        const state = await this.state()
-        this.current(state)
+        const preflight = await this.state()
+        this.current(preflight)
         await this.dependencies.requirePermission('contextAssets')
+        const state = await this.state()
         this.resolveSelectors(state, options)
         if (state.activeModules.length > MAX_ACTIVE_MODULES) {
             throw new PluginApiError('RESOURCE_LIMIT', 'Too many active modules')
@@ -598,10 +650,11 @@ export class ContextResourceService {
             throw new PluginApiError('INVALID_ARGUMENT', 'Invalid module scope')
         }
         const limit = normalizeLimit(options.limit)
-        const state = await this.state()
+        const preflight = await this.state()
         let selectors: { characterId: string | null; conversationId: string | null }
-        if (state.current) {
+        if (preflight.current) {
             await this.dependencies.requirePermission(scope === 'installed' ? 'installedModulesRead' : 'contextAssets')
+            const state = await this.state()
             const resolved = this.resolveSelectors(state, options)
             selectors = resolved
         } else {
@@ -611,7 +664,18 @@ export class ContextResourceService {
             await this.dependencies.requirePermission('installedModulesRead')
             selectors = { characterId: null, conversationId: null }
         }
+        const state = await this.state()
+        if (selectors.characterId !== null) {
+            const refreshed = this.resolveSelectors(state, options)
+            if (!this.sameSelectors(selectors as { characterId: string; conversationId: string }, refreshed)) {
+                throw this.contextChanged()
+            }
+            selectors = refreshed
+        } else if (scope !== 'installed') {
+            throw new PluginApiError('NOT_FOUND', 'No current character or conversation')
+        }
         const query = { kind: 'modules', scope, ...selectors, limit }
+        let authorizedPageSources: ContextModuleSource[] = []
         const page = await this.page(
             'context-modules',
             query,
@@ -620,6 +684,7 @@ export class ContextResourceService {
             async (offset, pageLimit) => {
                 const modules = scope === 'installed' ? state.installedModules : state.activeModules
                 const pageSources = modules.slice(offset, offset + pageLimit)
+                authorizedPageSources = pageSources
                 const nextOffset = offset + pageSources.length
                 return {
                     items: await Promise.all(pageSources.map((module) => this.moduleSnapshot(module))),
@@ -628,8 +693,26 @@ export class ContextResourceService {
             },
         )
         const result = { items: page.items, ...(page.nextCursor ? { nextCursor: page.nextCursor } : {}) }
-        assertContextSnapshotLimits(result)
-        return result
+        try {
+            const fresh = await this.state()
+            if (selectors.characterId !== null) {
+                const refreshed = this.resolveSelectors(fresh, options)
+                if (!this.sameSelectors(selectors as { characterId: string; conversationId: string }, refreshed)) {
+                    throw this.contextChanged()
+                }
+            }
+            const currentModules = scope === 'installed' ? fresh.installedModules : fresh.activeModules
+            if (authorizedPageSources.some((source) => !currentModules.some((candidate) =>
+                candidate.id === source.id
+                && this.moduleSourceIdentity(candidate) === this.moduleSourceIdentity(source)))) {
+                throw this.contextChanged()
+            }
+            assertContextSnapshotLimits(result)
+            return result
+        } catch (error) {
+            if (page.nextCursor) this.cursorRegistry.clear(page.nextCursor)
+            throw error
+        }
     }
 
     private handleFor(source: ContextAssetSource, origin: ContextAssetRef['origin'], revision: Revision) {
@@ -697,6 +780,29 @@ export class ContextResourceService {
         })))
     }
 
+    private sameAssetSource(left: ContextAssetSource, right: ContextAssetSource) {
+        return left.identity === right.identity
+            && left.storageKey === right.storageKey
+            && this.storageRevision(left) === this.storageRevision(right)
+    }
+
+    private sourceStillAuthorized(
+        state: ContextHostState,
+        located: { source: ContextAssetSource; origin: ContextAssetRef['origin'] },
+        moduleScope: 'active' | 'installed' | 'none',
+    ) {
+        if (located.origin.kind === 'character') {
+            const characterId = located.origin.characterId
+            if (!this.authorizedCharacterIds(state).has(characterId)) return false
+            const character = state.characters.find((item) => item.id === characterId)
+            return Boolean(character?.assets.some((source) => this.sameAssetSource(source, located.source)))
+        }
+        const moduleId = located.origin.moduleId
+        const modules = moduleScope === 'installed' ? state.installedModules : state.activeModules
+        return modules.some((module) => module.id === moduleId
+            && module.assets.some((source) => this.sameAssetSource(source, located.source)))
+    }
+
     private normalizeIncludes(value: ContextAssetRole[] | undefined) {
         const order: ContextAssetRole[] = ['portrait', 'emotion', 'additional', 'module']
         if (value === undefined) return order
@@ -722,10 +828,11 @@ export class ContextResourceService {
         const limit = normalizeLimit(options.limit)
         const include = this.normalizeIncludes(options.include)
         const mediaTypes = this.normalizeMediaTypes(options.mediaTypes)
-        const state = await this.state()
-        this.current(state)
+        const preflight = await this.state()
+        this.current(preflight)
         await this.dependencies.requirePermission('contextAssets')
         if (moduleScope === 'installed') await this.dependencies.requirePermission('installedModulesRead')
+        const state = await this.state()
         const selectors = this.resolveSelectors(state, options)
         const query = {
             kind: 'assets',
@@ -735,6 +842,10 @@ export class ContextResourceService {
             mediaTypes: mediaTypes ?? null,
             limit,
         }
+        let authorizedPageSources: Array<{
+            source: ContextAssetSource
+            origin: ContextAssetRef['origin']
+        }> = []
         const page = await this.page(
             'context-assets',
             query,
@@ -748,6 +859,7 @@ export class ContextResourceService {
                     )),
                 ].filter(({ source }) => include.includes(source.role))
                 const pageSources = sources.slice(offset, offset + pageLimit)
+                authorizedPageSources = pageSources
                 const references = await Promise.all(pageSources
                     .map(({ source, origin }) => this.assetReference(source, origin)))
                 const nextOffset = offset + pageSources.length
@@ -765,15 +877,41 @@ export class ContextResourceService {
             assets: page.items,
             ...(page.nextCursor ? { nextCursor: page.nextCursor } : {}),
         }
-        assertContextSnapshotLimits(result)
-        return result
+        try {
+            const fresh = await this.state()
+            const refreshed = this.resolveSelectors(fresh, options)
+            if (!this.sameSelectors(selectors, refreshed)
+                || authorizedPageSources.some((source) => !this.sourceStillAuthorized(fresh, source, moduleScope))) {
+                throw this.contextChanged()
+            }
+            assertContextSnapshotLimits(result)
+            return result
+        } catch (error) {
+            if (page.nextCursor) this.cursorRegistry.clear(page.nextCursor)
+            throw error
+        }
     }
 
     private allAssets(state: ContextHostState) {
-        const activeIds = new Set(state.activeModules.map((module) => module.id))
-        const modules = new Map<string, ContextModuleSource>()
+        const moduleAssetKey = (module: ContextModuleSource, source: ContextAssetSource) =>
+            `${module.id}\u0000${source.identity}\u0000${source.storageKey}`
+        const activeAssetKeys = new Set(state.activeModules.flatMap((module) =>
+            module.assets.map((source) => moduleAssetKey(module, source))))
+        const moduleAssets = new Map<string, LocatedAsset>()
         for (const module of [...state.installedModules, ...state.activeModules]) {
-            if (!modules.has(module.id)) modules.set(module.id, module)
+            for (const source of module.assets) {
+                const key = moduleAssetKey(module, source)
+                const existing = moduleAssets.get(key)
+                if (existing) {
+                    existing.activeModule ||= activeAssetKeys.has(key)
+                    continue
+                }
+                moduleAssets.set(key, {
+                    source,
+                    origin: { kind: 'module', moduleId: module.id },
+                    activeModule: activeAssetKeys.has(key),
+                })
+            }
         }
         return [
             ...state.characters.flatMap((character) => character.assets.map((source): LocatedAsset => ({
@@ -781,11 +919,7 @@ export class ContextResourceService {
                 origin: { kind: 'character', characterId: character.id },
                 activeModule: false,
             }))),
-            ...[...modules.values()].flatMap((module) => module.assets.map((source): LocatedAsset => ({
-                source,
-                origin: { kind: 'module', moduleId: module.id },
-                activeModule: activeIds.has(module.id),
-            }))),
+            ...moduleAssets.values(),
         ]
     }
 
@@ -796,8 +930,11 @@ export class ContextResourceService {
     }
 
     private async locateAsset(state: ContextHostState, assetId: string, expectedRevision?: Revision) {
-        const candidates = this.allAssets(state)
         const issued = this.issuedHandles.get(assetId)
+        if (!issued && !expectedRevision) {
+            throw new PluginApiError('NOT_FOUND', 'Context asset was not found')
+        }
+        const candidates = this.allAssets(state)
         if (issued) {
             const candidate = candidates.find((value) => value.source.identity === issued.identity
                 && this.sameOrigin(value.origin, issued.origin))
@@ -805,13 +942,7 @@ export class ContextResourceService {
             throw new PluginApiError('NOT_FOUND', 'Context asset was not found')
         }
         for (const candidate of candidates) {
-            const digest = await this.assetDigest(candidate.source)
-            if (await this.handleFor(candidate.source, candidate.origin, digest.revision) === assetId) {
-                this.issuedHandles.set(assetId, { identity: candidate.source.identity, origin: candidate.origin })
-                return candidate
-            }
-            if (expectedRevision
-                && await this.handleFor(candidate.source, candidate.origin, expectedRevision) === assetId) {
+            if (await this.handleFor(candidate.source, candidate.origin, expectedRevision) === assetId) {
                 this.issuedHandles.set(assetId, { identity: candidate.source.identity, origin: candidate.origin })
                 return candidate
             }
@@ -851,11 +982,13 @@ export class ContextResourceService {
         }
         const maxBytes = normalizeAssetReadBytes(options.maxBytes)
         validateAssetReadIdentifiers(assetId, options.ifRevision)
-        const state = await this.state()
-        this.current(state)
+        const preflight = await this.state()
+        this.current(preflight)
         await this.dependencies.requirePermission('contextAssets')
         // Charge every well-formed, permission-bearing attempt before handle or digest scanning.
         this.readRateLimiter.consume(this.context.principalId)
+        const state = await this.state()
+        this.current(state)
         const located = await this.locateAsset(state, assetId, options.ifRevision)
         await this.authorizeAssetOrigin(state, located)
         const cached = this.digestCache.get(located.source.storageKey)
