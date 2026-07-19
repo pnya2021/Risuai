@@ -661,6 +661,40 @@ describe('opaque context assets', () => {
         await expect(h.service.readContextAsset(replacement.assetId)).resolves.toMatchObject({ revision: replacement.revision })
     })
 
+    it('rechecks an inactive module source after installed permission resolution while preserving the active bypass', async () => {
+        const state = makeState()
+        const principalId = '66666666-6666-4666-8666-666666666666'
+        const issued = harness({ state, principalId })
+        const listed = await issued.service.listContextAssets({ moduleScope: 'active', include: ['module'] })
+        const reference = listed.assets[0]
+
+        const active = harness({ state, principalId, grants: ['contextAssets'] })
+        await expect(active.service.readContextAsset(reference.assetId, { ifRevision: reference.revision }))
+            .resolves.toMatchObject({ revision: reference.revision })
+        expect(active.permissionCalls).toEqual(['contextAssets'])
+
+        state.activeModules = []
+        let installedPermissionCalls = 0
+        const inactive = harness({
+            state,
+            principalId,
+            cloneStateReads: true,
+            onPermission: (permission) => {
+                if (permission !== 'installedModulesRead') return
+                installedPermissionCalls += 1
+                if (installedPermissionCalls === 2) {
+                    state.installedModules = state.installedModules
+                        .filter((module) => module.id !== 'module-active')
+                }
+            },
+        })
+
+        await expect(inactive.service.readContextAsset(reference.assetId, { ifRevision: reference.revision }))
+            .rejects.toMatchObject({ code: 'NOT_FOUND' })
+        expect(installedPermissionCalls).toBe(2)
+        expect(inactive.reads).toHaveBeenCalledOnce()
+    })
+
     it('enforces maxBytes and the 60/61 per-minute read boundary', async () => {
         let now = 10_000
         const h = harness({ now: () => now })

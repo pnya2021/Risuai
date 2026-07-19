@@ -960,15 +960,34 @@ export class ContextResourceService {
         if (!located.activeModule) await this.dependencies.requirePermission('installedModulesRead')
     }
 
-    private async reauthorizeAssetOrigin(located: LocatedAsset) {
-        const state = await this.state()
-        const current = this.allAssets(state).find((candidate) => candidate.source.identity === located.source.identity
-            && this.sameOrigin(candidate.origin, located.origin))
-        if (!current) throw new PluginApiError('NOT_FOUND', 'Context asset was removed while it was being read')
-        await this.authorizeAssetOrigin(state, current)
-        assertNotAborted(this.context)
-        if (this.storageRevision(current.source) !== this.storageRevision(located.source)) {
-            throw new PluginApiError('CONFLICT', 'Context asset changed while it was being read')
+    private async reauthorizeAssetOrigin(
+        located: LocatedAsset,
+        expectedSelectors: { characterId: string; conversationId: string },
+    ) {
+        let installedModulesAuthorized = false
+        while (true) {
+            const state = await this.state()
+            const current = this.allAssets(state).find((candidate) =>
+                candidate.source.identity === located.source.identity
+                && candidate.source.storageKey === located.source.storageKey
+                && this.sameOrigin(candidate.origin, located.origin))
+            if (!current) throw new PluginApiError('NOT_FOUND', 'Context asset was removed while it was being read')
+            if (current.origin.kind === 'character'
+                && !this.authorizedCharacterIds(state).has(current.origin.characterId)) {
+                throw new PluginApiError('PERMISSION_DENIED', 'Character asset is outside the current context')
+            }
+            const actualSelectors = this.resolveSelectors(state, {})
+            if (!this.sameSelectors(expectedSelectors, actualSelectors)) throw this.contextChanged()
+            if (current.origin.kind === 'module' && !current.activeModule && !installedModulesAuthorized) {
+                await this.dependencies.requirePermission('installedModulesRead')
+                installedModulesAuthorized = true
+                continue
+            }
+            assertNotAborted(this.context)
+            if (this.storageRevision(current.source) !== this.storageRevision(located.source)) {
+                throw new PluginApiError('CONFLICT', 'Context asset changed while it was being read')
+            }
+            return
         }
     }
 
@@ -988,7 +1007,7 @@ export class ContextResourceService {
         // Charge every well-formed, permission-bearing attempt before handle or digest scanning.
         this.readRateLimiter.consume(this.context.principalId)
         const state = await this.state()
-        this.current(state)
+        const selectors = this.resolveSelectors(state, {})
         const located = await this.locateAsset(state, assetId, options.ifRevision)
         await this.authorizeAssetOrigin(state, located)
         const cached = this.digestCache.get(located.source.storageKey)
@@ -1023,7 +1042,7 @@ export class ContextResourceService {
         }
         if (variant === 'original') {
             if (data.byteLength > maxBytes) throw new PluginApiError('RESOURCE_LIMIT', 'Context asset exceeds maxBytes')
-            await this.reauthorizeAssetOrigin(located)
+            await this.reauthorizeAssetOrigin(located, selectors)
             return {
                 data: data.slice(),
                 revision: digest.revision,
@@ -1051,7 +1070,7 @@ export class ContextResourceService {
             || thumbnail.data.byteLength > maxBytes) {
             throw new PluginApiError('RESOURCE_LIMIT', 'Thumbnail exceeds the advertised bounds')
         }
-        await this.reauthorizeAssetOrigin(located)
+        await this.reauthorizeAssetOrigin(located, selectors)
         return {
             data: thumbnail.data.slice(),
             revision: digest.revision,
