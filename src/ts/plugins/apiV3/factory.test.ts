@@ -105,6 +105,17 @@ describe('SandboxHost structured errors', () => {
     }
   })
 
+  it('installs the nativeFetch guest codec before plugin code can send DOM-only bodies', () => {
+    const { iframe } = createHarness({ nativeFetch: vi.fn() })
+    const parsed = new DOMParser().parseFromString(iframe.srcdoc, 'text/html')
+    const script = parsed.querySelector('script')?.textContent ?? ''
+    expect(script).toContain('normalizeGuestNativeFetch')
+    expect(script).toContain("propertyCache.set('nativeFetch'")
+    expect(script).toContain('ReadableStream bodies are not supported')
+    expect(script).toContain('rpcMarkOwnedTransfer')
+    expect(script).toContain('rpcIsOwnedTransfer(value)')
+  })
+
   it('requires an authorized READY/START gate and rejects stale post-start host mutations', async () => {
     let current = true
     const mutate = vi.fn()

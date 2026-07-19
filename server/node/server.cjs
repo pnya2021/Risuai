@@ -1,5 +1,6 @@
 const express = require('express');
 const app = express();
+const { createPluginFetchAuthGate, securePolicyFetch } = require('./pluginFetchPolicy.cjs');
 if (process.env.TRUST_PROXY) {
     app.set('trust proxy', Number(process.env.TRUST_PROXY) || process.env.TRUST_PROXY);
 }
@@ -13,6 +14,8 @@ const crypto = require('crypto')
 const rateLimit = require('express-rate-limit');
 const { WebSocketServer } = require('ws');
 app.use(express.static(path.join(process.cwd(), 'dist'), {index: false}));
+const pluginFetchEarlyAuthGate = createPluginFetchAuthGate((req) => isAuthorizedProxyRequest(req));
+app.use('/plugin-native-fetch', pluginFetchEarlyAuthGate);
 app.use(express.json({ limit: '100mb' }));
 app.use(express.raw({ type: 'application/octet-stream', limit: '100mb' }));
 app.use(express.text({ limit: '100mb' }));
@@ -1053,6 +1056,50 @@ app.get('/hub-proxy/*', authenticatedRouteLimiter, hubProxyFunc);
 
 app.post('/proxy', authenticatedRouteLimiter, reverseProxyFunc);
 app.post('/proxy2', authenticatedRouteLimiter, reverseProxyFunc);
+app.post('/plugin-native-fetch', authenticatedRouteLimiter, async (req, res) => {
+    const payload = req.body && typeof req.body === 'object' ? req.body : null;
+    if (!payload || typeof payload.url !== 'string' || !Array.isArray(payload.headers)) {
+        res.status(400).send({ error: 'Invalid plugin fetch request' });
+        return;
+    }
+    let body;
+    try {
+        if (payload.bodyBase64 !== undefined) {
+            if (typeof payload.bodyBase64 !== 'string' || payload.bodyBase64.length > 90 * 1024 * 1024) throw new Error('invalid body');
+            body = Buffer.from(payload.bodyBase64, 'base64');
+            if (body.byteLength > 64 * 1024 * 1024) throw new Error('body too large');
+        }
+    } catch {
+        res.status(400).send({ error: 'Invalid plugin fetch request' });
+        return;
+    }
+    const controller = new AbortController();
+    const abort = () => controller.abort();
+    req.once('aborted', abort);
+    res.once('close', () => { if (!res.writableEnded) abort(); });
+    try {
+        const result = await securePolicyFetch({
+            url: payload.url,
+            method: payload.method,
+            headers: payload.headers,
+            body,
+            allowedOrigins: payload.allowedOrigins,
+            secretHeaderNames: payload.secretHeaderNames,
+            maxRedirects: Math.min(5, Number(payload.maxRedirects ?? 5)),
+            maxResponseBytes: Math.min(64 * 1024 * 1024, Number(payload.maxResponseBytes ?? 64 * 1024 * 1024)),
+            signal: controller.signal,
+        });
+        res.status(200).send({
+            status: result.status,
+            headers: result.headers,
+            bodyBase64: result.body.toString('base64'),
+        });
+    } catch {
+        if (!res.headersSent) res.status(controller.signal.aborted ? 499 : 502).send({ error: controller.signal.aborted ? 'Plugin fetch aborted' : 'Plugin fetch failed' });
+    } finally {
+        req.removeListener('aborted', abort);
+    }
+});
 app.post('/hub-proxy/*', authenticatedRouteLimiter, hubProxyFunc);
 app.post('/proxy-stream-jobs', authenticatedRouteLimiter, async (req, res) => {
     if (!await checkProxyAuth(req, res)) {

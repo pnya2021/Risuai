@@ -1,6 +1,8 @@
 <script lang="ts">
     import { securityConfirmationQueue, securityConfirmationView } from '../../ts/plugins/securityConfirmationQueue'
 
+    const isSecretView = () => $securityConfirmationView?.request.kind === 'secret-placement'
+        || $securityConfirmationView?.request.kind === 'secret-replacement'
     const decide = (digest: string, presentationId: string, decision: boolean) =>
         securityConfirmationQueue.decide(digest, presentationId, decision)
     const modalDialog = (node: HTMLDialogElement) => {
@@ -12,30 +14,27 @@
             previousFocus?.focus()
         } }
     }
-    const initialFocus = (node: HTMLButtonElement) => {
-        queueMicrotask(() => node.focus())
-    }
+    const initialFocus = (node: HTMLButtonElement) => { queueMicrotask(() => node.focus()) }
     const dialogKey = (event: KeyboardEvent, digest: string, presentationId: string) => {
-        if (event.key === 'Escape') {
-            event.preventDefault()
-            decide(digest, presentationId, false)
-        }
+        if (event.key !== 'Escape') return
+        event.preventDefault()
+        decide(digest, presentationId, false)
     }
 </script>
 
-{#if $securityConfirmationView && $securityConfirmationView.request.kind !== 'secret-placement' && $securityConfirmationView.request.kind !== 'secret-replacement'}
-    <div class="fixed inset-0 z-[1000] flex items-center justify-center bg-black/60 p-4">
+{#if $securityConfirmationView && isSecretView()}
+    <div class="fixed inset-0 z-[1001] flex items-center justify-center bg-black/60 p-4">
         <dialog
             use:modalDialog
             role="alertdialog"
             aria-modal="true"
             aria-label={$securityConfirmationView.title}
-            aria-describedby="plugin-permission-description"
-            class="w-full max-w-lg rounded-lg border border-darkborderc bg-bgcolor p-5 text-textcolor shadow-xl"
+            aria-describedby="plugin-secret-description"
+            class="w-full max-w-xl rounded-lg border border-darkborderc bg-bgcolor p-5 text-textcolor shadow-xl"
             onkeydown={(event) => $securityConfirmationView && dialogKey(event, $securityConfirmationView.digest, $securityConfirmationView.presentationId)}
         >
             <h2 class="text-xl font-bold">{$securityConfirmationView.title}</h2>
-            <p id="plugin-permission-description" class="mt-3 whitespace-pre-wrap text-textcolor2">
+            <p id="plugin-secret-description" class="mt-3 max-h-[60vh] overflow-auto whitespace-pre-wrap break-words text-textcolor2">
                 {$securityConfirmationView.copy}
             </p>
             <div class="mt-5 flex justify-end gap-3">

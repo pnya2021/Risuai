@@ -37,6 +37,7 @@
     import Legal from './lib/Others/Legal.svelte';
     import CustomSidebarConfig from './lib/Others/CustomSidebarConfig.svelte';
     import PluginPermissionConsent from './lib/Others/PluginPermissionConsent.svelte';
+    import PluginSecretConsent from './lib/Others/PluginSecretConsent.svelte';
 
 
   
@@ -241,6 +242,7 @@
     {/if}
     <PluginAlertModal />
     <PluginPermissionConsent />
+    <PluginSecretConsent />
     {#if popupStore.children}
         <PopupList />
     {/if}

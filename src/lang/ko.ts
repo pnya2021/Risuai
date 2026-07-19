@@ -16,6 +16,16 @@ export const languageKorean = {
         "localModelInference": "승인된 로컬 이미지 태거 설치 및 실행",
         "pluginJobs": "표시 가능한 백그라운드 작업과 취소 콜백 사용",
     },
+    "pluginSecretConsent": {
+        "storeTitle": "쓰기 전용 비밀 저장",
+        "replaceTitle": "쓰기 전용 비밀 교체",
+        "store": "저장",
+        "replace": "교체",
+        "cancel": "취소",
+        "allowedOrigins": "허용된 출처",
+        "allowedPlacements": "허용된 사용 위치",
+        "writeOnlyNotice": "플러그인은 저장된 값을 다시 읽을 수 없습니다.",
+    },
     "formating": {
         "main": "메인 프롬프트",
         "jailbreak": "탈옥 프롬프트",

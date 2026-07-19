@@ -9,7 +9,7 @@ import { v4 } from "uuid";
 import { sleep } from "src/ts/util";
 import { alertConfirm, alertError, alertNormal } from "src/ts/alert";
 import { language } from "src/lang";
-import { checkCharOrder, forageStorage, getAssetStorageRevision, getFetchLogs, readImage } from "src/ts/globalApi.svelte";
+import { checkCharOrder, fetchPluginPolicyNative, forageStorage, getAssetStorageRevision, getFetchLogs, readImage } from "src/ts/globalApi.svelte";
 import { changeColorScheme, updateColorScheme, updateTextThemeAndCSS, type ColorScheme } from "src/ts/gui/colorscheme";
 import { isNodeServer, isTauri } from "src/ts/platform";
 import { get } from "svelte/store";
@@ -48,6 +48,9 @@ import { invokePermissionCheckedProvider } from './providerPermission';
 import { isCurrentPluginRuntimeRecord } from '../pluginRuntimeReplacement';
 import { ContextResourceService } from './illustration/contextResources';
 import { createRisuContextResourceAdapter } from './illustration/contextResources.risu';
+import { PluginSecretService, protectedPluginSecretBackend } from './illustration/pluginSecretStore';
+import { PluginNativeFetchService } from './illustration/nativeFetch';
+import { PluginApiError } from './illustration/errors';
 
 /*
     V3 API for RisuAI Plugins
@@ -607,6 +610,13 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
             }),
         },
     )
+    const secretService = new PluginSecretService(context, protectedPluginSecretBackend, {
+        requirePermission: () => pluginPermissionService.require(context, 'secrets', {
+            locale: DBState.db.language === 'ko' ? 'ko' : 'en',
+        }),
+        locale: DBState.db.language === 'ko' ? 'ko' : 'en',
+    })
+    const pluginNativeFetch = new PluginNativeFetchService(secretService, { request: fetchPluginPolicyNative })
     return {
 
         //Old APIs from v2.1
@@ -627,22 +637,10 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
             }
             return oldApis.risuFetch(url, options);
         },
-        nativeFetch: (url, options) => {
-            for(const blocked of urlBlacklist){
-                if(url.toLowerCase().includes(blocked)){
-                    throw new Error(`Requests to ${blocked} are blocked for security reasons.`);
-                }
-            }
-
-            //scan headers
-            const headers = options?.headers || {};
-            for(const headerName in headers){
-                if(authorizationHeaders.includes(headerName.toLowerCase())){
-                    console.warn(`Request contains potentially sensitive header '${headerName}'. handling of such headers may be changed to use server-side approch with write-only api access in the future for better security.`);
-                }
-            }
-            return oldApis.nativeFetch(url, options);
-        },
+        nativeFetch: (url, options) => pluginNativeFetch.fetch(url, options),
+        setPluginSecret: (id: string, value: string, policy) => secretService.setPluginSecret(id, value, policy),
+        hasPluginSecret: (id: string) => secretService.hasPluginSecret(id),
+        deletePluginSecret: (id: string) => secretService.deletePluginSecret(id),
         getChar: oldApis.getChar,
         setChar: oldApis.setChar,
         addProvider: (name: string, func: (arg: PluginV2ProviderArgument, abortSignal?: AbortSignal) => Promise<{ success: boolean, content: string }>, options?: PluginV3ProviderOptions) => {
@@ -1214,17 +1212,22 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
             if (!isPluginPermissionId(permission)) return Promise.resolve(false)
             return getPluginPermission(context, permission);
         },
-        getCapabilities: (ids?: string[]) => getCapabilities(context, ids, {
-            permissionState: (principalId, permission) => pluginPermissionService.state(principalId, permission),
-            runtime: {
-                registeredServices: new Set([
-                    'context.current.v1',
-                    'context.assets.v1',
-                    'context.modules-installed.v1',
-                ]),
-                hasCurrentContext: Boolean(getCurrentCharacter() && getCurrentChat()),
-            },
-        }),
+        getCapabilities: async (ids?: string[]) => {
+            const secretStatus = await protectedPluginSecretBackend.status()
+            return getCapabilities(context, ids, {
+                permissionState: (principalId, permission) => pluginPermissionService.state(principalId, permission),
+                runtime: {
+                    registeredServices: new Set([
+                        'context.current.v1',
+                        'context.assets.v1',
+                        'context.modules-installed.v1',
+                        'secrets.write-only.v1',
+                    ]),
+                    hasCurrentContext: Boolean(getCurrentCharacter() && getCurrentChat()),
+                    unavailableReasons: secretStatus.available ? {} : { 'secrets.write-only.v1': 'disabled' },
+                },
+            })
+        },
         getCurrentContext: () => contextResources.getCurrentContext(),
         getCharacterCardSnapshot: (characterId?: string) => contextResources.getCharacterCardSnapshot(characterId),
         getConversationContextSnapshot: (conversationId?: string) => contextResources.getConversationContextSnapshot(conversationId),
@@ -1391,11 +1394,9 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
                 });
             }
         },
-        saveSecretHeader: async (key: string, value: string|string[]) => {
-            //TODO: Implement server-side secret storage with write-only access for plugins, to enhance security when handling sensitive information like API keys.
-            //This will have rate-limit, to prevent saving it publicly and writing as secret every time before using it.
-            console.warn(`[RisuAI Plugin: ${plugin.name}] saveServerSecret is not implemented yet. This API is intended for securely storing sensitive information like API keys with write-only access for plugins. Please avoid using this API until it is implemented.`);
-        }
+        saveSecretHeader: async () => {
+            throw new PluginApiError('UNSUPPORTED', 'saveSecretHeader is unsafe and unsupported; use setPluginSecret with an exact origin policy')
+        },
     }
 }
 

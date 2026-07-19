@@ -42,6 +42,7 @@ import { moduleUpdate } from "./process/modules";
 import type { AccountStorage } from "./storage/accountStorage";
 import { getColdStorageItem, makeColdData } from "./process/coldstorage.svelte";
 import { isTauri, isNodeServer } from "./platform";
+import { createWebPolicyTransport, type PolicyTransportRequest } from "./plugins/apiV3/illustration/nativeFetch";
 import { persistRestoredDatabaseAndInvalidateEncoder } from './storage/restoredDatabaseState';
 import { databasePersistenceCoordinator } from './storage/databasePersistenceCoordinator';
 import { isLocalNetworkUrl } from "./network/localNetwork";
@@ -1536,15 +1537,8 @@ export class AppendableBuffer {
  * @returns {ReadableStream<Uint8Array>} - The new readable stream.
  */
 const pipeFetchLog = (fetchLogIndex: number, readableStream: ReadableStream<Uint8Array>) => {
-    
-    const splited = readableStream.tee();
-    
-    (async () => {
-        const text = await (new Response(splited[0])).text()
-        fetchLog[fetchLogIndex].response = text
-    })()
-    
-    return splited[1]
+    fetchLog[fetchLogIndex].response = '[streamed response body omitted]'
+    return readableStream
 }
 
 async function fetchViaProxyJobWs(url: string, arg: {
@@ -1759,7 +1753,6 @@ export async function fetchNative(url: string, arg: {
 }): Promise<Response> {
 
     const useInterceptor = !!arg.interceptor
-    console.log(arg.body, 'body')
     if (arg.body === undefined && (arg.method === 'POST' || arg.method === 'PUT')) {
         throw new Error('Body is required for POST and PUT requests')
     }
@@ -1816,9 +1809,9 @@ export async function fetchNative(url: string, arg: {
     let fetchLogIndex: number | null = null
     if (shouldLogFetch) {
         fetchLogIndex = addFetchLog({
-            body: new TextDecoder().decode(realBody),
-            headers: arg.headers,
-            response: 'Streamed Fetch',
+            body: `[${realBody?.byteLength ?? 0} request bytes omitted]`,
+            headers: Object.fromEntries(Object.keys(arg.headers ?? {}).map((name) => [name, '[redacted]'])),
+            response: '[streamed response body omitted]',
             success: true,
             url: url,
             resType: 'stream',
@@ -2000,6 +1993,92 @@ export async function fetchNative(url: string, arg: {
     } finally {
         timeoutSignal.cleanup()
     }
+}
+
+const secureWebPluginTransport = createWebPolicyTransport((url, options) => fetch(url, options))
+
+/** Host-only policy transport. Native/Node implementations replace this web fallback below. */
+export async function fetchPluginPolicyNative(request: PolicyTransportRequest) {
+    if (request.signal?.aborted) throw new Error('Plugin fetch aborted')
+    if (isNodeServer) {
+        const auth = await getNodeServerProxyAuth()
+        if (request.signal?.aborted) throw new Error('Plugin fetch aborted')
+        const response = await fetch('/plugin-native-fetch', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json', 'risu-auth': auth },
+            body: JSON.stringify({
+                url: request.url,
+                method: request.method,
+                headers: request.headers,
+                bodyBase64: request.body === undefined ? undefined : Buffer.from(
+                    typeof request.body === 'string' ? new TextEncoder().encode(request.body) : request.body,
+                ).toString('base64'),
+                allowedOrigins: request.allowedOrigins,
+                secretHeaderNames: request.secretHeaderNames,
+                maxRedirects: request.maxRedirects,
+                maxResponseBytes: request.maxResponseBytes,
+            }),
+            signal: request.signal,
+        })
+        const result = await response.json() as {
+            status?: number
+            headers?: Record<string, string>
+            bodyBase64?: string
+            error?: string
+        }
+        if (typeof result.status !== 'number' || typeof result.bodyBase64 !== 'string' || result.error) {
+            throw new Error('Plugin fetch bridge failed')
+        }
+        const responseBytes = Buffer.from(result.bodyBase64, 'base64')
+        return new Response([204, 205, 304].includes(result.status) ? null : responseBytes, {
+            status: result.status,
+            headers: result.headers ?? {},
+        })
+    }
+    if (isTauri) {
+        const requestId = crypto.randomUUID()
+        const abort = () => { void invoke('cancel_plugin_policy_fetch', { requestId }).catch(() => undefined) }
+        request.signal?.addEventListener('abort', abort, { once: true })
+        if (request.signal?.aborted) {
+            abort()
+            request.signal.removeEventListener('abort', abort)
+            throw new Error('Plugin fetch aborted')
+        }
+        try {
+            const raw = await invoke('plugin_policy_fetch', {
+                requestId,
+                requestJson: JSON.stringify({
+                    url: request.url,
+                    method: request.method,
+                    headers: request.headers,
+                    bodyBase64: request.body === undefined ? undefined : Buffer.from(
+                        typeof request.body === 'string' ? new TextEncoder().encode(request.body) : request.body,
+                    ).toString('base64'),
+                    allowedOrigins: request.allowedOrigins,
+                    secretHeaderNames: request.secretHeaderNames,
+                    maxRedirects: request.maxRedirects,
+                    maxResponseBytes: request.maxResponseBytes,
+                }),
+            })
+            const result = JSON.parse(String(raw)) as {
+                success?: boolean
+                status?: number
+                headers?: Record<string, string>
+                bodyBase64?: string
+            }
+            if (!result.success || typeof result.status !== 'number' || typeof result.bodyBase64 !== 'string') {
+                throw new Error('Plugin fetch native transport failed')
+            }
+            const responseBytes = Buffer.from(result.bodyBase64, 'base64')
+            return new Response([204, 205, 304].includes(result.status) ? null : responseBytes, {
+                status: result.status,
+                headers: result.headers ?? {},
+            })
+        } finally {
+            request.signal?.removeEventListener('abort', abort)
+        }
+    }
+    return secureWebPluginTransport.request(request)
 }
 
 /**

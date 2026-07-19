@@ -1,6 +1,8 @@
 // Prevents additional console window on Windows in release, DO NOT REMOVE!!
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod plugin_fetch_policy;
+
 #[tauri::command]
 fn greet(name: &str) -> String {
     format!("Hello, {}! You've been greeted from Rust!", name)
@@ -578,6 +580,7 @@ fn main() {
     }
 
     builder
+        .manage(plugin_fetch_policy::PluginFetchState::default())
         .plugin(tauri_plugin_http::init())
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_shell::init())
@@ -597,6 +600,8 @@ fn main() {
             run_py_server,
             install_py_dependencies,
             streamed_fetch,
+            plugin_fetch_policy::plugin_policy_fetch,
+            plugin_fetch_policy::cancel_plugin_policy_fetch,
             oauth_login
         ])
         .run(tauri::generate_context!())

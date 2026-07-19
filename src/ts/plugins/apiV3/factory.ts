@@ -207,6 +207,11 @@ await (async function() {
 
     const NativeWorker = globalThis.Worker;
     const NativeBlob = globalThis.Blob;
+    const NativeHeaders = globalThis.Headers;
+    const NativeFormData = globalThis.FormData;
+    const NativeURLSearchParams = globalThis.URLSearchParams;
+    const NativeRequest = globalThis.Request;
+    const NativeReadableStream = globalThis.ReadableStream;
     const NativeEventTarget = globalThis.EventTarget;
     const NativeMessageEvent = globalThis.MessageEvent;
     const NativeErrorEvent = globalThis.ErrorEvent;
@@ -688,6 +693,65 @@ await (async function() {
         });
     }
 
+    const MAX_GUEST_NATIVE_FETCH_BODY_BYTES = 64 * 1024 * 1024;
+    function guestBodySizeError() {
+        return makePluginError('RESOURCE_LIMIT', 'nativeFetch body exceeds 67108864 bytes', {
+            key: 'body', maximum: MAX_GUEST_NATIVE_FETCH_BODY_BYTES
+        });
+    }
+    function guestHeaderTuples(headers) {
+        if (headers === undefined) return [];
+        if (typeof NativeHeaders === 'function' && headers instanceof NativeHeaders) {
+            return Array.from(headers.entries(), ([name, value]) => [name, value]);
+        }
+        if (Array.isArray(headers)) return headers.map((entry) => [entry[0], entry[1]]);
+        if (headers && typeof headers === 'object') return Object.entries(headers);
+        throw makePluginError('INVALID_ARGUMENT', 'Invalid nativeFetch headers');
+    }
+    function guestSetContentType(headers, contentType) {
+        if (!contentType || headers.some(([name]) => String(name).toLowerCase() === 'content-type')) return;
+        headers.push(['content-type', contentType]);
+    }
+    async function normalizeGuestNativeFetch(url, options = {}) {
+        if (!options || typeof options !== 'object' || Array.isArray(options)) {
+            throw makePluginError('INVALID_ARGUMENT', 'Invalid nativeFetch options');
+        }
+        const normalized = { ...options };
+        const headers = guestHeaderTuples(options.headers);
+        normalized.headers = headers;
+        const body = options.body;
+        if (body === undefined) return sendRequest('CALL_ROOT', { method: 'nativeFetch', args: [url, normalized] });
+        if (typeof body === 'string') {
+            if (new TextEncoder().encode(body).byteLength > MAX_GUEST_NATIVE_FETCH_BODY_BYTES) throw guestBodySizeError();
+        } else if (body instanceof ArrayBuffer) {
+            if (body.byteLength > MAX_GUEST_NATIVE_FETCH_BODY_BYTES) throw guestBodySizeError();
+            normalized.body = rpcMarkOwnedTransfer(new Uint8Array(body.slice(0)));
+        } else if (ArrayBuffer.isView(body) && body.buffer instanceof ArrayBuffer) {
+            if (body.byteLength > MAX_GUEST_NATIVE_FETCH_BODY_BYTES) throw guestBodySizeError();
+            normalized.body = rpcMarkOwnedTransfer(new Uint8Array(body.buffer.slice(body.byteOffset, body.byteOffset + body.byteLength)));
+        } else if (typeof NativeBlob === 'function' && body instanceof NativeBlob) {
+            if (body.size > MAX_GUEST_NATIVE_FETCH_BODY_BYTES) throw guestBodySizeError();
+            normalized.body = rpcMarkOwnedTransfer(new Uint8Array(await body.arrayBuffer()));
+            guestSetContentType(headers, body.type);
+        } else if (typeof NativeURLSearchParams === 'function' && body instanceof NativeURLSearchParams) {
+            normalized.body = body.toString();
+            if (new TextEncoder().encode(normalized.body).byteLength > MAX_GUEST_NATIVE_FETCH_BODY_BYTES) throw guestBodySizeError();
+            guestSetContentType(headers, 'application/x-www-form-urlencoded;charset=UTF-8');
+        } else if (typeof NativeFormData === 'function' && body instanceof NativeFormData) {
+            const request = new NativeRequest('https://multipart.invalid/', { method: 'POST', body });
+            const declared = Number(request.headers.get('content-length') || 0);
+            if (declared > MAX_GUEST_NATIVE_FETCH_BODY_BYTES) throw guestBodySizeError();
+            normalized.body = rpcMarkOwnedTransfer(new Uint8Array(await request.arrayBuffer()));
+            if (normalized.body.byteLength > MAX_GUEST_NATIVE_FETCH_BODY_BYTES) throw guestBodySizeError();
+            guestSetContentType(headers, request.headers.get('content-type'));
+        } else if (typeof NativeReadableStream === 'function' && body instanceof NativeReadableStream) {
+            throw makePluginError('INVALID_ARGUMENT', 'ReadableStream bodies are not supported by nativeFetch');
+        } else {
+            throw makePluginError('INVALID_ARGUMENT', 'Unsupported nativeFetch body type');
+        }
+        return sendRequest('CALL_ROOT', { method: 'nativeFetch', args: [url, normalized] });
+    }
+
     
     
     
@@ -835,6 +899,7 @@ await (async function() {
             }
             return result;
         });
+        propertyCache.set('nativeFetch', normalizeGuestNativeFetch);
     } catch (e) {
         console.error('[V3 RPC] guest initialization failed');
     }

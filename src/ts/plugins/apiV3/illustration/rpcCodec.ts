@@ -117,9 +117,27 @@ export function prepareRpcMessage<T>(message: T): { message: T, transferables: T
 }
 
 export const GUEST_RPC_CODEC_SCRIPT = String.raw`
+    const rpcOwnedTransfers = new WeakSet();
+    const rpcOwnedTransferAdd = WeakSet.prototype.add;
+    const rpcOwnedTransferHas = WeakSet.prototype.has;
+    const rpcReflectApply = Reflect.apply;
+
+    function rpcMarkOwnedTransfer(value) {
+        rpcReflectApply(rpcOwnedTransferAdd, rpcOwnedTransfers, [value]);
+        return value;
+    }
+
+    function rpcIsOwnedTransfer(value) {
+        return rpcReflectApply(rpcOwnedTransferHas, rpcOwnedTransfers, [value]);
+    }
+
     function rpcClonePayload(value, seen = new WeakMap()) {
         if (!value || typeof value !== 'object') return value;
         if (seen.has(value)) return seen.get(value);
+        if (rpcIsOwnedTransfer(value)) {
+            seen.set(value, value);
+            return value;
+        }
         if (value instanceof ArrayBuffer) {
             const clone = value.slice(0);
             seen.set(value, clone);

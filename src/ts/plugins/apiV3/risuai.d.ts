@@ -1216,6 +1216,46 @@ interface PluginCapability {
     limits?: Record<string, string | number | boolean>;
 }
 
+type PluginSecretUsePolicy =
+    | { kind: 'header'; name: string; prefix?: string }
+    | { kind: 'json-body'; pointer: string; prefix?: string };
+
+interface PluginSecretPolicy {
+    /** Canonical exact HTTPS origins. Wildcards, paths, credentials, and private addresses are rejected. */
+    allowedOrigins: string[];
+    /** Exact header names or RFC 6901 JSON pointers where this Secret may be placed. */
+    uses: PluginSecretUsePolicy[];
+}
+
+interface PluginSecretRef {
+    pluginSecret: string;
+}
+
+type PluginNativeFetchHeaderValue = string | PluginSecretRef;
+type PluginNativeFetchHeaders =
+    | Record<string, PluginNativeFetchHeaderValue>
+    | Array<[string, PluginNativeFetchHeaderValue]>;
+type PluginNativeFetchJsonValue =
+    | null | boolean | number | string | PluginSecretRef
+    | PluginNativeFetchJsonValue[]
+    | { [key: string]: PluginNativeFetchJsonValue };
+type PluginNativeFetchInit = {
+    method?: string;
+    headers?: HeadersInit | PluginNativeFetchHeaders;
+    /** Fully countable and replayable BodyInit. ReadableStream is rejected. */
+    body?: BodyInit;
+    /** JSON-safe tree supporting exact-shape `{ pluginSecret: id }` leaves. Mutually exclusive with body. */
+    jsonBody?: PluginNativeFetchJsonValue;
+    signal?: AbortSignal;
+    credentials?: 'omit';
+    referrer?: '';
+    referrerPolicy?: 'no-referrer';
+    keepalive?: false;
+    mode?: 'cors';
+    redirect?: 'manual';
+    cache?: 'no-store';
+};
+
 type CharacterId = string;
 type ConversationId = string;
 type Revision = string;
@@ -1589,15 +1629,23 @@ interface RisuaiPluginAPI {
      * @param options - Fetch options
      * @returns Response promise
      */
-    nativeFetch(url: string, options?: RequestInit): Promise<Response>;
+    nativeFetch(url: string, options?: PluginNativeFetchInit): Promise<Response>;
 
     /**
-     * Saves a secret header for network requests, for protected Headers (like Authorization) that are stripped by Risuai for security.
-     * To use saved secret headers, use an object `{ secretHeader: 'Header-Name' }` in the `headers` field of `nativeFetch` options,
-     * Like `{ headers: {"Authorization":{ secretHeader: 'Authorization' }} }`
-     * @m This API is work in progress and may have breaking changes in the future.
-     * @param key - Header key (e.g., 'Authorization')
-     * @param value - Header value.
+     * Stores or atomically replaces a device-local, write-only Secret and its complete placement policy.
+     * The Host always shows a confirmation naming every canonical origin and placement.
+     */
+    setPluginSecret(id: string, value: string, policy: PluginSecretPolicy): Promise<void>;
+
+    /** Returns only whether this plugin principal owns the Secret. The value and policy are never returned. */
+    hasPluginSecret(id: string): Promise<boolean>;
+
+    /** Deletes a Secret owned by this plugin principal. */
+    deletePluginSecret(id: string): Promise<boolean>;
+
+    /**
+     * @deprecated This origin-less legacy API is unsafe and always rejects with `UNSUPPORTED`.
+     * Use `setPluginSecret` with an exact origin policy and `{ pluginSecret: id }` references.
      */
     saveSecretHeader(key: string, prefix: string, value: string|string[]): Promise<void>;
 
