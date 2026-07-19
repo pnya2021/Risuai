@@ -1,5 +1,5 @@
 export interface ColdDatabaseHydrationAdapter<TDatabase> {
-    setDatabase(data: TDatabase): { pluginStateChanged: boolean }
+    setDatabase(data: TDatabase): { pluginStateChanged: boolean; contextIdsChanged?: boolean }
     getSnapshot(): TDatabase
     setPatchSyncBaseline?(data: TDatabase): void
 }
@@ -27,7 +27,7 @@ export function hasPendingColdDatabaseWriteback() {
 export function hydrateColdDatabase<TDatabase>(data: TDatabase, adapter: ColdDatabaseHydrationAdapter<TDatabase>) {
     const result = adapter.setDatabase(data)
     adapter.setPatchSyncBaseline?.(adapter.getSnapshot())
-    if (result.pluginStateChanged) requestColdDatabaseWriteback()
+    if (result.pluginStateChanged || result.contextIdsChanged) requestColdDatabaseWriteback()
     return result
 }
 

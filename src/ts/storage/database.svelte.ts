@@ -27,6 +27,7 @@ import {
 import { normalizePluginDatabaseState } from '../plugins/pluginDatabaseNormalization';
 import { retirePluginPrincipals } from '../plugins/pluginRetirement';
 import { withAuthorizedPluginMutationLock } from '../plugins/pluginMutationCoordinator';
+import { normalizeContextRecordIds } from './contextRecordIds';
 
 //APP_VERSION_POINT is to locate the app version in the database file for version bumping
 export let appVer = "2026.6.214" //<APP_VERSION_POINT>
@@ -37,6 +38,7 @@ export function setDatabase(data:Database){
     if(checkNullish(data.characters)){
         data.characters = []
     }
+    const contextIdNormalization = normalizeContextRecordIds(data)
     if(checkNullish(data.apiType)){
         data.apiType = 'gemini-3-flash-preview'
     }
@@ -717,13 +719,14 @@ export function setDatabase(data:Database){
     data.coldstorage ??= data?.plugins?.length === 0
     changeLanguage(data.language)
     setDatabaseLite(data)
-    return pluginStateNormalization
+    return { ...pluginStateNormalization, ...contextIdNormalization }
 }
 
 export function setDatabaseLite(data:Database){
     const pluginStateNormalization = normalizePluginDatabaseState(data)
+    const contextIdNormalization = normalizeContextRecordIds(data)
     DBState.db = data
-    return pluginStateNormalization
+    return { ...pluginStateNormalization, ...contextIdNormalization }
 }
 
 /**

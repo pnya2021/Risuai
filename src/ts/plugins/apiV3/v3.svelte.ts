@@ -1,7 +1,7 @@
 import { allowedDbKeys, applyProgrammaticDatabaseMutation, customProviderStore, getV2PluginAPIs, handlePluginInstallViaPlugin, pluginV2, type PluginV2ProviderArgument, type PluginV2ProviderOptions, type RisuPlugin } from "../plugins.svelte";
 import { invokeSandboxCleanupCallback, SandboxHost } from "./factory";
 import { replacePluginV3RuntimeSnapshot } from "../pluginV3Reload";
-import { getDatabase } from "src/ts/storage/database.svelte";
+import { getCurrentCharacter, getCurrentChat, getDatabase } from "src/ts/storage/database.svelte";
 import { SafeLocalPluginStorage, tagWhitelist } from "../pluginSafeClass";
 import DOMPurify from 'dompurify';
 import { additionalChatMenu, additionalFloatingActionButtons, additionalHamburgerMenu, additionalSettingsMenu, bodyIntercepterStore, chatPanelStore, DBState, selectedCharID, type MenuDef } from "src/ts/stores.svelte";
@@ -9,7 +9,7 @@ import { v4 } from "uuid";
 import { sleep } from "src/ts/util";
 import { alertConfirm, alertError, alertNormal } from "src/ts/alert";
 import { language } from "src/lang";
-import { checkCharOrder, forageStorage, getFetchLogs } from "src/ts/globalApi.svelte";
+import { checkCharOrder, forageStorage, getAssetStorageRevision, getFetchLogs, readImage } from "src/ts/globalApi.svelte";
 import { changeColorScheme, updateColorScheme, updateTextThemeAndCSS, type ColorScheme } from "src/ts/gui/colorscheme";
 import { isNodeServer, isTauri } from "src/ts/platform";
 import { get } from "svelte/store";
@@ -21,7 +21,7 @@ import { sendChat as processSendChat, doingChat } from "src/ts/process/index.sve
 import { getModelInfo } from "src/ts/model/modellist";
 import type { ModelModeExtended } from "src/ts/process/request/shared";
 import { requestChatDataMain } from "src/ts/process/request/request";
-import { getModuleLorebooks } from "src/ts/process/modules";
+import { getActiveModulesWithReasons, getModuleLorebooks } from "src/ts/process/modules";
 import {
     registerTTSPreprocessor,
     unregisterTTSPreprocessor,
@@ -46,6 +46,8 @@ import { stripPluginPrincipal } from '../pluginPrincipal';
 import { cleanupOwnedProviderRegistration, InstanceChannelRegistry, InstanceCleanupRegistry, OwnedTimeoutSet, registerInstanceResourceIfActive, removeOwnedArrayEntry, removeOwnedMapEntry, retainOrCleanupInstanceResource } from './pluginInstanceResources';
 import { invokePermissionCheckedProvider } from './providerPermission';
 import { isCurrentPluginRuntimeRecord } from '../pluginRuntimeReplacement';
+import { ContextResourceService } from './illustration/contextResources';
+import { createRisuContextResourceAdapter } from './illustration/contextResources.risu';
 
 /*
     V3 API for RisuAI Plugins
@@ -589,6 +591,22 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
     )
     const canRegisterResource = () => !context.signal.aborted && isExecutionCurrent()
     const oldApis = getV2PluginAPIs(canRegisterResource, isExecutionCurrent);
+    const contextResources = new ContextResourceService(
+        context,
+        createRisuContextResourceAdapter({
+            getDatabase,
+            getCurrentCharacter,
+            getCurrentChat,
+            getActiveModulesWithReasons,
+            readImage,
+            getAssetStorageRevision,
+        }),
+        {
+            requirePermission: (permission) => pluginPermissionService.require(context, permission, {
+                locale: DBState.db.language === 'ko' ? 'ko' : 'en',
+            }),
+        },
+    )
     return {
 
         //Old APIs from v2.1
@@ -1198,7 +1216,22 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
         },
         getCapabilities: (ids?: string[]) => getCapabilities(context, ids, {
             permissionState: (principalId, permission) => pluginPermissionService.state(principalId, permission),
+            runtime: {
+                registeredServices: new Set([
+                    'context.current.v1',
+                    'context.assets.v1',
+                    'context.modules-installed.v1',
+                ]),
+                hasCurrentContext: Boolean(getCurrentCharacter() && getCurrentChat()),
+            },
         }),
+        getCurrentContext: () => contextResources.getCurrentContext(),
+        getCharacterCardSnapshot: (characterId?: string) => contextResources.getCharacterCardSnapshot(characterId),
+        getConversationContextSnapshot: (conversationId?: string) => contextResources.getConversationContextSnapshot(conversationId),
+        listContextAssets: (options) => contextResources.listContextAssets(options),
+        getActiveModules: (options) => contextResources.getActiveModules(options),
+        listContextModules: (options) => contextResources.listContextModules(options),
+        readContextAsset: (assetId: string, options) => contextResources.readContextAsset(assetId, options),
         //Internal use APIs
         _getOldKeys: () => {
             return Object.keys(oldApis)

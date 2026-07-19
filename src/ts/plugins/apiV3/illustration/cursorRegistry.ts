@@ -104,3 +104,6 @@ export class CursorRegistry {
         return lifecycle.every(([key, epoch]) => (this.lifecycleEpochs.get(key) ?? 0) === epoch)
     }
 }
+
+/** Shared extension-wide registry so the advertised 64-cursor ceiling is per principal, not per service. */
+export const illustrationCursorRegistry = new CursorRegistry()

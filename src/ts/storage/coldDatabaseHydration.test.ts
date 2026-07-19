@@ -8,6 +8,7 @@ import {
     requestColdDatabaseWriteback,
     runAfterColdDatabaseWriteback,
 } from './coldDatabaseHydration'
+import { normalizeContextRecordIds } from './contextRecordIds'
 
 describe('cold database hydration writeback', () => {
     beforeEach(async () => { await flushColdDatabaseWriteback(async () => undefined) })
@@ -23,6 +24,24 @@ describe('cold database hydration writeback', () => {
             async () => { events.push('plugin-load') },
         )
         expect(events).toEqual(['normalize', 'durable-write', 'plugin-load'])
+    })
+
+    it('durably writes normalized context IDs before plugins and preserves them after reload', async () => {
+        const database = { characters: [{ chaId: '', chats: [{ id: '' }] }] }
+        let durable: typeof database | undefined
+        hydrateColdDatabase(database, {
+            setDatabase: (value) => ({ pluginStateChanged: false, ...normalizeContextRecordIds(value) }),
+            getSnapshot: () => structuredClone(database),
+        })
+        const assigned = structuredClone(database)
+        await loadPluginsAfterColdDatabaseWriteback(
+            async () => { durable = structuredClone(database) },
+            async () => expect(durable).toEqual(assigned),
+        )
+        expect(durable).toBeDefined()
+        expect(normalizeContextRecordIds(durable!, () => { throw new Error('must not regenerate') }))
+            .toEqual({ contextIdsChanged: false })
+        expect(durable).toEqual(assigned)
     })
 
     it('keeps a failed write pending and retries it at the lowest plugin reload boundary', async () => {

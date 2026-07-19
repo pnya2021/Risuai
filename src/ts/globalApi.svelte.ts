@@ -219,6 +219,15 @@ export async function getFileSrc(loc: string) {
 }
 
 let appDataDirPath = ''
+const assetStorageEpochs = new Map<string, number>()
+
+const markAssetStorageMutation = (storageKey: string) => {
+    assetStorageEpochs.set(storageKey, (assetStorageEpochs.get(storageKey) ?? 0) + 1)
+}
+
+/** Cache version for Host asset readers; the storage key remains opaque to plugins. */
+export const getAssetStorageRevision = (storageKey: string) =>
+    `${storageKey}:${assetStorageEpochs.get(storageKey) ?? 0}`
 
 /**
  * Reads an image file and returns its data.
@@ -266,17 +275,21 @@ export async function saveAsset(data: Uint8Array, customId: string = '', fileNam
         fileExtension = fileName.split('.').pop()
     }
     if (isTauri) {
-        await writeFile(`assets/${id}.${fileExtension}`, data, {
+        const storageKey = `assets/${id}.${fileExtension}`
+        await writeFile(storageKey, data, {
             baseDir: BaseDirectory.AppData
         });
-        return `assets/${id}.${fileExtension}`
+        markAssetStorageMutation(storageKey)
+        return storageKey
     }
     else {
         let form = `assets/${id}.${fileExtension}`
         const replacer = await forageStorage.setItem(form, data)
         if (replacer) {
+            markAssetStorageMutation(replacer)
             return replacer
         }
+        markAssetStorageMutation(form)
         return form
     }
 }

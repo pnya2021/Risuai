@@ -11,6 +11,7 @@ import { DBState, HideIconStore, moduleBackgroundEmbedding, ReloadGUIPointer } f
 import {get} from "svelte/store"
 import { convertCharacterToModule, convertModuleToCharacter } from "../interchangeability"
 import { exportCharacterCard, importCharacterProcess } from "../characterCards"
+import { resolveModuleActivations, type ModuleActivationReason } from "../plugins/apiV3/illustration/moduleActivation"
 
 export interface MCPModule{
     url: string
@@ -393,37 +394,22 @@ function deduplicateModuleById(modules:RisuModule[]){
     return newModules
 }
 
-let lastModules = ''
-let lastModuleData:RisuModule[] = []
-export function getModules(){
+export function getActiveModulesWithReasons(): Array<{ module: RisuModule; activatedBy: ModuleActivationReason[] }> {
     const currentChat = getCurrentChat()
     const character = getCurrentCharacter()
     const persona = checkPersonaBinded()
     const db = getDatabase()
-    let ids = db.enabledModules ?? []
-    if (currentChat){
-        ids = ids.concat(currentChat.modules ?? [])
-    }
-    if(character && character.modules){
-        ids = ids.concat(character.modules)
-    }
-    if(persona && persona.embeddedModule){
-        ids = ids.concat([persona.embeddedModule?.id])
-    }
-    if(db.moduleIntergration){
-        const intList = db.moduleIntergration.split(',').map((s) => s.trim())
-        ids = ids.concat(intList)
-    }
-    const idsJoined = ids.join('-')
-    if(lastModules === idsJoined){
-        return lastModuleData
-    }
+    return resolveModuleActivations(db.modules ?? [], {
+        global: db.enabledModules ?? [],
+        chat: currentChat?.modules ?? [],
+        character: character?.modules ?? [],
+        personaModule: persona?.embeddedModule ?? null,
+        integration: db.moduleIntergration?.split(',').map((value) => value.trim()).filter(Boolean) ?? [],
+    })
+}
 
-    let modules:RisuModule[] = getModuleByIds(ids)
-    lastModules = idsJoined
-    lastModuleData = modules
-    return modules
-
+export function getModules(){
+    return getActiveModulesWithReasons().map(({ module }) => module)
 }
 
 
@@ -583,6 +569,5 @@ export function moduleUpdate(){
 }
 
 export function refreshModules(){
-    lastModules = ''
-    lastModuleData = []
+    // Active module resolution is derived from current state on every call.
 }

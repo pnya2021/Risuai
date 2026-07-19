@@ -1216,6 +1216,83 @@ interface PluginCapability {
     limits?: Record<string, string | number | boolean>;
 }
 
+type CharacterId = string;
+type ConversationId = string;
+type Revision = string;
+
+interface CurrentContextRef {
+    characterId: CharacterId;
+    conversationId: ConversationId;
+    personaId?: string;
+    characterRevision: Revision;
+    conversationRevision: Revision;
+}
+
+interface CharacterTextSection {
+    key: string;
+    label: string;
+    content: string;
+}
+
+interface ContextLoreSnapshot {
+    id: string;
+    name: string;
+    content: string;
+    enabled: boolean;
+}
+
+interface CharacterCardSnapshot {
+    id: CharacterId;
+    revision: Revision;
+    type: 'character' | 'group';
+    name: string;
+    textSections: CharacterTextSection[];
+    lorebook: ContextLoreSnapshot[];
+    groupMemberIds?: CharacterId[];
+}
+
+interface ConversationContextSnapshot {
+    id: ConversationId;
+    revision: Revision;
+    localLorebook: ContextLoreSnapshot[];
+    selectedModuleIds: string[];
+}
+
+type ContextAssetRole = 'portrait' | 'emotion' | 'additional' | 'module';
+
+interface ContextAssetRef {
+    assetId: string;
+    revision: Revision;
+    name: string;
+    extension?: string;
+    mediaType?: string;
+    byteLength?: number;
+    role: ContextAssetRole;
+    origin:
+        | { kind: 'character'; characterId: CharacterId }
+        | { kind: 'module'; moduleId: string };
+}
+
+type ModuleActivationReason = 'global' | 'chat' | 'character' | 'persona' | 'integration';
+
+interface ActiveModuleSummary {
+    id: string;
+    namespace?: string;
+    name: string;
+    activatedBy: ModuleActivationReason[];
+}
+
+interface ContextModuleSnapshot extends ActiveModuleSummary {
+    revision: Revision;
+    description: string;
+    lorebook: ContextLoreSnapshot[];
+}
+
+interface CursorPage<T> {
+    items: T[];
+    nextCursor?: string;
+}
+
 interface RisuaiPluginAPI {
     // ========== Version Information ==========
 
@@ -1966,6 +2043,57 @@ interface RisuaiPluginAPI {
 
     /** Pure feature discovery. This method never opens a permission prompt. */
     getCapabilities(ids?: string[]): Promise<Record<string, PluginCapability>>;
+
+    /** Returns stable references for the current card and conversation. */
+    getCurrentContext(): Promise<CurrentContextRef>;
+
+    /** Returns descriptive current-card or current-group-member data only. */
+    getCharacterCardSnapshot(characterId?: CharacterId): Promise<CharacterCardSnapshot>;
+
+    /** Returns current-conversation lore and selected module IDs. */
+    getConversationContextSnapshot(conversationId?: ConversationId): Promise<ConversationContextSnapshot>;
+
+    /** Lists opaque, revision-bound resources from the authorized current context. */
+    listContextAssets(options?: {
+        characterId?: CharacterId;
+        conversationId?: ConversationId;
+        include?: ContextAssetRole[];
+        moduleScope?: 'active' | 'installed' | 'none';
+        mediaTypes?: string[];
+        cursor?: string;
+        limit?: number;
+    }): Promise<{
+        contextRevision: Revision;
+        assets: ContextAssetRef[];
+        nextCursor?: string;
+    }>;
+
+    /** Returns unpaged summaries for the modules active in the authorized context. */
+    getActiveModules(options?: {
+        characterId?: CharacterId;
+        conversationId?: ConversationId;
+    }): Promise<ActiveModuleSummary[]>;
+
+    /** Lists descriptive active or installed module metadata without executable fields. */
+    listContextModules(options?: {
+        characterId?: CharacterId;
+        conversationId?: ConversationId;
+        scope?: 'active' | 'installed';
+        cursor?: string;
+        limit?: number;
+    }): Promise<CursorPage<ContextModuleSnapshot>>;
+
+    /** Reads an opaque context resource after re-authorizing its current origin. */
+    readContextAsset(assetId: string, options?: {
+        ifRevision?: Revision;
+        variant?: 'original' | 'thumbnail';
+        maxBytes?: number;
+    }): Promise<{
+        data: Uint8Array;
+        revision: Revision;
+        name: string;
+        mediaType: string;
+    }>;
 
     /**
      * Unwraps a SafeClassArray into a standard array

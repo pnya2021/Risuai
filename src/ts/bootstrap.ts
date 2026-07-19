@@ -225,7 +225,7 @@ export async function loadData() {
             try {
                 await loadPluginsAfterColdDatabaseWriteback(persistNormalizedDatabaseBeforePlugins, loadPlugins)
             } catch (error) {
-                console.error('[bootstrap] normalized plugin principal writeback failed; plugins remain disabled', error)
+                console.error('[bootstrap] normalized database writeback failed; plugins remain disabled', error)
             }
             if (getDatabase().account) {
                 LoadingStatusState.text = "Checking Account Data..."
