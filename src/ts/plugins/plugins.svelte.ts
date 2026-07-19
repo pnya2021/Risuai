@@ -1,6 +1,6 @@
 import { get, writable } from "svelte/store";
 import { language } from "../../lang";
-import { getCurrentCharacter, getDatabase, setDatabase, setDatabaseLite } from "../storage/database.svelte";
+import { getCurrentCharacter, getDatabase, setDatabase, setDatabaseLite, setDatabaseLive, type Database } from "../storage/database.svelte";
 import { alertConfirm, alertError, alertPluginConfirm } from "../alert";
 import { selectSingleFile, sleep } from "../util";
 import type { OpenAIChat } from "../process/index.svelte";
@@ -11,6 +11,15 @@ import { checkCodeSafety } from "./pluginSafety";
 import { SafeDocument, SafeIdbFactory, SafeLocalStorage } from "./pluginSafeClass";
 import { loadV3Plugins } from "./apiV3/v3.svelte";
 import { pluginCodeTranspiler } from "./apiV3/transpiler";
+import { invalidatePluginPrincipal, isCanonicalPluginPrincipalId, preparePluginRecord, reconcileProgrammaticPluginRecords, stripPluginPrincipal } from './pluginPrincipal';
+import { pluginDataLifecycle } from './pluginDataLifecycle';
+import { retirePluginPrincipals } from './pluginRetirement';
+import { pluginRuntimeReloadCoordinator, withPluginMutationLock } from './pluginMutationCoordinator';
+import { isCurrentPluginRuntimeRecord, PluginRuntimeReplacementTransaction, reloadPluginRuntime, runAuthorizedPluginRuntimeMutation, runCoordinatedPersistedRuntimeMutation, runCoordinatedPluginRuntimeMutation, suspendPluginRuntime } from './pluginRuntimeReplacement';
+import { createPluginDatabaseBoundary } from './pluginDatabaseBoundary';
+import { createRevocableV2Api, createV2RuntimeAuthorization, resetPluginV2Runtime } from './pluginV2Runtime';
+import { ensureColdDatabaseWriteback, runAfterColdDatabaseWriteback } from '../storage/coldDatabaseHydration';
+import { runPrincipalBoundPluginUpdate } from './pluginUpdateAuthorization';
 
 export const customProviderStore = writable([] as string[])
 
@@ -27,6 +36,8 @@ interface ProviderPlugin {
     updateURL?: string
     enabled?: boolean
     allowedIPC?: string[]
+    /** Host-owned installed-record identity. */
+    principalId?: string
 }
 interface ProviderPluginCustomLink {
     link: string
@@ -108,18 +119,12 @@ export const checkPluginUpdate = async (plugin: RisuPlugin) => {
 
 export async function updatePlugin(plugin: RisuPlugin) {
     try {
-        if(!plugin.updateURL){
-            return false
-        }
-        const response = await fetch(plugin.updateURL)
-        if(response.status >= 200 && response.status < 300){
-            const jsFile = await response.text()
-            await importPlugin(jsFile, {
-                isUpdate: true,
-                originalPluginName: plugin.name
-            })
-            return true
-        }
+        return await runPrincipalBoundPluginUpdate(plugin, {
+            fetchUpdate: (url) => fetch(url),
+            isInstalledRecordCurrent: (name, principalId, script) => (getDatabase({ snapshot: true }).plugins ?? [])
+                .some((record: RisuPlugin) => record.name === name && record.principalId === principalId && record.script === script),
+            importUpdate: importPlugin,
+        })
     } catch (error) {
         console.error('Failed to update plugin:', error)
     }
@@ -131,6 +136,8 @@ export async function importPlugin(code:string|null = null, argu:{
     originalPluginName?: string
     isHotReload?: boolean
     isTypescript?: boolean
+    expectedPrincipalId?: string
+    expectedPluginScript?: string
 } = {}) {
     try {
         let jsFile = ''
@@ -388,9 +395,22 @@ export async function importPlugin(code:string|null = null, argu:{
             enabled: true
         }
 
+        const runtimeReplacement = await preparePluginRuntimeReplacement()
+        const importedPlugin = await runCoordinatedPluginRuntimeMutation(runtimeReplacement, (markLive) => withPluginMutationLock(async () => {
+        db = getDatabase()
         db.plugins ??= []
 
         const oldPluginIndex = db.plugins.findIndex((p: RisuPlugin) => p.name === pluginData.name);
+        const oldPlugin = oldPluginIndex === -1 ? undefined : db.plugins[oldPluginIndex]
+
+        if (argu.expectedPrincipalId !== undefined && (
+            !isCanonicalPluginPrincipalId(argu.expectedPrincipalId)
+            || oldPlugin?.principalId !== argu.expectedPrincipalId
+            || (argu.expectedPluginScript !== undefined && oldPlugin.script !== argu.expectedPluginScript)
+        )) {
+            console.warn(`Stopped hot reload for ${pluginData.name}: installed plugin identity changed.`)
+            return
+        }
 
         if(originalPluginName && originalPluginName !== pluginData.name){
             showError(`When updating plugin "${originalPluginName}", the plugin name cannot be changed to "${pluginData.name}". Please keep the original name to update.`)
@@ -403,6 +423,17 @@ export async function importPlugin(code:string|null = null, argu:{
             if(!c){
                 return
             }
+        }
+
+        const mutationKind = argu.isHotReload ? 'hot-reload'
+            : isUpdate ? 'trusted-update'
+            : oldPlugin ? 'manual-replacement'
+            : 'fresh-install'
+        pluginData = preparePluginRecord(pluginData, oldPlugin, { kind: mutationKind })
+        markLive()
+
+        if (oldPlugin?.principalId && oldPlugin.principalId !== pluginData.principalId) {
+            await retirePluginPrincipals([oldPlugin.principalId], invalidatePluginPrincipal)
         }
 
         if(oldPluginIndex !== -1){
@@ -419,7 +450,10 @@ export async function importPlugin(code:string|null = null, argu:{
         console.log(`Imported plugin: ${pluginData.name} (API v${apiVersion})`)
         setDatabaseLite(db)
 
-        loadPlugins()
+        return pluginData
+        }), reloadCurrentPluginsUnlocked, failClosedPluginRuntime)
+        if (!importedPlugin) return
+        return importedPlugin
         
     } catch (error) {
         console.error(error)
@@ -428,18 +462,144 @@ export async function importPlugin(code:string|null = null, argu:{
 }
 
 let pluginTranslator = false
+const pluginRuntimeAdapter = { loadV2: loadV2Plugin, loadV3: loadV3Plugins }
+const snapshotEnabledPlugins = () => safeStructuredClone(getDatabase().plugins ?? [])
+    .filter((plugin: RisuPlugin) => plugin.enabled) as RisuPlugin[]
+const reloadPluginSnapshot = (installed: RisuPlugin[]) => runAfterColdDatabaseWriteback(async () => {
+    console.log('Loading plugins...')
+    const pluginV2 = installed.filter((plugin) => plugin.version === 2 || plugin.version === '2.1')
+    const pluginV3 = installed.filter((plugin) => plugin.version === '3.0')
+    await reloadPluginRuntime(pluginV2, pluginV3, pluginRuntimeAdapter)
+})
+const reloadCurrentPluginsUnlocked = () => reloadPluginSnapshot(snapshotEnabledPlugins())
+const failClosedPluginRuntime = () => location.reload()
+
+export async function preparePluginRuntimeReplacement(authorizeBeforeSuspend: () => boolean = () => true) {
+    await ensureColdDatabaseWriteback()
+    const release = await pluginRuntimeReloadCoordinator.acquire()
+    return PluginRuntimeReplacementTransaction.prepare({
+        suspend: () => suspendPluginRuntime(pluginRuntimeAdapter),
+        resume: reloadCurrentPluginsUnlocked,
+        failClosed: failClosedPluginRuntime,
+        release,
+    }, authorizeBeforeSuspend)
+}
 
 export async function loadPlugins() {
-    console.log('Loading plugins...')
-    let db = getDatabase()
+    await ensureColdDatabaseWriteback()
+    return pluginRuntimeReloadCoordinator.run(
+        snapshotEnabledPlugins,
+        (plugins) => reloadPluginSnapshot(plugins as RisuPlugin[]),
+    )
+}
 
+export async function replaceDatabaseWithPluginRuntime(data: Database, options: {
+    transaction?: PluginRuntimeReplacementTransaction
+    persist?: (database: Database) => void | Promise<void>
+    authorizeBeforeSuspend?: () => boolean
+    authorizeAfterSuspend?: () => boolean
+} = {}) {
+    await runAuthorizedPluginRuntimeMutation({
+        prepare: () => options.transaction ?? preparePluginRuntimeReplacement(options.authorizeBeforeSuspend),
+        authorizeAfterSuspend: options.authorizeAfterSuspend,
+        mutate: async (markLive) => {
+            await setDatabaseLive(data, options.authorizeAfterSuspend, markLive)
+            await options.persist?.(getDatabase({ snapshot: true }))
+        },
+        reload: reloadCurrentPluginsUnlocked,
+        failClosed: failClosedPluginRuntime,
+    })
+}
 
-    const enabledPlugins = safeStructuredClone(db.plugins).filter((p: RisuPlugin) => p.enabled)
-    const pluginV2 = enabledPlugins.filter((a: RisuPlugin) => a.version === 2 || a.version === '2.1')
-    const pluginV3 = enabledPlugins.filter((a: RisuPlugin) => a.version === '3.0')
+export async function replacePersistedDatabaseWithPluginRuntime<T>(
+    persistRequest: () => T | Promise<T>,
+    readPersistedDatabase: () => Database | Promise<Database>,
+    persistNormalizedDatabase?: (database: Database) => void | Promise<void>,
+) {
+    const transaction = await preparePluginRuntimeReplacement()
+    const { persisted } = await runCoordinatedPersistedRuntimeMutation(
+        transaction,
+        persistRequest,
+        async () => {
+            await setDatabaseLive(await readPersistedDatabase())
+            await persistNormalizedDatabase?.(getDatabase({ snapshot: true }))
+        },
+        reloadCurrentPluginsUnlocked,
+        failClosedPluginRuntime,
+    )
+    return persisted
+}
 
-    await loadV2Plugin(pluginV2)
-    await loadV3Plugins(pluginV3)
+export async function runSuspendedPluginRuntimeMutation<T>(mutation: (control: {
+    markIrreversibleMutation: () => void
+    replaceLiveDatabase: (database: Database) => Promise<void>
+}) => T | Promise<T>) {
+    const transaction = await preparePluginRuntimeReplacement()
+    return runCoordinatedPluginRuntimeMutation(
+        transaction,
+        (markLive) => mutation({
+            markIrreversibleMutation: markLive,
+            replaceLiveDatabase: async (database) => {
+                markLive()
+                await setDatabaseLive(database)
+            },
+        }),
+        reloadCurrentPluginsUnlocked,
+        failClosedPluginRuntime,
+    )
+}
+
+export async function replaceInstalledPluginsProgrammatically(incoming: RisuPlugin[]) {
+    const transaction = await preparePluginRuntimeReplacement()
+    return runCoordinatedPluginRuntimeMutation(
+        transaction,
+        (markLive) => withPluginMutationLock(async () => {
+            const replacement = reconcileProgrammaticPluginRecords(DBState.db.plugins ?? [], incoming)
+            markLive()
+            await retirePluginPrincipals(replacement.invalidatedPrincipalIds, invalidatePluginPrincipal)
+            DBState.db.plugins = replacement.records as RisuPlugin[]
+            return DBState.db.plugins
+        }),
+        reloadCurrentPluginsUnlocked,
+        failClosedPluginRuntime,
+    )
+}
+
+export async function setInstalledPluginEnabled(principalId: string, enabled: boolean) {
+    const transaction = await preparePluginRuntimeReplacement()
+    return runCoordinatedPluginRuntimeMutation(
+        transaction,
+        (markLive) => withPluginMutationLock(async () => {
+            const plugin = (DBState.db.plugins ?? []).find((entry) => entry.principalId === principalId)
+            if (!plugin) return false
+            markLive()
+            plugin.enabled = enabled
+            DBState.db.plugins = [...DBState.db.plugins]
+            return true
+        }),
+        reloadCurrentPluginsUnlocked,
+        failClosedPluginRuntime,
+    )
+}
+
+export async function removeInstalledPlugin(principalId: string) {
+    const removed = await withPluginMutationLock(async () => {
+        const plugin = (DBState.db.plugins ?? []).find((entry) => entry.principalId === principalId)
+        if (!plugin) return false
+        await pluginDataLifecycle.retirePrincipal(principalId, {
+            invalidate: () => invalidatePluginPrincipal(principalId),
+            remove: () => {
+                const plugins = DBState.db.plugins ?? []
+                const index = plugins.findIndex((entry) => entry.principalId === principalId)
+                if (index >= 0) plugins.splice(index, 1)
+                if (DBState.db.currentPluginProvider === plugin.name) DBState.db.currentPluginProvider = ''
+                DBState.db.plugins = plugins
+            },
+        })
+        return true
+    })
+    if (removed) await loadPlugins()
+    return removed
 }
 
 export type PluginV2ProviderArgument = {
@@ -473,7 +633,9 @@ export const pluginV2 = {
     replacerbeforeRequest: new Set<ReplacerFunction>(),
     replacerafterRequest: new Set<(content: string, type: string) => string | Promise<string>>(),
     unload: new Set<() => void | Promise<void>>(),
-    loaded: false
+    loaded: false,
+    generation: 0,
+    ownedResources: new Set<() => void>(),
 }
 
 export const allowedDbKeys = [
@@ -503,8 +665,12 @@ export const allowedDbKeys = [
     'characterOrder'
 ]
 
-export const getV2PluginAPIs = () => {
-    return {
+export const getV2PluginAPIs = (
+    isActive: () => boolean,
+    isInstalledRecordCurrent: () => boolean = isActive,
+) => {
+    let scopedApi: any
+    const rawApi = {
         risuFetch: globalFetch,
         nativeFetch: fetchNative,
         getArg: (arg: string) => {
@@ -578,8 +744,8 @@ export const getV2PluginAPIs = () => {
         },
         safeGlobalThis: {} as any,
         getSafeGlobalThis: () => {
-            if(Object.keys(globalThis.__pluginApis__.safeGlobalThis).length > 0){
-                return globalThis.__pluginApis__.safeGlobalThis;
+            if(Object.keys(rawApi.safeGlobalThis).length > 0){
+                return rawApi.safeGlobalThis;
             }
             //safeGlobalThis
             const keys = Object.keys(globalThis);
@@ -604,7 +770,7 @@ export const getV2PluginAPIs = () => {
 
             safeGlobal.DBState = {
                 db: toGetter(
-                    globalThis.__pluginApis__.getDatabase
+                    scopedApi.getDatabase
                 )
             }
             safeGlobal.setInterval = (...args: any[]) => {
@@ -630,9 +796,9 @@ export const getV2PluginAPIs = () => {
             safeGlobal.innerHeight = window.innerHeight;
             safeGlobal.getComputedStyle = window.getComputedStyle
             safeGlobal.navigator = window.navigator;
-            safeGlobal.localStorage = globalThis.__pluginApis__.safeLocalStorage;
-            safeGlobal.indexedDB = globalThis.__pluginApis__.safeIdbFactory;
-            safeGlobal.__pluginApis__ = globalThis.__pluginApis__
+            safeGlobal.localStorage = scopedApi.safeLocalStorage;
+            safeGlobal.indexedDB = scopedApi.safeIdbFactory;
+            safeGlobal.__pluginApis__ = scopedApi
             safeGlobal.Object = Object;
             safeGlobal.Array = Array;
             safeGlobal.String = String;
@@ -642,8 +808,8 @@ export const getV2PluginAPIs = () => {
             safeGlobal.Date = Date;
             safeGlobal.RegExp = RegExp;
             safeGlobal.Error = Error;
-            safeGlobal.Function = globalThis.__pluginApis__.SafeFunction;
-            safeGlobal.document = globalThis.__pluginApis__.safeDocument;
+            safeGlobal.Function = scopedApi.SafeFunction;
+            safeGlobal.document = scopedApi.safeDocument;
             safeGlobal.addEventListener = (...args: any[]) => {
                 //@ts-expect-error spreading any[] into addEventListener - expects (type: string, listener: EventListenerOrEventListenerObject, options?: boolean | AddEventListenerOptions)
                 window.addEventListener(...args);
@@ -652,6 +818,10 @@ export const getV2PluginAPIs = () => {
                 //@ts-expect-error spreading any[] into removeEventListener - expects (type: string, listener: EventListenerOrEventListenerObject, options?: boolean | EventListenerOptions)
                 window.removeEventListener(...args);
             }
+            // The outer rawApi membrane wraps this returned object. Returning
+            // an inner facade here would double-own timers/listeners and make
+            // cleanup dereference an already-revoked proxy.
+            rawApi.safeGlobalThis = safeGlobal;
             return safeGlobal;
         },
         safeLocalStorage: new SafeLocalStorage(),
@@ -663,48 +833,11 @@ export const getV2PluginAPIs = () => {
         apiVersion: "2.1",
         apiVersionCompatibleWith: ["2.0","2.1"],
         getDatabase: () => {
-            const db = DBState?.db
+            const db = getDatabase({ snapshot: true })
             if(!db){
                 return {}
             }
-            return new Proxy(db, {
-                get(target, prop) {
-                    if (typeof prop === 'string' && allowedDbKeys.includes(prop)) {
-                        return (target as any)[prop];
-                    }
-                    else if(target.pluginCustomStorage){
-                        console.log('Getting custom db property', prop.toString());
-                        return target.pluginCustomStorage[prop.toString()];
-                    }
-                    return undefined;
-                },
-                set(target, prop, value) {
-                    if (typeof prop === 'string' && allowedDbKeys.includes(prop)) {
-                        (target as any)[prop] = value;
-                        return true;
-                    }
-                    else{
-                        console.log('Setting custom db property', prop.toString(), value);
-                        target.pluginCustomStorage ??= {}
-                        target.pluginCustomStorage[prop.toString()] = value;
-                        return true;
-                    }
-                },
-                ownKeys(target) {
-                    const keys = Reflect.ownKeys(target).filter(key => typeof key === 'string' && allowedDbKeys.includes(key));
-                    if(target.pluginCustomStorage){
-                        keys.push(...Object.keys(target.pluginCustomStorage));
-                    }
-                    return keys;
-                },
-                deleteProperty(target, prop) {
-                    console.log('Attempt to delete db.' + String(prop) + ' denied in safe database proxy.');
-                    return false;
-                },
-                getPrototypeOf(target) {
-                    return Reflect.getPrototypeOf(target);
-                },
-            })
+            return createPluginDatabaseBoundary(db, allowedDbKeys)
         },
         pluginStorage: {
             getItem: (key: string) => {
@@ -743,48 +876,19 @@ export const getV2PluginAPIs = () => {
                 return Object.keys(db.pluginCustomStorage).length;
             }
         },
-        setDatabaseLite: (newDb: any) => {
-            const db = getDatabase();
-            db.pluginCustomStorage ??= {}
-            for (const key of Object.keys(newDb)) {
-                if (allowedDbKeys.includes(key)) {
-                    (db as any)[key] = newDb[key];
-                }
-                else{
-                    db.pluginCustomStorage[key] = newDb[key];
-                }
-            }
-            DBState.db = db;
-        },
-        setDatabase: async (newDb: any) => {
-            const db = getDatabase();
-            db.pluginCustomStorage ??= {}
-            for (const key of Object.keys(newDb)) {
-                if (key === 'plugins') {
-                    console.warn('[WARN] Plugin attempted to access plugin directly. this would be blocked in future versions. Instead, use the provided APIs to manage plugins. Attempting to handle plugin installation via plugin for new plugins in the provided database object.')
-                    newDb[key] = await handlePluginInstallViaPlugin(newDb.plugins)
-                }
-                
-                if (allowedDbKeys.includes(key)) {
-                    (db as any)[key] = newDb[key];
-                }
-                else{
-                    db.pluginCustomStorage[key] = newDb[key];
-                }
-            }
-            setDatabase(db);
-        },
+        setDatabaseLite: (newDb: any) => applyProgrammaticDatabaseMutation(newDb, 'lite', isActive, isInstalledRecordCurrent),
+        setDatabase: (newDb: any) => applyProgrammaticDatabaseMutation(newDb, 'approved', isActive, isInstalledRecordCurrent),
         SafeFunction: new Proxy(Function, {
             construct(target, args) {
                 return function() {
-                    return globalThis.__pluginApis__.getSafeGlobalThis();
+                    return scopedApi.getSafeGlobalThis();
                 }
             },
             
             //call too
             apply(target, thisArg, args) {
                 return function() {
-                    return globalThis.__pluginApis__.getSafeGlobalThis();
+                    return scopedApi.getSafeGlobalThis();
                 }
             }
 
@@ -806,27 +910,23 @@ export const getV2PluginAPIs = () => {
         },
 
     }
+    scopedApi = createRevocableV2Api(rawApi, isActive, pluginV2.ownedResources)
+    return scopedApi
 }
 
 export async function loadV2Plugin(plugins: RisuPlugin[]) {
-
-    if (pluginV2.loaded) {
-        for (const unload of pluginV2.unload) {
-            await unload()
-        }
-
-        pluginV2.providers.clear()
-        pluginV2.editdisplay.clear()
-        pluginV2.editoutput.clear()
-        pluginV2.editprocess.clear()
-        pluginV2.editinput.clear()
-    }
+    const unloadErrors = await resetPluginV2Runtime(pluginV2, () => customProviderStore.set([]))
+    if (unloadErrors?.length) console.warn(`[Plugin] ${unloadErrors.length} V2 unload callback(s) failed`)
 
     pluginV2.loaded = true
 
-    globalThis.__pluginApis__ = getV2PluginAPIs()
-
     for (const plugin of plugins) {
+        const isInstalledRecordCurrent = () => isCurrentPluginRuntimeRecord(
+            plugin, getDatabase().plugins ?? [], (principalId) => pluginDataLifecycle.isRetiring(principalId),
+        )
+        const isCurrent = createV2RuntimeAuthorization(pluginV2, isInstalledRecordCurrent)
+        if (!isCurrent()) continue
+        globalThis.__pluginApis__ = getV2PluginAPIs(isCurrent, isInstalledRecordCurrent)
         let data = ''
         let version = plugin.version || 2
 
@@ -882,6 +982,7 @@ export async function loadV2Plugin(plugins: RisuPlugin[]) {
 
         if(version === '2.1'){
             const safety = (await checkCodeSafety(plugin.script))
+            if (!isCurrent()) continue
             data = safety.modifiedCode
             console.log('Safety check result:', safety)
             console.log('Loading V2.1 Plugin', plugin.name, data)
@@ -921,10 +1022,11 @@ export async function pluginProcess(arg: {
     }
 }
 
-export async function handlePluginInstallViaPlugin(plugins: RisuPlugin[]){
+export async function handlePluginInstallViaPlugin(plugins: RisuPlugin[], isActive: () => boolean = () => true){
 
     const trimmedPlugins: RisuPlugin[] = []
     for(const plugin of plugins){
+        if (!isActive()) return trimmedPlugins
         if(!DBState.db.plugins.find((p: RisuPlugin) => p.name === plugin.name && p.script === plugin.script)){
 
             if(plugin.version !== '3.0'){
@@ -932,8 +1034,9 @@ export async function handlePluginInstallViaPlugin(plugins: RisuPlugin[]){
                 continue
             }
             const confirmation = await alertConfirm(language.confirmInstallPluginViaPlugin.replace('{plugin}', plugin.name))
+            if (!isActive()) return trimmedPlugins
             if(confirmation){
-                trimmedPlugins.push(plugin)
+                trimmedPlugins.push(stripPluginPrincipal(plugin) as RisuPlugin)
             }
         }
         else{
@@ -942,4 +1045,45 @@ export async function handlePluginInstallViaPlugin(plugins: RisuPlugin[]){
     }
 
     return trimmedPlugins
+}
+
+export async function applyProgrammaticDatabaseMutation(
+    newDb: any,
+    mode: 'lite' | 'approved',
+    isActive: () => boolean = () => true,
+    isInstalledRecordCurrent: () => boolean = isActive,
+) {
+    if (!isActive()) return false
+    const staged = safeStructuredClone(getDatabase({ snapshot: true })) as Database
+    staged.pluginCustomStorage ??= {}
+
+    let nextPlugins: RisuPlugin[] | undefined
+    if (Object.hasOwn(newDb ?? {}, 'plugins')) {
+        if (mode === 'lite') {
+            nextPlugins = safeStructuredClone(newDb.plugins ?? []) as RisuPlugin[]
+        } else {
+            console.warn('[WARN] Plugin attempted to access plugin directly. New plugin records require explicit approval.')
+            const approved = await handlePluginInstallViaPlugin(newDb.plugins ?? [], isActive)
+            if (!isActive()) return false
+            nextPlugins = [...(staged.plugins ?? [])]
+            for (const plugin of approved) {
+                const existingIndex = nextPlugins.findIndex((current) => current.name === plugin.name)
+                if (existingIndex >= 0) nextPlugins[existingIndex] = plugin
+                else nextPlugins.push(plugin)
+            }
+        }
+    }
+
+    for (const key of Object.keys(newDb ?? {})) {
+        if (key === 'plugins') continue
+        if (allowedDbKeys.includes(key)) (staged as any)[key] = safeStructuredClone(newDb[key])
+        else staged.pluginCustomStorage[key] = safeStructuredClone(newDb[key])
+    }
+    if (nextPlugins) staged.plugins = nextPlugins
+    if (!isActive()) return false
+    await replaceDatabaseWithPluginRuntime(staged, {
+        authorizeBeforeSuspend: isActive,
+        authorizeAfterSuspend: isInstalledRecordCurrent,
+    })
+    return true
 }

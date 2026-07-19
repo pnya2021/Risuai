@@ -1196,6 +1196,26 @@ interface ProviderOptions {
  * @important All methods are asynchronous unless otherwise noted.
  * Always use `await` or `.then()` when calling API methods.
  */
+type PluginPermissionId =
+    | 'fetchLogs' | 'db' | 'mainDom' | 'replacer' | 'provider' | 'sendChat'
+    | 'contextAssets' | 'installedModulesRead' | 'chatObserve' | 'chatObserveAll'
+    | 'chatWrite' | 'chatWriteAll' | 'inlayWrite' | 'inlayRead' | 'inlayManage'
+    | 'secrets' | 'localModelInference' | 'pluginJobs';
+
+interface PluginCapability {
+    id: string;
+    version: number;
+    supported: boolean;
+    available: boolean;
+    permission?: PluginPermissionId;
+    permissionState?: 'not-requested' | 'granted' | 'denied';
+    reason?: 'unknown-capability' | 'unsupported-platform' | 'unsupported-hardware'
+        | 'disabled' | 'permission-required' | 'no-current-context' | 'not-configured'
+        | 'consent-required' | 'insufficient-storage' | 'insufficient-memory'
+        | 'temporarily-unavailable';
+    limits?: Record<string, string | number | boolean>;
+}
+
 interface RisuaiPluginAPI {
     // ========== Version Information ==========
 
@@ -1942,7 +1962,10 @@ interface RisuaiPluginAPI {
      * @param permission - Permission string (e.g. 'fetchLogs'|'db'|'mainDom')
      * @returns True if permission granted, false otherwise
      */
-    requestPluginPermission(permission: string): Promise<boolean>;
+    requestPluginPermission(permission: PluginPermissionId): Promise<boolean>;
+
+    /** Pure feature discovery. This method never opens a permission prompt. */
+    getCapabilities(ids?: string[]): Promise<Record<string, PluginCapability>>;
 
     /**
      * Unwraps a SafeClassArray into a standard array

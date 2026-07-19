@@ -20,7 +20,7 @@ import { checkDriverInit } from "./drive/drive";
 import { characterURLImport } from "./characterCards";
 import { defaultJailbreak, defaultMainPrompt, oldJailbreak, oldMainPrompt } from "./storage/defaultPrompts";
 import { loadRisuAccountData } from "./drive/accounter";
-import { decodeRisuSave, encodeRisuSaveLegacy } from "./storage/risuSave";
+import { decodeRisuSave, encodeRisuSaveLegacy, RisuSaveEncoder } from "./storage/risuSave";
 import { updateAnimationSpeed } from "./gui/animation";
 import { updateColorScheme, updateTextThemeAndCSS } from "./gui/colorscheme";
 import { autoServerBackup } from "./kei/backup";
@@ -46,8 +46,27 @@ import { isTauri } from "./platform";
 import { registerModelDynamic } from "./model/modellist";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { appDataDir, join } from "@tauri-apps/api/path";
+import { hydrateColdDatabase, loadPluginsAfterColdDatabaseWriteback, registerColdDatabaseWritebackWriter } from './storage/coldDatabaseHydration';
+import { databasePersistenceCoordinator } from './storage/databasePersistenceCoordinator';
 
 const appWindow = isTauri ? getCurrentWebviewWindow() : null
+const hydrateLoadedDatabase = (data: Parameters<typeof setDatabase>[0]) => hydrateColdDatabase(data, {
+    setDatabase,
+    getSnapshot: () => getDatabase({ snapshot: true }),
+})
+const persistNormalizedDatabaseBeforePlugins = () => databasePersistenceCoordinator.runExclusiveMutation(async () => {
+    const encoder = new RisuSaveEncoder()
+    await encoder.init(getDatabase({ snapshot: true }), {
+        compression: forageStorage.isAccount,
+        skipRemoteSavingOnCharacters: false,
+    })
+    const encoded = encoder.encode()
+    if (!encoded) throw new Error('Failed to encode normalized plugin principals')
+    const bytes = new Uint8Array(encoded)
+    if (isTauri) await writeFile('database/database.bin', bytes, { baseDir: BaseDirectory.AppData })
+    else await forageStorage.setItem('database/database.bin', bytes)
+})
+registerColdDatabaseWritebackWriter(persistNormalizedDatabaseBeforePlugins)
 
 /**
  * Loads the application data.
@@ -69,7 +88,9 @@ export async function loadData() {
                     await mkdir('assets', { baseDir: BaseDirectory.AppData })
                 }
                 if (!await exists('database/database.bin', { baseDir: BaseDirectory.AppData })) {
-                    await writeFile('database/database.bin', encodeRisuSaveLegacy({}), { baseDir: BaseDirectory.AppData });
+                    await databasePersistenceCoordinator.runExclusiveMutation(
+                        () => writeFile('database/database.bin', encodeRisuSaveLegacy({}), { baseDir: BaseDirectory.AppData }),
+                    )
                 }
                 const appDataDirPath = await appDataDir();
                 try {
@@ -85,7 +106,7 @@ export async function loadData() {
                     getDbBackups() //this also cleans the backups
                     LoadingStatusState.text = "Decoding Save File..."
                     const decoded = await decodeRisuSave(readed)
-                    setDatabase(decoded)
+                    hydrateLoadedDatabase(decoded)
                 } catch (error) {
                     LoadingStatusState.text = "Reading Backup Files..."
                     const backups = await getDbBackups()
@@ -101,9 +122,7 @@ export async function loadData() {
                                     throw new Error(`Failed to load backup ${backup}: ${backupResponse.status}`);
                                 }
                                 const backupData = new Uint8Array(await backupResponse.arrayBuffer());
-                                setDatabase(
-                                    await decodeRisuSave(backupData)
-                                )
+                                hydrateLoadedDatabase(await decodeRisuSave(backupData))
                                 backupLoaded = true
                             } catch (error) {
                                 console.error(error)
@@ -127,12 +146,14 @@ export async function loadData() {
                 LoadingStatusState.text = "Decoding Local Save File..."
                 if (checkNullish(gotStorage)) {
                     gotStorage = encodeRisuSaveLegacy({})
-                    await forageStorage.setItem('database/database.bin', gotStorage)
+                    await databasePersistenceCoordinator.runExclusiveMutation(
+                        () => forageStorage.setItem('database/database.bin', gotStorage),
+                    )
                 }
                 try {
                     const decoded = await decodeRisuSave(gotStorage)
                     console.log(decoded)
-                    setDatabase(decoded)
+                    hydrateLoadedDatabase(decoded)
                 } catch (error) {
                     console.error(error)
                     const backups = await getDbBackups()
@@ -141,9 +162,7 @@ export async function loadData() {
                         try {
                             LoadingStatusState.text = `Reading Backup File ${backup}...`
                             const backupData: Uint8Array = await forageStorage.getItem(`database/dbbackup-${backup}.bin`) as unknown as Uint8Array
-                            setDatabase(
-                                await decodeRisuSave(backupData)
-                            )
+                            hydrateLoadedDatabase(await decodeRisuSave(backupData))
                             backupLoaded = true
                         } catch (error) { }
                     }
@@ -159,12 +178,12 @@ export async function loadData() {
                     })
                     if (checkNullish(gotStorage)) {
                         gotStorage = encodeRisuSaveLegacy({})
-                        await forageStorage.setItem('database/database.bin', gotStorage)
+                        await databasePersistenceCoordinator.runExclusiveMutation(
+                            () => forageStorage.setItem('database/database.bin', gotStorage),
+                        )
                     }
                     try {
-                        setDatabase(
-                            await decodeRisuSave(gotStorage)
-                        )
+                        hydrateLoadedDatabase(await decodeRisuSave(gotStorage))
                     } catch (error) {
                         const backups = await getDbBackups()
                         let backupLoaded = false
@@ -172,9 +191,7 @@ export async function loadData() {
                             try {
                                 LoadingStatusState.text = `Reading Backup File ${backup}...`
                                 const backupData: Uint8Array = await forageStorage.getItem(`database/dbbackup-${backup}.bin`) as unknown as Uint8Array
-                                setDatabase(
-                                    await decodeRisuSave(backupData)
-                                )
+                                hydrateLoadedDatabase(await decodeRisuSave(backupData))
                                 backupLoaded = true
                             } catch (error) { }
                         }
@@ -206,8 +223,10 @@ export async function loadData() {
             }
             LoadingStatusState.text = "Loading Plugins..."
             try {
-                await loadPlugins()
-            } catch (error) { }
+                await loadPluginsAfterColdDatabaseWriteback(persistNormalizedDatabaseBeforePlugins, loadPlugins)
+            } catch (error) {
+                console.error('[bootstrap] normalized plugin principal writeback failed; plugins remain disabled', error)
+            }
             if (getDatabase().account) {
                 LoadingStatusState.text = "Checking Account Data..."
                 try {

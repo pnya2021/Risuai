@@ -1,6 +1,8 @@
 import { alertError, alertInput, alertNormal, alertSelect, alertStore } from "../alert";
 import { getDatabase, type Database } from "../storage/database.svelte";
-import { forageStorage, getUncleanables, openURL } from "../globalApi.svelte";
+import { forageStorage, getUncleanables, openURL, persistRestoredDatabaseUnderLease } from "../globalApi.svelte";
+import { runSuspendedPluginRuntimeMutation } from "../plugins/plugins.svelte";
+import { databasePersistenceCoordinator } from "../storage/databasePersistenceCoordinator";
 import { isTauri } from "src/ts/platform"
 import { BaseDirectory, exists, readFile, readDir, writeFile } from "@tauri-apps/plugin-fs";
 import { language } from "../../lang";
@@ -283,6 +285,7 @@ async function loadDrive(ACCESS_TOKEN:string, mode: 'backup'|'sync'):Promise<voi
         lastSaved = Date.now()
         localStorage.setItem('risu_lastsaved', `${lastSaved}`)
         const requiredImages = (await getUncleanables(db))
+        const assetWrites: Array<{ path: string; data: Uint8Array }> = []
         let ind = 0;
         let errorLogs:string[] = []
         for(const images of requiredImages){
@@ -310,13 +313,7 @@ async function loadDrive(ACCESS_TOKEN:string, mode: 'backup'|'sync'):Promise<voi
                             for(const file of files){
                                 if(file.name === formatedImage){
                                     const fData = await getFileData(ACCESS_TOKEN, file.id)
-                                    if(isTauri){
-                                        await writeFile(`assets/` + images, fData ,{baseDir: BaseDirectory.AppData})
-        
-                                    }
-                                    else{
-                                        await forageStorage.setItem('assets/' + images, fData)
-                                    }
+                                    assetWrites.push({ path: images, data: fData })
                                     tries = 3
                                 }
                             }
@@ -333,10 +330,18 @@ async function loadDrive(ACCESS_TOKEN:string, mode: 'backup'|'sync'):Promise<voi
             }
         }
         db.didFirstSetup = true
-        const dbData = encodeRisuSaveLegacy(db, 'compression')
+        await runSuspendedPluginRuntimeMutation(async ({ markIrreversibleMutation, replaceLiveDatabase }) =>
+            databasePersistenceCoordinator.runExclusiveMutation(async () => {
+            for (const asset of assetWrites) {
+                markIrreversibleMutation()
+                if (isTauri) await writeFile(`assets/` + asset.path, asset.data, { baseDir: BaseDirectory.AppData })
+                else await forageStorage.setItem('assets/' + asset.path, asset.data)
+            }
+            await replaceLiveDatabase(db)
+            await persistRestoredDatabaseUnderLease(getDatabase({ snapshot: true }))
+        }))
 
         if(isTauri){
-            await writeFile('database/database.bin', dbData, {baseDir: BaseDirectory.AppData})
             relaunch()
             alertStore.set({
                 type: "wait",
@@ -344,7 +349,6 @@ async function loadDrive(ACCESS_TOKEN:string, mode: 'backup'|'sync'):Promise<voi
             })
         }
         else{
-            await forageStorage.setItem('database/database.bin', dbData)
             location.search = ''
             alertStore.set({
                 type: "wait",

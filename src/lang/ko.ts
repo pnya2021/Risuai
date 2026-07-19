@@ -1,4 +1,21 @@
 export const languageKorean = {
+    "pluginPermissionConsent": {
+        "title": "플러그인 권한 요청",
+        "allow": "허용",
+        "deny": "거부",
+        "contextAssets": "현재 카드, 대화, 활성 에셋 읽기",
+        "installedModulesRead": "설치된 모듈의 설명과 에셋 읽기",
+        "chatObserve": "현재 대화의 확정된 메시지 관찰",
+        "chatObserveAll": "모든 대화의 확정된 메시지 관찰",
+        "chatWrite": "현재 대화의 제한적 변경",
+        "chatWriteAll": "권한이 있는 다른 대화의 제한적 변경",
+        "inlayWrite": "플러그인 소유 Inlay 생성·읽기·삭제",
+        "inlayRead": "다른 플러그인 또는 레거시 Inlay 읽기",
+        "inlayManage": "다른 Inlay 삭제 또는 참조 분리",
+        "secrets": "쓰기 전용 비밀 저장 및 제한된 요청에 사용",
+        "localModelInference": "승인된 로컬 이미지 태거 설치 및 실행",
+        "pluginJobs": "표시 가능한 백그라운드 작업과 취소 콜백 사용",
+    },
     "formating": {
         "main": "메인 프롬프트",
         "jailbreak": "탈옥 프롬프트",

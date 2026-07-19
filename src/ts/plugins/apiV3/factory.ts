@@ -17,13 +17,15 @@ type MsgType =
     | 'ABORT_SIGNAL'
     | 'EXECUTE_CODE'
     | 'EXEC_RESULT'
+    | 'READY'
+    | 'START'
     | 'TERMINATE'
     | 'TERMINATE_ACK';
 
 const RPC_MESSAGE_TYPES = new Set<string>([
     'CALL_ROOT', 'CALL_INSTANCE', 'INVOKE_CALLBACK', 'CALLBACK_RETURN',
     'RESPONSE', 'RELEASE_INSTANCE', 'RELEASE_CALLBACK', 'ABORT_SIGNAL',
-    'EXECUTE_CODE', 'EXEC_RESULT', 'TERMINATE', 'TERMINATE_ACK'
+    'EXECUTE_CODE', 'EXEC_RESULT', 'READY', 'START', 'TERMINATE', 'TERMINATE_ACK'
 ]);
 
 const rpcLogType = (value: unknown) =>
@@ -56,7 +58,20 @@ interface AbortSignalRef {
     aborted: boolean;
 }
 
-type CallbackWrapper = ((...args: any[]) => Promise<any>) & { release: () => void };
+const CLEANUP_CALLBACK_INVOKER = Symbol('cleanupCallbackInvoker')
+const invokedCleanupCallbacks = new WeakSet<Function>()
+type CallbackWrapper = ((...args: any[]) => Promise<any>) & {
+    release: () => void
+    [CLEANUP_CALLBACK_INVOKER]: (...args: any[]) => Promise<any>
+};
+
+export function invokeSandboxCleanupCallback(callback: (...args: any[]) => unknown, ...args: any[]) {
+    const wrapper = callback as CallbackWrapper
+    if (typeof wrapper[CLEANUP_CALLBACK_INVOKER] !== 'function') return Promise.resolve()
+    if (invokedCleanupCallbacks.has(wrapper)) return Promise.resolve()
+    invokedCleanupCallbacks.add(wrapper)
+    return wrapper[CLEANUP_CALLBACK_INVOKER](...args)
+}
 
 interface CallbackWrapperEntry {
     wrapper: CallbackWrapper;
@@ -844,18 +859,42 @@ export class SandboxHost {
     private instanceRegistry = new Map<string, any>();
     private abortControllers = new Map<string, AbortController>();
     private callbackWrapperCache = new Map<string, CallbackWrapperEntry>();
-    private pendingCallbacks = new Map<string, { resolve: (value: any) => void, reject: (reason?: any) => void }>();
+    private pendingCallbacks = new Map<string, {
+        resolve: (value: any) => void
+        reject: (reason?: any) => void
+        cleanup: boolean
+        runGeneration: number
+    }>();
     private pendingExecutions = new Map<string, { resolve: (value: any) => void, reject: (reason?: any) => void }>();
     private messageHandler?: (event: MessageEvent) => void;
     private terminated = false;
     private runGeneration = 0;
 
-    constructor(apiFactory: any) {
+    constructor(
+        apiFactory: any,
+        private readonly authorizeRequest: () => boolean = () => true,
+        private readonly onAuthorizationFailure: () => void = () => undefined,
+        private readonly authorizeCallback: () => boolean = authorizeRequest,
+    ) {
         this.apiFactory = apiFactory;
     }
 
+    private isAuthorized() {
+        try { return this.authorizeRequest() } catch { return false }
+    }
+
+    private isCallbackAuthorized() {
+        try { return this.authorizeCallback() } catch { return false }
+    }
+
+    private terminateUnauthorized() {
+        try { this.onAuthorizationFailure() } catch { /* authorization failure stays fail-closed */ }
+        this.terminate()
+    }
+
     public executeInIframe(code: string): Promise<any> {
-        if (this.terminated || !this.iframe?.contentWindow) {
+        if (this.terminated || !this.iframe?.contentWindow || !this.isAuthorized()) {
+            if (!this.terminated && !this.isAuthorized()) this.terminateUnauthorized()
             return Promise.reject(new PluginApiError('ABORTED', 'Plugin sandbox terminated'));
         }
         return new Promise((resolve, reject) => {
@@ -960,13 +999,14 @@ export class SandboxHost {
                     return cached.wrapper;
                 }
 
-                const wrapper = (async (...innerArgs: any[]) => {
-                    if (!this.isCurrentRun(runGeneration)) {
+                const invoke = async (cleanup: boolean, innerArgs: any[]) => {
+                    if (!this.isCurrentRun(runGeneration) || (!cleanup && !this.isCallbackAuthorized())) {
+                        if (this.isCurrentRun(runGeneration)) this.terminateUnauthorized()
                         throw new PluginApiError('ABORTED', 'Plugin sandbox terminated');
                     }
                     return new Promise((resolve, reject) => {
                         const reqId = 'cb_req_' + Math.random().toString(36).substring(2);
-                        this.pendingCallbacks.set(reqId, { resolve, reject });
+                        this.pendingCallbacks.set(reqId, { resolve, reject, cleanup, runGeneration });
 
                         // AbortSignal cannot be structured-cloned for postMessage.
                         // Convert to a serializable ref and forward abort events
@@ -1008,7 +1048,9 @@ export class SandboxHost {
                             reject(deserializePluginApiError(undefined));
                         }
                     });
-                }) as CallbackWrapper;
+                }
+                const wrapper = ((...innerArgs: any[]) => invoke(false, innerArgs)) as CallbackWrapper;
+                wrapper[CLEANUP_CALLBACK_INVOKER] = (...innerArgs: any[]) => invoke(true, innerArgs)
                 wrapper.release = () => {
                     const entry = this.callbackWrapperCache.get(cbRef.id);
                     if (!entry || entry.wrapper !== wrapper || entry.refCount <= 0) return;
@@ -1077,7 +1119,20 @@ export class SandboxHost {
             const data = event.data as RpcMessage;
             if (!data || typeof data !== 'object') return;
 
+            const requiresActiveAuthorization = data.type === 'READY'
+                || data.type === 'CALL_ROOT'
+                || data.type === 'CALL_INSTANCE'
+            if (requiresActiveAuthorization && !this.isAuthorized()) {
+                this.terminateUnauthorized()
+                return
+            }
+
             console.log('[V3 RPC]', { direction: 'guest-to-host', type: rpcLogType(data.type) });
+
+            if (data.type === 'READY') {
+                this.postToGuest({ type: 'START' })
+                return
+            }
 
             if (data.type === 'EXEC_RESULT') {
                 const pending = this.pendingExecutions.get(data.reqId!);
@@ -1093,9 +1148,14 @@ export class SandboxHost {
             if (data.type === 'CALLBACK_RETURN') {
                 const req = this.pendingCallbacks.get(data.reqId!);
                 if (req) {
+                    this.pendingCallbacks.delete(data.reqId!);
+                    if (!req.cleanup && (!this.isCurrentRun(req.runGeneration) || !this.isCallbackAuthorized())) {
+                        req.reject(new PluginApiError('ABORTED', 'Plugin sandbox terminated'))
+                        if (this.isCurrentRun(req.runGeneration)) this.terminateUnauthorized()
+                        return
+                    }
                     if (data.error) req.reject(deserializePluginApiError(data.error));
                     else req.resolve(data.result);
-                    this.pendingCallbacks.delete(data.reqId!);
                 }
                 return;
             }
@@ -1138,11 +1198,19 @@ export class SandboxHost {
                     }
 
                     if (!this.isCurrentRun(runGeneration)) return;
+                    if (!this.isAuthorized()) {
+                        this.terminateUnauthorized()
+                        return
+                    }
 
                     response.result = this.serialize(result, runGeneration);
 
                 } catch (err: any) {
                     if (!this.isCurrentRun(runGeneration)) return;
+                    if (!this.isAuthorized()) {
+                        this.terminateUnauthorized()
+                        return
+                    }
                     response.error = serializePluginApiError(err);
                 } finally {
                     for (const id of usedAbortIds) this.abortControllers.delete(id);
@@ -1173,7 +1241,17 @@ export class SandboxHost {
             document.querySelector('meta#csp-meta')?.remove();
             (async () => {
                 ${GUEST_BRIDGE_SCRIPT}
-                    
+
+                await new Promise((resolve) => {
+                    const onStart = (event) => {
+                        if (event.source !== window.parent || !event.data || event.data.type !== 'START') return;
+                        window.removeEventListener('message', onStart);
+                        resolve();
+                    };
+                    window.addEventListener('message', onStart);
+                    window.parent.postMessage({ type: 'READY' }, '*');
+                });
+
                 (async () => {
                     ${userCode}
                 })()

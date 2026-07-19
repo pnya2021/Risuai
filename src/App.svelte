@@ -36,6 +36,7 @@
     import IrisModal from './lib/Others/IrisModal.svelte';
     import Legal from './lib/Others/Legal.svelte';
     import CustomSidebarConfig from './lib/Others/CustomSidebarConfig.svelte';
+    import PluginPermissionConsent from './lib/Others/PluginPermissionConsent.svelte';
 
 
   
@@ -239,6 +240,7 @@
         <HypaV3Progress />
     {/if}
     <PluginAlertModal />
+    <PluginPermissionConsent />
     {#if popupStore.children}
         <PopupList />
     {/if}

@@ -8,6 +8,7 @@ import { v4 } from "uuid"
 import { language } from "src/lang"
 import { sleep } from "../util"
 import { fetchProtectedResource } from "../sionyw"
+import { databasePersistenceCoordinator } from "./databasePersistenceCoordinator"
 
 export const AccountWarning = writable('')
 let risuSession = ''
@@ -196,17 +197,19 @@ export async function unMigrationAccount() {
     let i = 0;
     const MigrationStorage = localforage.createInstance({name: "risuai"})
     
-    for(const key of keys){
-        alertStore.set({
-            type: "wait",
-            msg: `Migrating your data...(${i}/${keys.length})`
-        })
-        await MigrationStorage.setItem(key,await forageStorage.getItem(key))
-        i += 1
-    }
+    await databasePersistenceCoordinator.runExclusiveMutation(async () => {
+        for(const key of keys){
+            alertStore.set({
+                type: "wait",
+                msg: `Migrating your data...(${i}/${keys.length})`
+            })
+            await MigrationStorage.setItem(key,await forageStorage.getItem(key))
+            i += 1
+        }
 
-    db.account = null
-    await MigrationStorage.setItem('database/database.bin', encodeRisuSaveLegacy(db))
+        db.account = null
+        await MigrationStorage.setItem('database/database.bin', encodeRisuSaveLegacy(db))
+    })
 
     alertStore.set({
         type: "none",

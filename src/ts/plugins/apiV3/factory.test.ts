@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { parse } from 'acorn'
 
-import { SandboxHost } from './factory'
+import { invokeSandboxCleanupCallback, SandboxHost } from './factory'
 import { serializePluginApiError } from './illustration/errors'
 
 vi.stubGlobal('ImageBitmap', class ImageBitmap {})
@@ -33,10 +33,16 @@ const internalPluginError = {
   retryable: false,
 } as const
 
-function createHarness(apiFactory: Record<string, (...args: any[]) => any>, simulateNativeClone = false) {
+function createHarness(
+  apiFactory: Record<string, (...args: any[]) => any>,
+  simulateNativeClone = false,
+  authorizeRequest: () => boolean = () => true,
+  onAuthorizationFailure: () => void = () => undefined,
+  authorizeCallback: () => boolean = authorizeRequest,
+) {
   const iframe = document.createElement('iframe')
   document.body.appendChild(iframe)
-  const host = new SandboxHost(apiFactory)
+  const host = new SandboxHost(apiFactory, authorizeRequest, onAuthorizationFailure, authorizeCallback)
   const cleanup = host.run(iframe, '')
   cleanups.push(cleanup)
 
@@ -97,6 +103,150 @@ describe('SandboxHost structured errors', () => {
         .map((value, index) => `${Math.max(1, line - 2) + index}: ${value}`).join('\n')
       throw new Error(`${error.message}\n${context}`)
     }
+  })
+
+  it('requires an authorized READY/START gate and rejects stale post-start host mutations', async () => {
+    let current = true
+    const mutate = vi.fn()
+    const authorizationFailed = vi.fn()
+    const { dispatch, iframe, posted } = createHarness(
+      { mutate }, false, () => current, authorizationFailed,
+    )
+
+    expect(iframe.srcdoc).toContain("window.parent.postMessage({ type: 'READY' }")
+    expect(iframe.srcdoc).toContain("event.data.type !== 'START'")
+    dispatch({ type: 'READY' })
+    await postedMessage(posted, 'START')
+
+    current = false
+    dispatch({ type: 'CALL_ROOT', reqId: 'stale-mutation', method: 'mutate', args: [] })
+    await vi.waitFor(() => expect(authorizationFailed).toHaveBeenCalledOnce())
+    expect(mutate).not.toHaveBeenCalled()
+    expect(iframe.isConnected).toBe(false)
+  })
+
+  it('aborts a registered guest callback when the same-principal script becomes stale after START', async () => {
+    let current = true
+    let registered!: () => Promise<unknown>
+    const authorizationFailed = vi.fn()
+    const { dispatch, posted } = createHarness({
+      register: (callback: () => Promise<unknown>) => { registered = callback },
+    }, false, () => current, authorizationFailed)
+
+    dispatch({ type: 'READY' })
+    await postedMessage(posted, 'START')
+    dispatch({
+      type: 'CALL_ROOT', reqId: 'register-provider-callback', method: 'register',
+      args: [{ __type: 'CALLBACK_REF', id: 'provider-callback' }],
+    })
+    await postedMessage(posted, 'RESPONSE', 'register-provider-callback')
+
+    current = false
+    await expect(registered()).rejects.toMatchObject({ code: 'ABORTED' })
+    expect(authorizationFailed).toHaveBeenCalledOnce()
+    expect(posted.some((entry) => entry.message.type === 'INVOKE_CALLBACK')).toBe(false)
+  })
+
+  it('still lets the host invoke and settle the designated cleanup callback after abort', async () => {
+    let active = true
+    let registered!: () => Promise<unknown>
+    const { dispatch, posted } = createHarness({
+      register: (callback: () => Promise<unknown>) => { registered = callback },
+    }, false, () => active, vi.fn())
+    dispatch({ type: 'CALL_ROOT', reqId: 'register-cleanup', method: 'register', args: [{ __type: 'CALLBACK_REF', id: 'cleanup' }] })
+    await postedMessage(posted, 'RESPONSE', 'register-cleanup')
+
+    active = false
+    const cleanup = invokeSandboxCleanupCallback(registered)
+    const invocation = await postedMessage(posted, 'INVOKE_CALLBACK')
+    dispatch({ type: 'CALLBACK_RETURN', reqId: invocation.message.reqId, result: 'clean' })
+    await expect(cleanup).resolves.toBe('clean')
+  })
+
+  it('invokes a designated cleanup callback at most once', async () => {
+    let active = true
+    let registered!: () => Promise<unknown>
+    const { dispatch, posted } = createHarness({
+      register: (callback: () => Promise<unknown>) => { registered = callback },
+    }, false, () => active, vi.fn())
+    dispatch({ type: 'CALL_ROOT', reqId: 'register-one-shot', method: 'register', args: [{ __type: 'CALLBACK_REF', id: 'cleanup-one-shot' }] })
+    await postedMessage(posted, 'RESPONSE', 'register-one-shot')
+
+    active = false
+    const first = invokeSandboxCleanupCallback(registered)
+    const invocation = await postedMessage(posted, 'INVOKE_CALLBACK')
+    dispatch({ type: 'CALLBACK_RETURN', reqId: invocation.message.reqId, result: 'done' })
+    await expect(first).resolves.toBe('done')
+    await expect(invokeSandboxCleanupCallback(registered)).resolves.toBeUndefined()
+    expect(posted.filter((entry) => entry.message.type === 'INVOKE_CALLBACK')).toHaveLength(1)
+  })
+
+  it.each(['CALL_ROOT', 'CALL_INSTANCE'] as const)(
+    'blocks %s emitted by an after-abort cleanup and settles it as ABORTED',
+    async (callType) => {
+      let active = true
+      let registered!: () => Promise<unknown>
+      const mutate = vi.fn()
+      const authorizationFailed = vi.fn()
+      const { dispatch, iframe, posted } = createHarness({
+        register: (callback: () => Promise<unknown>) => { registered = callback },
+        mutate,
+        make: () => ({ mutate }),
+      }, false, () => active, authorizationFailed)
+      dispatch({ type: 'CALL_ROOT', reqId: 'register-cleanup-api', method: 'register', args: [{ __type: 'CALLBACK_REF', id: 'cleanup-api' }] })
+      await postedMessage(posted, 'RESPONSE', 'register-cleanup-api')
+
+      let instanceId: string | undefined
+      if (callType === 'CALL_INSTANCE') {
+        dispatch({ type: 'CALL_ROOT', reqId: 'make-instance', method: 'make', args: [] })
+        const response = await postedMessage(posted, 'RESPONSE', 'make-instance')
+        instanceId = response.message.result.id
+      }
+
+      active = false
+      const cleanup = invokeSandboxCleanupCallback(registered)
+      await postedMessage(posted, 'INVOKE_CALLBACK')
+      dispatch(callType === 'CALL_ROOT'
+        ? { type: 'CALL_ROOT', reqId: 'cleanup-mutation', method: 'mutate', args: [] }
+        : { type: 'CALL_INSTANCE', reqId: 'cleanup-mutation', id: instanceId, method: 'mutate', args: [] })
+
+      await expect(cleanup).rejects.toMatchObject({ code: 'ABORTED' })
+      expect(mutate).not.toHaveBeenCalled()
+      expect(authorizationFailed).toHaveBeenCalledOnce()
+      expect(iframe.isConnected).toBe(false)
+    },
+  )
+
+  it('rejects an in-flight normal callback return that becomes stale after invocation', async () => {
+    let active = true
+    let registered!: () => Promise<unknown>
+    const authorizationFailed = vi.fn()
+    const { dispatch, posted } = createHarness({
+      register: (callback: () => Promise<unknown>) => { registered = callback },
+    }, false, () => active, authorizationFailed)
+    dispatch({ type: 'CALL_ROOT', reqId: 'register-in-flight', method: 'register', args: [{ __type: 'CALLBACK_REF', id: 'in-flight' }] })
+    await postedMessage(posted, 'RESPONSE', 'register-in-flight')
+    const result = registered()
+    const invocation = await postedMessage(posted, 'INVOKE_CALLBACK')
+    active = false
+    dispatch({ type: 'CALLBACK_RETURN', reqId: invocation.message.reqId, result: 'stale' })
+    await expect(result).rejects.toMatchObject({ code: 'ABORTED' })
+    expect(authorizationFailed).toHaveBeenCalledOnce()
+  })
+
+  it('rechecks exact authorization after an awaited host API call before retaining or returning its result', async () => {
+    let current = true
+    let resolveCall!: (value: string) => void
+    const call = new Promise<string>((resolve) => { resolveCall = resolve })
+    const authorizationFailed = vi.fn()
+    const { dispatch, iframe, posted } = createHarness({ delayed: () => call }, false, () => current, authorizationFailed)
+    dispatch({ type: 'CALL_ROOT', reqId: 'delayed', method: 'delayed', args: [] })
+    current = false
+    resolveCall('stale-result')
+
+    await vi.waitFor(() => expect(authorizationFailed).toHaveBeenCalledOnce())
+    expect(posted.some((entry) => entry.message.reqId === 'delayed')).toBe(false)
+    expect(iframe.isConnected).toBe(false)
   })
 
   it('preserves every PluginApiError field in RESPONSE messages', async () => {

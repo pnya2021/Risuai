@@ -8,6 +8,7 @@ import { getDatabase, type Database } from "./database.svelte"
 import { AccountStorage } from "./accountStorage"
 import { decodeRisuSave, encodeRisuSaveLegacy } from "./risuSave";
 import { language } from "src/lang"
+import { databasePersistenceCoordinator } from "./databasePersistenceCoordinator"
 
 export class AutoStorage{
     isAccount:boolean = false
@@ -74,28 +75,29 @@ export class AutoStorage{
 
             let replaced:{[key:string]:string} = {}
             
-            for(const key of keys){
-                alertStore.set({
-                    type: "wait",
-                    msg: `Migrating your data...(${i}/${keys.length})`
-                })
-                const rkey = await accountStorage.setItem(key,await this.realStorage.getItem(key))
-                if(rkey !== key){
-                    replaced[key] = rkey
+            await databasePersistenceCoordinator.runExclusiveMutation(async () => {
+                for(const key of keys){
+                    alertStore.set({
+                        type: "wait",
+                        msg: `Migrating your data...(${i}/${keys.length})`
+                    })
+                    const rkey = await accountStorage.setItem(key,await this.realStorage.getItem(key))
+                    if(rkey !== key){
+                        replaced[key] = rkey
+                    }
+                    i += 1
                 }
-                i += 1
-            }
 
-            const dba = replaceDbResources(db, replaced)
-            const comp = encodeRisuSaveLegacy(dba, 'compression')
-            //try decoding
-            try {
-                const z:Database = await decodeRisuSave(comp)
-                if(z.formatversion){
-                    await accountStorage.setItem('database/database.bin', comp)
-                }
-                
-            } catch (error) {}
+                const dba = replaceDbResources(db, replaced)
+                const comp = encodeRisuSaveLegacy(dba, 'compression')
+                //try decoding
+                try {
+                    const z:Database = await decodeRisuSave(comp)
+                    if(z.formatversion){
+                        await accountStorage.setItem('database/database.bin', comp)
+                    }
+                } catch (error) {}
+            })
             this.realStorage = accountStorage
             alertStore.set({
                 type: "none",

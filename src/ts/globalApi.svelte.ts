@@ -14,11 +14,11 @@ import { appDataDir, join } from "@tauri-apps/api/path";
 import { get } from "svelte/store";
 import { open } from '@tauri-apps/plugin-shell'
 import streamSaver from 'streamsaver';
-import { setDatabase, type Database, defaultSdDataFunc, getDatabase, appVer, getCurrentCharacter, type character, type groupChat } from "./storage/database.svelte";
+import { type Database, defaultSdDataFunc, getDatabase, appVer, getCurrentCharacter, type character, type groupChat } from "./storage/database.svelte";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { checkRisuUpdate } from "./update";
 import { MobileGUI, botMakerMode, selectedCharID, loadedStore, DBState, LoadingStatusState, selIdState, ReloadGUIPointer, bodyIntercepterStore } from "./stores.svelte";
-import { loadPlugins } from "./plugins/plugins.svelte";
+import { loadPlugins, replaceDatabaseWithPluginRuntime } from "./plugins/plugins.svelte";
 import { alertConfirm, alertError, alertMd, alertNormal, alertNormalWait, alertSelect, alertTOS, waitAlert } from "./alert";
 import { checkDriverInit, syncDrive } from "./drive/drive";
 import { hasher } from "./parser/parser.svelte";
@@ -42,11 +42,31 @@ import { moduleUpdate } from "./process/modules";
 import type { AccountStorage } from "./storage/accountStorage";
 import { getColdStorageItem, makeColdData } from "./process/coldstorage.svelte";
 import { isTauri, isNodeServer } from "./platform";
+import { persistRestoredDatabaseAndInvalidateEncoder } from './storage/restoredDatabaseState';
+import { databasePersistenceCoordinator } from './storage/databasePersistenceCoordinator';
 import { isLocalNetworkUrl } from "./network/localNetwork";
 import { decodeProxyJobWsChunk, formatProxyStreamErrorMessage, parseProxyJobWsEvent } from "./network/proxyJobWs";
 import { getNodeServerProxyAuth } from "./storage/nodeStorage";
 
 export const forageStorage = new AutoStorage()
+
+export async function persistRestoredDatabaseUnderLease(database: Database) {
+    const encoded = encodeRisuSaveLegacy(database, 'compression')
+    await persistRestoredDatabaseAndInvalidateEncoder(async () => {
+        if (isTauri) await writeFile('database/database.bin', encoded, { baseDir: BaseDirectory.AppData })
+        else await forageStorage.setItem('database/database.bin', encoded)
+    }, requiresFullEncoderReload)
+}
+
+export function persistRestoredDatabase(database: Database) {
+    return databasePersistenceCoordinator.runExclusiveMutation(
+        () => persistRestoredDatabaseUnderLease(database),
+    )
+}
+
+export function replaceAndPersistDatabaseWithPluginRuntime(data: Database) {
+    return replaceDatabaseWithPluginRuntime(data, { persist: persistRestoredDatabase })
+}
 
 const appWindow = isTauri ? getCurrentWebviewWindow() : null
 
@@ -444,6 +464,7 @@ export async function saveDb() {
                 continue
             }
 
+            const persistenceGeneration = databasePersistenceCoordinator.captureGeneration()
             await encoder.set(db, toSave)
             const encoded = encoder.encode()
             if (!encoded) {
@@ -451,26 +472,27 @@ export async function saveDb() {
                 continue
             }
             const dbData = new Uint8Array(encoded)
-            if (isTauri) {
-                await writeFile('database/database.bin', dbData, { baseDir: BaseDirectory.AppData });
-                await writeFile(`database/dbbackup-${(Date.now() / 100).toFixed()}.bin`, dbData, { baseDir: BaseDirectory.AppData });
-            }
-            else {
-
-                await forageStorage.setItem('database/database.bin', dbData)
-                if (!forageStorage.isAccount) {
-                    await forageStorage.setItem(`database/dbbackup-${(Date.now() / 100).toFixed()}.bin`, dbData)
+            const write = await databasePersistenceCoordinator.runNormalWrite(persistenceGeneration, async () => {
+                if (isTauri) {
+                    await writeFile('database/database.bin', dbData, { baseDir: BaseDirectory.AppData });
+                    await writeFile(`database/dbbackup-${(Date.now() / 100).toFixed()}.bin`, dbData, { baseDir: BaseDirectory.AppData });
+                } else {
+                    await forageStorage.setItem('database/database.bin', dbData)
+                    if (!forageStorage.isAccount) {
+                        await forageStorage.setItem(`database/dbbackup-${(Date.now() / 100).toFixed()}.bin`, dbData)
+                    }
                 }
-                if (forageStorage.isAccount) {
-                    await sleep(3000)
-                }
+            })
+            if (!write.executed) {
+                requiresFullEncoderReload.state = true
+                changed = true
+            } else {
+                if (forageStorage.isAccount) await sleep(3000)
+                if (!forageStorage.isAccount) await getDbBackups()
+                savetrys = 0
+                await saveDbKei()
+                await sleep(500)
             }
-            if (!forageStorage.isAccount) {
-                await getDbBackups()
-            }
-            savetrys = 0
-            await saveDbKei()
-            await sleep(500)
         } catch (error) {
             savetrys += 1
             if (savetrys > 4) {
@@ -2074,7 +2096,7 @@ export async function loadInternalBackup() {
         await readFile('database/' + selectedBackup, { baseDir: BaseDirectory.AppData })
     ) : (await forageStorage.getItem(selectedBackup))
 
-    setDatabase(
+    await replaceAndPersistDatabaseWithPluginRuntime(
         await decodeRisuSave(Buffer.from(data) as unknown as Uint8Array)
     )
 

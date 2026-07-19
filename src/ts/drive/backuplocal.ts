@@ -1,16 +1,18 @@
 import { BaseDirectory, readFile, readDir, writeFile } from "@tauri-apps/plugin-fs";
 import localforage from "localforage";
 import { alertError, alertNormal, alertStore, alertWait, alertMd, alertConfirm } from "../alert";
-import { LocalWriter, forageStorage, requiresFullEncoderReload } from "../globalApi.svelte";
+import { LocalWriter, forageStorage, persistRestoredDatabaseUnderLease, requiresFullEncoderReload } from "../globalApi.svelte";
 import { isTauri } from "src/ts/platform"
 import { decodeRisuSave, encodeRisuSaveLegacy } from "../storage/risuSave";
-import { getDatabase, setDatabaseLite } from "../storage/database.svelte";
+import { getDatabase } from "../storage/database.svelte";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { decryptBuffer, encryptBuffer, sleep } from "../util";
 import { hubURL } from "../characterCards";
 import { language } from "src/lang";
 import { getColdStorageItem, listColdDataKeys, setColdStorageItem } from "../process/coldstorage.svelte";
 import { DBState } from "../stores.svelte";
+import { runSuspendedPluginRuntimeMutation } from "../plugins/plugins.svelte";
+import { databasePersistenceCoordinator } from "../storage/databasePersistenceCoordinator";
 
 function getBasename(data:string){
     const baseNameRegex = /\\/g
@@ -437,143 +439,129 @@ export function LoadLocalBackup(){
         input.type = 'file';
         input.accept = '.bin';
         input.onchange = async () => {
-            if (!input.files || input.files.length === 0) {
+            try {
+                if (!input.files || input.files.length === 0) {
+                    input.remove();
+                    return;
+                }
+                const file = input.files[0];
                 input.remove();
-                return;
-            }
-            const file = input.files[0];
-            input.remove();
 
-            const reader = file.stream().getReader();
-            const CHUNK_SIZE = 1024 * 1024; // 1MB chunk size
-            let bytesRead = 0;
-            let remainingBuffer = new Uint8Array();
+                const reader = file.stream().getReader();
+                const entries: Array<{ name: string; data: Uint8Array }> = []
+                let bytesRead = 0;
+                let remainingBuffer = new Uint8Array();
 
-            while (true) {
-                const { done, value } = await reader.read();
-                if (done) {
-                    break;
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+                    bytesRead += value.length;
+                    const progress = ((bytesRead / file.size) * 100).toFixed(2);
+                    alertWait(`Loading local Backup... (${progress}%)`);
+
+                    const newBuffer = new Uint8Array(remainingBuffer.length + value.length);
+                    newBuffer.set(remainingBuffer);
+                    newBuffer.set(value, remainingBuffer.length);
+                    remainingBuffer = newBuffer;
+
+                    let offset = 0;
+                    while (offset + 4 <= remainingBuffer.length) {
+                        const nameLength = new Uint32Array(remainingBuffer.slice(offset, offset + 4).buffer)[0];
+                        if (offset + 4 + nameLength + 4 > remainingBuffer.length) break;
+                        const name = new TextDecoder().decode(remainingBuffer.slice(offset + 4, offset + 4 + nameLength));
+                        const dataLength = new Uint32Array(remainingBuffer.slice(offset + 4 + nameLength, offset + 8 + nameLength).buffer)[0];
+                        if (offset + 8 + nameLength + dataLength > remainingBuffer.length) break;
+                        entries.push({
+                            name,
+                            data: remainingBuffer.slice(offset + 8 + nameLength, offset + 8 + nameLength + dataLength),
+                        })
+                        offset += 8 + nameLength + dataLength;
+                    }
+                    remainingBuffer = remainingBuffer.slice(offset);
+                }
+                if (remainingBuffer.length !== 0) throw new Error('Backup archive is truncated')
+
+                const encryptionEntry = entries.find((entry) => entry.name === 'encryption.risudat')
+                if (encryptionEntry) {
+                    try {
+                        const meta = JSON.parse(new TextDecoder().decode(encryptionEntry.data)) as typeof encryptionMeta
+                        if (meta.type === 'account' && meta.time) {
+                            encryptionMeta.type = 'account'
+                            encryptionMeta.time = meta.time
+                        } else {
+                            alertError('Invalid encryption metadata, will attempt to load database backup without decryption.')
+                        }
+                    } catch (error) {
+                        console.error('Failed to parse encryption metadata:', error)
+                        alertError('Failed to parse encryption metadata, will attempt to load database backup without decryption.')
+                    }
                 }
 
-                bytesRead += value.length;
-                const progress = ((bytesRead / file.size) * 100).toFixed(2);
-                alertWait(`Loading local Backup... (${progress}%)`);
-
-                const newBuffer = new Uint8Array(remainingBuffer.length + value.length);
-                newBuffer.set(remainingBuffer);
-                newBuffer.set(value, remainingBuffer.length);
-                remainingBuffer = newBuffer;
-
-                let offset = 0;
-                while (offset + 4 <= remainingBuffer.length) {
-                    const nameLength = new Uint32Array(remainingBuffer.slice(offset, offset + 4).buffer)[0];
-
-                    if (offset + 4 + nameLength > remainingBuffer.length) {
-                        break;
-                    }
-                    const nameBuffer = remainingBuffer.slice(offset + 4, offset + 4 + nameLength);
-                    const name = new TextDecoder().decode(nameBuffer);
-
-                    if (offset + 4 + nameLength + 4 > remainingBuffer.length) {
-                        break;
-                    }
-                    const dataLength = new Uint32Array(remainingBuffer.slice(offset + 4 + nameLength, offset + 4 + nameLength + 4).buffer)[0];
-
-                    if (offset + 4 + nameLength + 4 + dataLength > remainingBuffer.length) {
-                        break;
-                    }
-                    const data = remainingBuffer.slice(offset + 4 + nameLength + 4, offset + 4 + nameLength + 4 + dataLength);
-
-                    if( name === 'encryption.risudat') {
+                const databaseEntry = entries.find((entry) => entry.name === 'database.risudat')
+                let restoredDatabase: Awaited<ReturnType<typeof decodeRisuSave>> | undefined
+                if (databaseEntry) {
+                    let bytes = databaseEntry.data
+                    if (encryptionMeta.type === 'account' && encryptionMeta.time) {
                         try {
-                            const meta = JSON.parse(new TextDecoder().decode(data)) as typeof encryptionMeta
-                            if (meta.type === 'account' && meta.time) {
-                                encryptionMeta.type = 'account'
-                                encryptionMeta.time = meta.time
-                            } else {
-                                alertError('Invalid encryption metadata, will attempt to load database backup without decryption.')
-                            }
-                        } catch (e) {
-                            console.error('Failed to parse encryption metadata:', e)
-                            alertError('Failed to parse encryption metadata, will attempt to load database backup without decryption.')
+                            const key = (await (await fetch(`https://sv.risuai.xyz/cryptokey?key=${encryptionMeta.time}`)).json()).key
+                            bytes = new Uint8Array(await decryptBuffer(bytes, key))
+                        } catch (error) {
+                            console.error('Failed to decrypt database backup:', error)
+                            alertError('Failed to decrypt database backup, will attempt to load it without decryption.')
                         }
                     }
+                    restoredDatabase = await decodeRisuSave(bytes)
+                }
 
-                    else if (name === 'database.risudat') {
-                        let db = new Uint8Array(data);
-                        if(encryptionMeta.type === 'account' && encryptionMeta.time){
-                            try {
-                                const key = (await (await fetch(`https://sv.risuai.xyz/cryptokey?key=${encryptionMeta.time}`)).json()).key
-                                const decrypted = await decryptBuffer(db, key)
-                                db = new Uint8Array(decrypted)
-                            }
-                            catch (e) {
-                                console.error('Failed to decrypt database backup:', e)
-                                alertError('Failed to decrypt database backup, will attempt to load it without decryption.')
-                            }
-                        }
-                        const dbData = await decodeRisuSave(db);
-                        setDatabaseLite(dbData);
-                        requiresFullEncoderReload.state = true;
-                        if (isTauri) {
-                            await writeFile('database/database.bin', db, { baseDir: BaseDirectory.AppData });
-                            await relaunch();
-                            alertStore.set({
-                                type: "wait",
-                                msg: "Success, Refreshing your app."
-                            });
-                        } else {
-                            await forageStorage.setItem('database/database.bin', db);
-                            location.search = '';
-                            alertStore.set({
-                                type: "wait",
-                                msg: "Success, Refreshing your app."
-                            });
-                        }
-                    }
-                    
-                    else {
+                await runSuspendedPluginRuntimeMutation(async ({ markIrreversibleMutation, replaceLiveDatabase }) =>
+                    databasePersistenceCoordinator.runExclusiveMutation(async () => {
+                    for (const { name, data } of entries) {
+                        if (name === 'encryption.risudat' || name === 'database.risudat') continue
                         const coldStorageKey = getColdStorageBackupKey(name)
                         let handledAsColdStorage = false
-
                         if (coldStorageKey && forageStorage.isAccount) {
                             handledAsColdStorage = true
-                        }
-                        else if (coldStorageKey) {
+                        } else if (coldStorageKey) {
                             try {
-                                const text = new TextDecoder().decode(data)
-                                const jsonData = JSON.parse(text)
-
+                                const jsonData = JSON.parse(new TextDecoder().decode(data))
                                 if (isColdStorageBackupData(jsonData)) {
+                                    markIrreversibleMutation()
                                     await setColdStorageItem(coldStorageKey, jsonData)
                                     handledAsColdStorage = true
                                 } else {
                                     console.warn(`Skipping invalid cold storage backup item ${name}`)
                                 }
-                            } catch (e) {
-                                console.error(`Failed to parse cold storage item ${coldStorageKey}:`, e)
+                            } catch (error) {
+                                console.error(`Failed to parse cold storage item ${coldStorageKey}:`, error)
                             }
                         }
-
                         if (!handledAsColdStorage) {
-                            if (isTauri) {
-                                await writeFile(`assets/` + name, data, { baseDir: BaseDirectory.AppData });
-                            } else {
-                                await forageStorage.setItem('assets/' + name, data);
-                            }
+                            markIrreversibleMutation()
+                            if (isTauri) await writeFile(`assets/` + name, data, { baseDir: BaseDirectory.AppData });
+                            else await forageStorage.setItem('assets/' + name, data);
                         }
-                    }
-                    await sleep(10);
-                    if (forageStorage.isAccount) {
-                        await sleep(1000);
+                        await sleep(10);
+                        if (forageStorage.isAccount) await sleep(1000);
                     }
 
-                    offset += 4 + nameLength + 4 + dataLength;
+                    if (restoredDatabase) {
+                        await replaceLiveDatabase(restoredDatabase)
+                        await persistRestoredDatabaseUnderLease(getDatabase({ snapshot: true }))
+                    }
+                }))
+
+                if (restoredDatabase) {
+                    requiresFullEncoderReload.state = true;
+                    alertStore.set({ type: "wait", msg: "Success, Refreshing your app." });
+                    if (isTauri) await relaunch();
+                    else location.search = '';
+                } else {
+                    alertNormal('Success');
                 }
-                remainingBuffer = remainingBuffer.slice(offset);
+            } catch (error) {
+                console.error(error);
+                alertError('Failed, Is file corrupted?')
             }
-
-            alertNormal('Success');
         };
 
         input.click();

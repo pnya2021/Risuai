@@ -5,7 +5,7 @@
     import { TriangleAlert } from '@lucide/svelte';
 
     import { DBState, hotReloading } from "src/ts/stores.svelte";
-    import { checkPluginUpdate, createBlankPlugin, importPlugin, loadPlugins, updatePlugin } from "src/ts/plugins/plugins.svelte";
+    import { checkPluginUpdate, createBlankPlugin, importPlugin, removeInstalledPlugin, setInstalledPluginEnabled, updatePlugin } from "src/ts/plugins/plugins.svelte";
     import TextInput from "src/lib/UI/GUI/TextInput.svelte";
     import NumberInput from "src/lib/UI/GUI/NumberInput.svelte";
     import SelectInput from "src/lib/UI/GUI/SelectInput.svelte";
@@ -97,9 +97,7 @@
             <button
                 class="textcolor2 hover:gray-200 cursor-pointer"
                 onclick={async (e) => {
-                    plugin.enabled = !plugin.enabled
-                    DBState.db.plugins[i] = plugin
-                    loadPlugins()
+                    if (plugin.principalId) await setInstalledPluginEnabled(plugin.principalId, !plugin.enabled)
                     e.preventDefault()
                 }}
             >
@@ -118,14 +116,8 @@
                         language.removeConfirm +
                             (plugin.displayName ?? plugin.name),
                     );
-                    if (v) {
-                        if (DBState.db.currentPluginProvider === plugin.name) {
-                            DBState.db.currentPluginProvider = "";
-                        }
-                        let plugins = DBState.db.plugins ?? [];
-                        plugins.splice(i, 1);
-                        DBState.db.plugins = plugins;
-                        loadPlugins()
+                    if (v && plugin.principalId) {
+                        await removeInstalledPlugin(plugin.principalId)
                     }
                 }}
             >
