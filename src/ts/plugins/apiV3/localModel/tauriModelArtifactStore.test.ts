@@ -271,4 +271,36 @@ describe("Tauri model artifact store", () => {
             bytes: 0,
         })
     })
+
+    it("enforces the 1 MiB chunk boundary on partial and verified reads", async () => {
+        const fs = new MemoryTauriFs()
+        const store = new TauriModelArtifactStore({ fs })
+        const bytes = tinyArtifactBytes()
+        const partial = await store.beginWrite(TINY_ARTIFACT.sha256, {
+            expectedBytes: bytes.byteLength,
+        })
+        await partial.write(bytes.slice(0, 41))
+        await partial.abort({ keepPartial: true })
+
+        await expect(
+            collect(
+                store.readPartial(TINY_ARTIFACT.sha256, {
+                    chunkSize: 1_048_577,
+                }),
+            ),
+        ).rejects.toThrow(/chunk size/i)
+
+        const resumed = await store.beginWrite(TINY_ARTIFACT.sha256, {
+            expectedBytes: bytes.byteLength,
+        })
+        await resumed.write(bytes.slice(resumed.offset))
+        await resumed.commit(TINY_ARTIFACT.sha256)
+        const opened = await store.openVerified(TINY_ARTIFACT.sha256)
+        expect(await collect(opened.chunks({ chunkSize: 1_048_576 }))).toEqual(
+            bytes,
+        )
+        await expect(
+            collect(opened.chunks({ chunkSize: 1_048_577 })),
+        ).rejects.toThrow(/chunk size/i)
+    })
 })

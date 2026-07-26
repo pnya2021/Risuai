@@ -1,5 +1,6 @@
 import { Sha256 } from "@aws-crypto/sha256-js"
 import {
+    MODEL_ARTIFACT_MAX_CHUNK_BYTES,
     assertArtifactDigest,
     type ArtifactStat,
     type ModelArtifactStore,
@@ -169,16 +170,18 @@ async function preflightQuota(
 async function streamIntoStore(input: {
     response: RegisteredArtifactResponse
     writer: ModelArtifactWriteHandle
+    store: ModelArtifactStore
     hasher: Sha256
     offset: number
     artifact: Readonly<RegisteredModelArtifact>
     signal: AbortSignal
 }): Promise<void> {
     if (!input.response.body) throw new Error("Artifact response body is absent")
-    const reader = input.response.body.getReader()
+    let reader: ReadableStreamDefaultReader<Uint8Array> | undefined
     let total = input.offset
     let completed = false
     try {
+        reader = input.response.body.getReader()
         while (true) {
             throwIfAborted(input.signal)
             const item = await reader.read()
@@ -188,6 +191,12 @@ async function streamIntoStore(input: {
                 throw new DownloadFailure("Artifact stream yielded non-byte data", false)
             }
             if (item.value.byteLength === 0) continue
+            if (item.value.byteLength > MODEL_ARTIFACT_MAX_CHUNK_BYTES) {
+                throw new DownloadFailure(
+                    "Artifact stream chunk exceeds maximum size",
+                    false,
+                )
+            }
             const chunk = item.value.slice()
             total += chunk.byteLength
             if (total > input.artifact.bytes) {
@@ -203,7 +212,12 @@ async function streamIntoStore(input: {
         if (digest !== input.artifact.sha256) {
             throw new DownloadFailure("Artifact SHA-256 verification failed", false)
         }
-        await input.writer.commit(digest)
+        await commitVerified({
+            writer: input.writer,
+            store: input.store,
+            digest,
+            signal: input.signal,
+        })
         completed = true
     } catch (error) {
         const keepPartial =
@@ -215,9 +229,27 @@ async function streamIntoStore(input: {
         await input.writer.abort({ keepPartial }).catch(() => undefined)
         throw error
     } finally {
-        if (!completed) await reader.cancel().catch(() => undefined)
-        reader.releaseLock()
+        if (reader) {
+            if (!completed) await reader.cancel().catch(() => undefined)
+            reader.releaseLock()
+        }
     }
+}
+
+async function commitVerified(input: {
+    writer: ModelArtifactWriteHandle
+    store: ModelArtifactStore
+    digest: string
+    signal: AbortSignal
+}): Promise<void> {
+    throwIfAborted(input.signal)
+    await input.writer.commit(input.digest)
+    if (!input.signal.aborted) return
+    await input.store.remove(input.digest, {
+        partial: false,
+        verified: true,
+    })
+    throw abortReason(input.signal)
 }
 
 async function executeDownload(
@@ -300,7 +332,12 @@ async function executeDownload(
                     await writer.abort({ keepPartial: true })
                     throw new Error("Artifact partial changed before promotion")
                 }
-                await writer.commit(digest)
+                try {
+                    await commitVerified({ writer, store, digest, signal })
+                } catch (error) {
+                    await writer.abort({ keepPartial: true }).catch(() => undefined)
+                    throw error
+                }
                 return {
                     state: "verified",
                     bytes: artifact.bytes,
@@ -320,87 +357,101 @@ async function executeDownload(
             signal,
             maxBytes: artifact.bytes,
         })
-        throwIfAborted(signal)
-
-        if (REDIRECT_STATUSES.has(response.status)) {
-            const location = header(response.headers, "Location")
-            await cancelBody(response.body)
-            if (!location) throw new Error("Artifact redirect omitted Location")
-            url = resolveRegisteredArtifactRedirect({
-                artifact,
-                currentUrl: artifact.url,
-                location,
-                currentHostOrigin: options.currentHostOrigin,
-                redirectsFollowed,
-            })
-            redirectsFollowed += 1
-            continue
+        let responseBodyOwned = response.body !== null
+        const releaseResponseBody = async (reason?: unknown) => {
+            if (!responseBodyOwned) return
+            responseBodyOwned = false
+            await cancelBody(response.body, reason)
         }
+        try {
+            throwIfAborted(signal)
 
-        const responseEtag = header(response.headers, "ETag")
-        if (offset > 0 && response.status === 206) {
-            const contentRange = header(response.headers, "Content-Range")
-            const contentLength = header(response.headers, "Content-Length")
-            const lengthMatches =
-                contentLength === undefined ||
-                Number(contentLength) === artifact.bytes - offset
-            const etagMatches = etag === undefined || responseEtag === etag
-            if (
-                !validateContentRange(contentRange, offset, artifact.bytes) ||
-                !lengthMatches ||
-                !etagMatches
-            ) {
-                await cancelBody(response.body)
-                if (restarted) throw new Error("Artifact resume response is invalid")
-                await store.remove(artifact.sha256, {
-                    partial: true,
-                    verified: false,
+            if (REDIRECT_STATUSES.has(response.status)) {
+                const location = header(response.headers, "Location")
+                await releaseResponseBody()
+                if (!location) throw new Error("Artifact redirect omitted Location")
+                url = resolveRegisteredArtifactRedirect({
+                    artifact,
+                    currentUrl: artifact.url,
+                    location,
+                    currentHostOrigin: options.currentHostOrigin,
+                    redirectsFollowed,
                 })
-                offset = 0
-                etag = undefined
-                restarted = true
-                url = artifact.url
-                redirectsFollowed = 0
+                redirectsFollowed += 1
                 continue
             }
-        } else if (response.status === 200) {
-            if (offset > 0) {
-                await store.remove(artifact.sha256, {
-                    partial: true,
-                    verified: false,
-                })
-                offset = 0
-                etag = undefined
-                restarted = true
-                hasher = new Sha256()
-            }
-        } else {
-            await cancelBody(response.body)
-            throw new Error(`Artifact transport returned status ${response.status}`)
-        }
 
-        if (!response.body) throw new Error("Artifact response body is absent")
-        const writer = await store.beginWrite(artifact.sha256, {
-            expectedBytes: artifact.bytes,
-            ...(responseEtag ? { etag: responseEtag } : etag ? { etag } : {}),
-            restart: offset === 0,
-        })
-        if (writer.offset !== offset) {
-            await writer.abort({ keepPartial: true })
-            throw new Error("Artifact partial changed before streaming")
-        }
-        await streamIntoStore({
-            response,
-            writer,
-            hasher,
-            offset,
-            artifact,
-            signal,
-        })
-        return {
-            state: "verified",
-            bytes: artifact.bytes,
-            resumed: offset > 0 && !restarted,
+            const responseEtag = header(response.headers, "ETag")
+            if (offset > 0 && response.status === 206) {
+                const contentRange = header(response.headers, "Content-Range")
+                const contentLength = header(response.headers, "Content-Length")
+                const lengthMatches =
+                    contentLength === undefined ||
+                    Number(contentLength) === artifact.bytes - offset
+                const etagMatches = etag === undefined || responseEtag === etag
+                if (
+                    !validateContentRange(contentRange, offset, artifact.bytes) ||
+                    !lengthMatches ||
+                    !etagMatches
+                ) {
+                    await releaseResponseBody()
+                    if (restarted) throw new Error("Artifact resume response is invalid")
+                    await store.remove(artifact.sha256, {
+                        partial: true,
+                        verified: false,
+                    })
+                    offset = 0
+                    etag = undefined
+                    restarted = true
+                    url = artifact.url
+                    redirectsFollowed = 0
+                    continue
+                }
+            } else if (response.status === 200) {
+                if (offset > 0) {
+                    await store.remove(artifact.sha256, {
+                        partial: true,
+                        verified: false,
+                    })
+                    offset = 0
+                    etag = undefined
+                    restarted = true
+                    hasher = new Sha256()
+                }
+            } else {
+                await releaseResponseBody()
+                throw new Error(`Artifact transport returned status ${response.status}`)
+            }
+
+            if (!response.body) throw new Error("Artifact response body is absent")
+            const writer = await store.beginWrite(artifact.sha256, {
+                expectedBytes: artifact.bytes,
+                ...(responseEtag ? { etag: responseEtag } : etag ? { etag } : {}),
+                restart: offset === 0,
+            })
+            if (writer.offset !== offset) {
+                const mismatch = new Error("Artifact partial changed before streaming")
+                await writer.abort({ keepPartial: true }).catch(() => undefined)
+                throw mismatch
+            }
+            responseBodyOwned = false
+            await streamIntoStore({
+                response,
+                writer,
+                store,
+                hasher,
+                offset,
+                artifact,
+                signal,
+            })
+            return {
+                state: "verified",
+                bytes: artifact.bytes,
+                resumed: offset > 0 && !restarted,
+            }
+        } catch (error) {
+            await releaseResponseBody(error)
+            throw error
         }
     }
 }

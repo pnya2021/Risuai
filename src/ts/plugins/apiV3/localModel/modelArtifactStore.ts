@@ -1,5 +1,7 @@
 export type ArtifactStoreKind = "opfs" | "tauri"
 
+export const MODEL_ARTIFACT_MAX_CHUNK_BYTES = 1_048_576
+
 export interface ArtifactEstimate {
     usageBytes?: number
     quotaBytes?: number

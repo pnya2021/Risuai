@@ -143,6 +143,22 @@ function body(chunks: Uint8Array[]): ReadableStream<Uint8Array> {
     })
 }
 
+function trackedBody(options: { cancelError?: Error } = {}): {
+    body: ReadableStream<Uint8Array>
+    cancellations(): number
+} {
+    let cancellations = 0
+    return {
+        body: new ReadableStream<Uint8Array>({
+            cancel() {
+                cancellations += 1
+                if (options.cancelError) throw options.cancelError
+            },
+        }),
+        cancellations: () => cancellations,
+    }
+}
+
 function response(
     status: number,
     chunks: Uint8Array[] | null,
@@ -172,6 +188,75 @@ function deferred<T>(): {
         resolve = next
     })
     return { promise, resolve }
+}
+
+class GatedArtifactStore extends MemoryArtifactStore {
+    delayBegin = false
+    delayCommit = false
+    readonly beginStarted = deferred<void>()
+    readonly releaseBegin = deferred<void>()
+    readonly commitStarted = deferred<void>()
+    readonly releaseCommit = deferred<void>()
+    readonly terminal = deferred<"committed" | "partial" | "removed">()
+
+    override async beginWrite(
+        digest: string,
+        metadata: Parameters<ModelArtifactStore["beginWrite"]>[1],
+    ): Promise<ModelArtifactWriteHandle> {
+        this.beginStarted.resolve(undefined)
+        if (this.delayBegin) await this.releaseBegin.promise
+        const handle = await super.beginWrite(digest, metadata)
+        return {
+            offset: handle.offset,
+            write: (chunk) => handle.write(chunk),
+            commit: async (verifiedSha256) => {
+                this.commitStarted.resolve(undefined)
+                if (this.delayCommit) await this.releaseCommit.promise
+                await handle.commit(verifiedSha256)
+                this.terminal.resolve("committed")
+            },
+            abort: async (abortOptions) => {
+                await handle.abort(abortOptions)
+                this.terminal.resolve(
+                    abortOptions.keepPartial ? "partial" : "removed",
+                )
+            },
+        }
+    }
+}
+
+class FailingBeginArtifactStore extends MemoryArtifactStore {
+    override async beginWrite(): Promise<never> {
+        throw new Error("beginWrite failed")
+    }
+}
+
+class FailingAbortArtifactStore extends MemoryArtifactStore {
+    override async beginWrite(
+        digest: string,
+        metadata: Parameters<ModelArtifactStore["beginWrite"]>[1],
+    ): Promise<ModelArtifactWriteHandle> {
+        const handle = await super.beginWrite(digest, metadata)
+        return {
+            offset: handle.offset,
+            write: (chunk) => handle.write(chunk),
+            commit: (verifiedSha256) => handle.commit(verifiedSha256),
+            abort: async (abortOptions) => {
+                await handle.abort(abortOptions)
+                throw new Error("writer cleanup failed")
+            },
+        }
+    }
+}
+
+class MismatchedOffsetArtifactStore extends FailingAbortArtifactStore {
+    override async beginWrite(
+        digest: string,
+        metadata: Parameters<ModelArtifactStore["beginWrite"]>[1],
+    ): Promise<ModelArtifactWriteHandle> {
+        const handle = await super.beginWrite(digest, metadata)
+        return { ...handle, offset: handle.offset + 1 }
+    }
 }
 
 function options(
@@ -216,6 +301,74 @@ describe("registered artifact download", () => {
             tinyArtifactBytes(),
         )
         expect(store.maxWrittenChunk).toBe(13)
+        expect(store.activeWriters).toBe(0)
+    })
+
+    it("accepts an exact 1 MiB incoming chunk", async () => {
+        const store = new MemoryArtifactStore()
+        const bytes = new Uint8Array(1_048_576)
+        const artifact = Object.freeze({
+            ...TINY_ARTIFACT,
+            bytes: bytes.byteLength,
+            sha256:
+                "30e14955ebf1352266dc2ff8067e68104607e750abb9d3b36582b8af909fcb58",
+        })
+
+        await expect(
+            downloadRegisteredArtifact({
+                artifact,
+                store,
+                assertRegisteredArtifact: () => undefined,
+                transport: {
+                    request: async () => response(200, [bytes]),
+                },
+            }),
+        ).resolves.toEqual({
+            state: "verified",
+            bytes: 1_048_576,
+            resumed: false,
+        })
+        expect(store.maxWrittenChunk).toBe(1_048_576)
+    })
+
+    it("rejects an oversized incoming chunk before copying or writing it", async () => {
+        const store = new MemoryArtifactStore()
+        const oversized = new Uint8Array(1_048_577)
+        const originalSlice = oversized.slice.bind(oversized)
+        let copied = false
+        Object.defineProperty(oversized, "slice", {
+            value: (start?: number, end?: number) => {
+                copied = true
+                return originalSlice(start, end)
+            },
+        })
+        const artifact = Object.freeze({
+            ...TINY_ARTIFACT,
+            bytes: oversized.byteLength,
+            sha256: "0".repeat(64),
+        })
+
+        await expect(
+            downloadRegisteredArtifact({
+                artifact,
+                store,
+                assertRegisteredArtifact: () => undefined,
+                transport: {
+                    request: async () => ({
+                        status: 200,
+                        headers: [],
+                        body: new ReadableStream<Uint8Array>({
+                            start(controller) {
+                                controller.enqueue(oversized)
+                                controller.close()
+                            },
+                        }),
+                    }),
+                },
+            }),
+        ).rejects.toThrow(/chunk.*maximum/i)
+        expect(copied).toBe(false)
+        expect(store.maxWrittenChunk).toBe(0)
         expect(store.activeWriters).toBe(0)
     })
 
@@ -350,6 +503,113 @@ describe("registered artifact download", () => {
             )
             expect(store.activeWriters).toBe(0)
         }
+    })
+
+    it("cancels a response body returned after the last waiter aborts", async () => {
+        const store = new MemoryArtifactStore()
+        const controller = new AbortController()
+        const tracked = trackedBody()
+        const download = downloadRegisteredArtifact(
+            options(
+                store,
+                {
+                    request: async () => {
+                        controller.abort()
+                        return { status: 200, headers: [], body: tracked.body }
+                    },
+                },
+                { signal: controller.signal },
+            ),
+        )
+
+        await expect(download).rejects.toThrow()
+        await vi.waitFor(() => expect(tracked.cancellations()).toBe(1))
+    })
+
+    it("cancels unclaimed bodies without masking duplicate-header errors", async () => {
+        const tracked = trackedBody({
+            cancelError: new Error("body cleanup failed"),
+        })
+        await expect(
+            downloadRegisteredArtifact(
+                options(new MemoryArtifactStore(), {
+                    request: async () => ({
+                        status: 200,
+                        headers: [
+                            ["ETag", '"one"'],
+                            ["etag", '"two"'],
+                        ],
+                        body: tracked.body,
+                    }),
+                }),
+            ),
+        ).rejects.toThrow(/duplicate etag/i)
+        expect(tracked.cancellations()).toBe(1)
+    })
+
+    it("cancels the response body when beginWrite fails without masking that failure", async () => {
+        const tracked = trackedBody({
+            cancelError: new Error("body cleanup failed"),
+        })
+        await expect(
+            downloadRegisteredArtifact(
+                options(new FailingBeginArtifactStore(), {
+                    request: async () => ({
+                        status: 200,
+                        headers: [],
+                        body: tracked.body,
+                    }),
+                }),
+            ),
+        ).rejects.toThrow(/beginWrite failed/i)
+        expect(tracked.cancellations()).toBe(1)
+    })
+
+    it("aborts an acquired writer when reader acquisition fails without masking the primary error", async () => {
+        const store = new FailingAbortArtifactStore()
+        const lockedBody = new ReadableStream<Uint8Array>()
+        const externalReader = lockedBody.getReader()
+        try {
+            await expect(
+                downloadRegisteredArtifact(
+                    options(store, {
+                        request: async () => ({
+                            status: 200,
+                            headers: [],
+                            body: lockedBody,
+                        }),
+                    }),
+                ),
+            ).rejects.toThrow(/locked|reader/i)
+            expect(store.activeWriters).toBe(0)
+            expect(await store.stat(TINY_ARTIFACT.sha256)).toEqual({
+                state: "absent",
+                bytes: 0,
+            })
+        } finally {
+            externalReader.releaseLock()
+            await lockedBody.cancel().catch(() => undefined)
+        }
+    })
+
+    it("keeps offset mismatch primary while writer and response cleanup fail", async () => {
+        const store = new MismatchedOffsetArtifactStore()
+        const tracked = trackedBody({
+            cancelError: new Error("body cleanup failed"),
+        })
+        await expect(
+            downloadRegisteredArtifact(
+                options(store, {
+                    request: async () => ({
+                        status: 200,
+                        headers: [],
+                        body: tracked.body,
+                    }),
+                }),
+            ),
+        ).rejects.toThrow(/partial changed before streaming/i)
+        expect(store.activeWriters).toBe(0)
+        expect(tracked.cancellations()).toBe(1)
     })
 
     it("checks every redirect against the reviewed one-hop policy", async () => {
@@ -498,6 +758,68 @@ describe("registered artifact download", () => {
         expect(underlyingSignal.aborted).toBe(true)
         await vi.waitFor(() => expect(store.activeWriters).toBe(0))
         expect((await store.stat(TINY_ARTIFACT.sha256)).state).toBe("partial")
+    })
+
+    it("does not promote a complete partial when the last waiter cancels during beginWrite", async () => {
+        const store = new GatedArtifactStore()
+        store.delayBegin = true
+        store.setPartial(TINY_ARTIFACT, tinyArtifactBytes(), '"tiny"')
+        const controller = new AbortController()
+        const download = downloadRegisteredArtifact(
+            options(
+                store,
+                {
+                    request: async () => {
+                        throw new Error("transport must not run")
+                    },
+                },
+                { signal: controller.signal },
+            ),
+        )
+
+        await store.beginStarted.promise
+        controller.abort()
+        await expect(download).rejects.toThrow()
+        store.releaseBegin.resolve(undefined)
+
+        expect(await store.terminal.promise).toBe("partial")
+        expect(await store.stat(TINY_ARTIFACT.sha256)).toMatchObject({
+            state: "partial",
+            bytes: 130,
+        })
+        expect(store.activeWriters).toBe(0)
+    })
+
+    it("rolls back verification when the last waiter cancels during commit", async () => {
+        const store = new GatedArtifactStore()
+        store.delayCommit = true
+        const controller = new AbortController()
+        const download = downloadRegisteredArtifact(
+            options(
+                store,
+                {
+                    request: async () =>
+                        response(200, chunksOf(tinyArtifactBytes(), 19), [
+                            ["ETag", '"tiny"'],
+                        ]),
+                },
+                { signal: controller.signal },
+            ),
+        )
+
+        await store.commitStarted.promise
+        controller.abort()
+        await expect(download).rejects.toThrow()
+        store.releaseCommit.resolve(undefined)
+        expect(await store.terminal.promise).toBe("committed")
+
+        await vi.waitFor(async () => {
+            expect(await store.stat(TINY_ARTIFACT.sha256)).toEqual({
+                state: "absent",
+                bytes: 0,
+            })
+        })
+        expect(store.activeWriters).toBe(0)
     })
 
     it("keeps different digests independent", async () => {

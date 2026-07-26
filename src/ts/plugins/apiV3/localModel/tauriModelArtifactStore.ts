@@ -10,6 +10,7 @@ import {
     writeTextFile,
 } from "@tauri-apps/plugin-fs"
 import {
+    MODEL_ARTIFACT_MAX_CHUNK_BYTES,
     assertArtifactDigest,
     assertArtifactWriteMetadata,
     type ArtifactEstimate,
@@ -93,7 +94,11 @@ async function ignoreNotFound(action: () => Promise<void>): Promise<void> {
 }
 
 function validateChunkSize(options: ArtifactReadOptions): number {
-    if (!Number.isSafeInteger(options.chunkSize) || options.chunkSize <= 0) {
+    if (
+        !Number.isSafeInteger(options.chunkSize) ||
+        options.chunkSize <= 0 ||
+        options.chunkSize > MODEL_ARTIFACT_MAX_CHUNK_BYTES
+    ) {
         throw new Error("Invalid artifact read chunk size")
     }
     return options.chunkSize

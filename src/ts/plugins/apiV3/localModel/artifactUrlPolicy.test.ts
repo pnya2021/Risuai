@@ -66,6 +66,26 @@ describe("registered artifact URL policy", () => {
         ["wrong port", "https://us.aws.cdn.hf.co:444/xet-bridge-us/a"],
         ["wrong path", "https://us.aws.cdn.hf.co/not-xet/a"],
         ["encoded traversal", "https://us.aws.cdn.hf.co/xet-bridge-us/%2e%2e/a"],
+        [
+            "encoded slash traversal",
+            "https://chat.example/api/resolve-cache/%2e%2e%2fsecret",
+        ],
+        [
+            "double-encoded slash traversal",
+            "https://chat.example/api/resolve-cache/%252e%252e%252fsecret",
+        ],
+        [
+            "double-encoded path separator",
+            "https://chat.example/api/resolve-cache/safe%252fsecret",
+        ],
+        [
+            "encoded backslash traversal",
+            "https://chat.example/api/resolve-cache/%2e%2e%5csecret",
+        ],
+        [
+            "double-encoded backslash",
+            "https://chat.example/api/resolve-cache/safe%255csecret",
+        ],
         ["query widening", "https://us.aws.cdn.hf.co/xet-bridge-us/a?redirect=https://evil.example"],
         ["host query", "https://chat.example/api/resolve-cache/a?download=1"],
     ])("rejects %s redirects", (_name, location) => {

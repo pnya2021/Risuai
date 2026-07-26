@@ -39,12 +39,21 @@ function hasTraversal(value: string): boolean {
     return pathname.split("/").some((segment) => {
         let decoded = segment
         try {
-            decoded = decodeURIComponent(decoded)
-            decoded = decodeURIComponent(decoded)
+            for (let depth = 0; depth < 2; depth += 1) {
+                decoded = decodeURIComponent(decoded)
+                if (
+                    decoded === "." ||
+                    decoded === ".." ||
+                    decoded.includes("/") ||
+                    decoded.includes("\\")
+                ) {
+                    return true
+                }
+            }
         } catch {
             return true
         }
-        return decoded === "." || decoded === ".."
+        return false
     })
 }
 
