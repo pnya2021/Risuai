@@ -259,6 +259,11 @@ fn is_forbidden_ipv4(address: Ipv4Addr) -> bool {
 
 fn is_forbidden_ipv6(address: Ipv6Addr) -> bool {
     let segments = address.segments();
+    let teredo = segments[0] == 0x2001 && segments[1] == 0x0000;
+    let benchmarking = segments[0] == 0x2001
+        && segments[1] == 0x0002
+        && segments[2] == 0x0000;
+    let six_to_four = segments[0] == 0x2002;
     let well_known_nat64 = segments[0] == 0x0064
         && segments[1] == 0xff9b
         && segments[2..6].iter().all(|segment| *segment == 0);
@@ -277,6 +282,9 @@ fn is_forbidden_ipv6(address: Ipv6Addr) -> bool {
         || (segments[0] & 0xffc0) == 0xfe80
         || (segments[0] & 0xffc0) == 0xfec0
         || (segments[0] == 0x2001 && segments[1] == 0x0db8)
+        || teredo
+        || benchmarking
+        || six_to_four
         || (segments[0] == 0x0100 && segments[1..4].iter().all(|segment| *segment == 0))
         || (segments[0] == 0x2001 && (segments[1] & 0xfff0) == 0x0010)
         || (segments[0] == 0x0064 && segments[1] == 0xff9b && segments[2] == 0x0001)
@@ -1299,6 +1307,9 @@ mod tests {
             "fec0::1",
             "ff00::1",
             "2001:db8::1",
+            "2001:2::1",
+            "2001::1",
+            "2002:7f00:1::",
             "::127.0.0.1",
             "::ffff:8.8.8.8",
             "64:ff9b:1::8.8.8.8",
