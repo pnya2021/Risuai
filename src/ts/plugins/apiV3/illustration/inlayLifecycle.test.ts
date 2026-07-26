@@ -256,6 +256,20 @@ describe('owned Inlay delete lifecycle', () => {
         expect(own.adapter.removeInlay).not.toHaveBeenCalled()
     })
 
+    it('rejects shape-valid owned lifecycle metadata relocated under a non-deterministic ID', async () => {
+        const own = harness()
+        const descriptor = await own.service.createInlay(new Uint8Array([1]), options())
+        const record = own.records.get(descriptor.id)!
+        const relocatedId = 'inlay_' + 'c'.repeat(64)
+        own.records.set(relocatedId, { ...record, id: relocatedId })
+
+        await expectCode(own.service.deleteInlay(relocatedId), 'PERMISSION_DENIED')
+
+        expect(own.adapter.hasReference).not.toHaveBeenCalled()
+        expect(own.adapter.removeInlay).not.toHaveBeenCalled()
+        expect(own.records.has(relocatedId)).toBe(true)
+    })
+
     it('rejects referenced deletion without removing storage', async () => {
         const { adapter, records, service } = harness({ referenced: true })
         const descriptor = await service.createInlay(new Uint8Array([1]), options())

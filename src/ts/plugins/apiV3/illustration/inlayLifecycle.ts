@@ -248,6 +248,9 @@ export class InlayLifecycleService {
         if (!validMetadata(metadata) || metadata.ownerPrincipalId !== this.context.principalId) {
             throw new PluginApiError('PERMISSION_DENIED', 'Inlay is not owned by the current plugin')
         }
+        if (await deterministicInlayId(metadata.ownerPrincipalId, metadata.idempotencyKey) !== id) {
+            throw new PluginApiError('PERMISSION_DENIED', 'Inlay lifecycle identity is malformed')
+        }
         if (expectedRevision !== undefined && expectedRevision !== record.revision) {
             throw new PluginApiError('CONFLICT', 'Inlay revision changed', {
                 details: { expectedRevision, actualRevision: record.revision },
