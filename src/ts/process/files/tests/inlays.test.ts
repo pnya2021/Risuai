@@ -3,12 +3,15 @@ import { beforeEach, describe, expect, test, vi } from 'vitest'
 import type { InlayAsset } from '../inlays'
 import {
     getInlayAsset,
+    getInlayAssetRecord,
     getInlayAssetBlob,
+    InlayImageDecodeError,
     listInlayAssets,
     postInlayAsset,
     removeInlayAsset,
     setInlayAsset,
     writeInlayImage,
+    writeInlayImageFromBytes,
 } from '../inlays'
 
 //#region module mocks
@@ -30,16 +33,19 @@ vi.spyOn(document, 'createElement').mockImplementation((tag: string, options?: a
 })
 
 const store = new Map<string, unknown>()
+let failSet: Error | null = null
+let skipRemove = false
 
 vi.mock('localforage', () => ({
     default: {
         createInstance: () => ({
             getItem: vi.fn(async (key: string) => store.get(key) ?? null),
             setItem: vi.fn(async (key: string, value: unknown) => {
+                if (failSet) throw failSet
                 store.set(key, value)
             }),
             removeItem: vi.fn(async (key: string) => {
-                store.delete(key)
+                if (!skipRemove) store.delete(key)
             }),
             iterate: vi.fn(async (cb: (value: unknown, key: string) => void) => {
                 for (const [key, value] of store) {
@@ -99,6 +105,8 @@ function makeImage(w: number, h: number): HTMLImageElement {
 beforeEach(() => {
     vi.clearAllMocks()
     store.clear()
+    failSet = null
+    skipRemove = false
 })
 
 describe('setInlayAsset', () => {
@@ -186,6 +194,24 @@ describe('getInlayAsset', () => {
         const result = await getInlayAsset('str-id')
         expect(result!.data).toBe(b64)
     })
+
+    test('keeps owned lifecycle metadata private while raw Host reads retain it', async () => {
+        const lifecycle = {
+            version: 1 as const,
+            ownerPrincipalId: 'principal-1',
+            operation: 'inlay.create.v1' as const,
+            idempotencyKey: 'create-1',
+            argumentDigest: 'a'.repeat(64),
+            revision: `sha256:${'b'.repeat(64)}`,
+            context: { kind: 'character' as const, characterId: 'character-1' },
+        }
+        store.set('owned-id', {
+            data: new Blob(['png']), ext: 'png', name: 'owned.png', type: 'image', lifecycle,
+        })
+
+        expect(await getInlayAssetRecord('owned-id')).toMatchObject({ lifecycle })
+        expect(await getInlayAsset('owned-id')).not.toHaveProperty('lifecycle')
+    })
 })
 
 describe('getInlayAssetBlob', () => {
@@ -266,7 +292,60 @@ describe('listInlayAssets', () => {
 
 describe('removeInlayAsset', () => {
     test('does not throw when removing a non-existent id', async () => {
-        await expect(removeInlayAsset('nope')).resolves.not.toThrow()
+        await expect(removeInlayAsset('nope')).resolves.toBe(true)
+    })
+
+    test('reports false when storage did not actually remove an asset', async () => {
+        store.set('retained', { data: 'data:image/png;base64,AA==', ext: 'png', name: 'x.png', type: 'image' })
+        skipRemove = true
+
+        await expect(removeInlayAsset('retained')).resolves.toBe(false)
+    })
+})
+
+describe('writeInlayImageFromBytes', () => {
+    test('normalizes decoded dimensions and always revokes its object URL after success', async () => {
+        const createObjectURL = vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:test-image')
+        const revokeObjectURL = vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => undefined)
+        vi.spyOn(HTMLImageElement.prototype, 'decode').mockResolvedValue(undefined)
+        vi.spyOn(HTMLImageElement.prototype, 'width', 'get').mockReturnValue(2048)
+        vi.spyOn(HTMLImageElement.prototype, 'height', 'get').mockReturnValue(1024)
+
+        await expect(writeInlayImageFromBytes(new Uint8Array([1, 2, 3]), {
+            id: 'owned-id', name: 'owned.jpg', beforeStore: vi.fn(),
+        })).resolves.toBe('owned-id')
+
+        expect(createObjectURL).toHaveBeenCalledOnce()
+        expect(revokeObjectURL).toHaveBeenCalledWith('blob:test-image')
+        expect(store.get('owned-id')).toMatchObject({
+            ext: 'png', height: 724, width: 1448, name: 'owned.jpg', type: 'image',
+        })
+    })
+
+    test('rejects undecodable images and revokes the object URL without storing', async () => {
+        vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:bad-image')
+        const revokeObjectURL = vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => undefined)
+        vi.spyOn(HTMLImageElement.prototype, 'decode').mockRejectedValue(new Error('decode failed'))
+
+        await expect(writeInlayImageFromBytes(new Uint8Array([0]), { id: 'bad-id' }))
+            .rejects.toBeInstanceOf(InlayImageDecodeError)
+
+        expect(revokeObjectURL).toHaveBeenCalledWith('blob:bad-image')
+        expect(store.has('bad-id')).toBe(false)
+    })
+
+    test('revokes the object URL when storage fails after decode', async () => {
+        vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:store-failure')
+        const revokeObjectURL = vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => undefined)
+        vi.spyOn(HTMLImageElement.prototype, 'decode').mockResolvedValue(undefined)
+        vi.spyOn(HTMLImageElement.prototype, 'width', 'get').mockReturnValue(1)
+        vi.spyOn(HTMLImageElement.prototype, 'height', 'get').mockReturnValue(1)
+        failSet = new Error('storage unavailable')
+
+        await expect(writeInlayImageFromBytes(new Uint8Array([1]), { id: 'failed-id' }))
+            .rejects.toThrow('storage unavailable')
+
+        expect(revokeObjectURL).toHaveBeenCalledWith('blob:store-failure')
     })
 })
 

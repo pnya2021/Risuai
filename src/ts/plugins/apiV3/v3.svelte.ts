@@ -14,7 +14,8 @@ import { changeColorScheme, updateColorScheme, updateTextThemeAndCSS, type Color
 import { isNodeServer, isTauri } from "src/ts/platform";
 import { get } from "svelte/store";
 import { registerMCPModule, registeredCustomPluginMCPs, unregisterMCPModule } from "src/ts/process/mcp/pluginmcp";
-import { getInlayAsset } from "src/ts/process/files/inlays";
+import { getInlayAsset, getInlayAssetRecord, removeInlayAsset, writeInlayImageFromBytes } from "src/ts/process/files/inlays";
+import { getColdStorageItem, listColdDataKeys } from "src/ts/process/coldstorage.svelte";
 import { getLLMCache, searchLLMCache } from "src/ts/translator/translator";
 import { LLMFlags, LLMFormat, LLMProvider, LLMTokenizer, type LLMModel } from "src/ts/model/types";
 import { sendChat as processSendChat, doingChat } from "src/ts/process/index.svelte";
@@ -51,6 +52,8 @@ import { createRisuContextResourceAdapter } from './illustration/contextResource
 import { PluginSecretService, protectedPluginSecretBackend } from './illustration/pluginSecretStore';
 import { PluginNativeFetchService } from './illustration/nativeFetch';
 import { PluginApiError } from './illustration/errors';
+import { INLAY_LIFECYCLE_CAPABILITY_IDS, InlayLifecycleService } from './illustration/inlayLifecycle';
+import { createRisuInlayLifecycleAdapter } from './illustration/inlayLifecycle.risu';
 
 /*
     V3 API for RisuAI Plugins
@@ -610,6 +613,23 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
             }),
         },
     )
+    const inlayLifecycle = new InlayLifecycleService(
+        context,
+        createRisuInlayLifecycleAdapter({
+            getDatabase,
+            getCurrentCharacter,
+            listColdDataKeys,
+            getColdStorageItem,
+            getInlayAssetRecord,
+            writeInlayImageFromBytes,
+            removeInlayAsset,
+        }),
+        {
+            require: (executionContext, permission) => pluginPermissionService.require(executionContext, permission, {
+                locale: DBState.db.language === 'ko' ? 'ko' : 'en',
+            }),
+        },
+    )
     const secretService = new PluginSecretService(context, protectedPluginSecretBackend, {
         requirePermission: () => pluginPermissionService.require(context, 'secrets', {
             locale: DBState.db.language === 'ko' ? 'ko' : 'en',
@@ -729,6 +749,8 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
         readInlay: async (id: string) => {
             return await getInlayAsset(id);
         },
+        createInlay: (data, options) => inlayLifecycle.createInlay(data, options),
+        deleteInlay: (id, options) => inlayLifecycle.deleteInlay(id, options),
         saveAsset: oldApis.saveAsset,
         //Same functionality, but new implementation
         getDatabase: async (includeOnly:string[]|'all' = 'all') => {
@@ -1222,6 +1244,7 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
                         'context.assets.v1',
                         'context.modules-installed.v1',
                         'secrets.write-only.v1',
+                        ...INLAY_LIFECYCLE_CAPABILITY_IDS,
                     ]),
                     hasCurrentContext: Boolean(getCurrentCharacter() && getCurrentChat()),
                     unavailableReasons: secretStatus.available ? {} : { 'secrets.write-only.v1': 'disabled' },

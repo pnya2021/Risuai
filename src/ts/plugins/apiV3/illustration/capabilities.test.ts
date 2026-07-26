@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import { CAPABILITY_CONTRACT, CAPABILITY_IDS } from './capabilityContract'
 import { getCapabilities } from './capabilities'
+import { INLAY_LIFECYCLE_CAPABILITY_IDS } from './inlayLifecycle'
 
 const context = {
     principalId: '11111111-1111-4111-8111-111111111111',
@@ -101,5 +102,28 @@ describe('V3 capability discovery', () => {
 
     it('returns all known descriptors when IDs are omitted', async () => {
         expect(Object.keys(await getCapabilities(context))).toEqual(CAPABILITY_IDS)
+    })
+
+    it('registers only the usable owned Inlay lifecycle and still gates it on inlayWrite', async () => {
+        expect(INLAY_LIFECYCLE_CAPABILITY_IDS).toEqual([
+            'inlay.create.v1',
+            'inlay.delete-own.v1',
+        ])
+        expect(INLAY_LIFECYCLE_CAPABILITY_IDS).not.toContain('inlay.atomic-attach.v1')
+
+        const granted = await getCapabilities(context, [
+            'inlay.create.v1',
+            'inlay.delete-own.v1',
+            'inlay.atomic-attach.v1',
+        ], {
+            permissionState: async () => 'granted',
+            runtime: { registeredServices: new Set(INLAY_LIFECYCLE_CAPABILITY_IDS) },
+        })
+        expect(granted['inlay.create.v1']).toMatchObject({ available: true, permission: 'inlayWrite' })
+        expect(granted['inlay.delete-own.v1']).toMatchObject({ available: true, permission: 'inlayWrite' })
+        expect(granted['inlay.atomic-attach.v1']).toMatchObject({
+            available: false,
+            reason: 'temporarily-unavailable',
+        })
     })
 })
