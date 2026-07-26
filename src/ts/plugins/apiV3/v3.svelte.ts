@@ -54,6 +54,7 @@ import { PluginNativeFetchService } from './illustration/nativeFetch';
 import { PluginApiError } from './illustration/errors';
 import { INLAY_LIFECYCLE_CAPABILITY_IDS, InlayLifecycleService } from './illustration/inlayLifecycle';
 import { createRisuInlayLifecycleAdapter } from './illustration/inlayLifecycle.risu';
+import { DEVICE_CACHE_CAPABILITY_IDS, DeviceCacheService } from './illustration/deviceCache';
 
 /*
     V3 API for RisuAI Plugins
@@ -630,6 +631,7 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
             }),
         },
     )
+    const deviceCache = new DeviceCacheService(context)
     const secretService = new PluginSecretService(context, protectedPluginSecretBackend, {
         requirePermission: () => pluginPermissionService.require(context, 'secrets', {
             locale: DBState.db.language === 'ko' ? 'ko' : 'en',
@@ -751,6 +753,11 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
         },
         createInlay: (data, options) => inlayLifecycle.createInlay(data, options),
         deleteInlay: (id, options) => inlayLifecycle.deleteInlay(id, options),
+        putDeviceCacheEntry: (input) => deviceCache.putDeviceCacheEntry(input),
+        getDeviceCacheEntry: (key) => deviceCache.getDeviceCacheEntry(key),
+        listDeviceCacheEntries: (options) => deviceCache.listDeviceCacheEntries(options),
+        deleteDeviceCacheEntry: (key, options) => deviceCache.deleteDeviceCacheEntry(key, options),
+        clearDeviceCache: (options) => deviceCache.clearDeviceCache(options),
         saveAsset: oldApis.saveAsset,
         //Same functionality, but new implementation
         getDatabase: async (includeOnly:string[]|'all' = 'all') => {
@@ -1245,6 +1252,7 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
                         'context.modules-installed.v1',
                         'secrets.write-only.v1',
                         ...INLAY_LIFECYCLE_CAPABILITY_IDS,
+                        ...DEVICE_CACHE_CAPABILITY_IDS,
                     ]),
                     hasCurrentContext: Boolean(getCurrentCharacter() && getCurrentChat()),
                     unavailableReasons: secretStatus.available ? {} : { 'secrets.write-only.v1': 'disabled' },

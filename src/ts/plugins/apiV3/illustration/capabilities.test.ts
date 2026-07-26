@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest'
 import { CAPABILITY_CONTRACT, CAPABILITY_IDS } from './capabilityContract'
 import { getCapabilities } from './capabilities'
 import { INLAY_LIFECYCLE_CAPABILITY_IDS } from './inlayLifecycle'
+import { DEVICE_CACHE_CAPABILITY_IDS } from './deviceCache'
 
 const context = {
     principalId: '11111111-1111-4111-8111-111111111111',
@@ -122,6 +123,24 @@ describe('V3 capability discovery', () => {
         expect(granted['inlay.create.v1']).toMatchObject({ available: true, permission: 'inlayWrite' })
         expect(granted['inlay.delete-own.v1']).toMatchObject({ available: true, permission: 'inlayWrite' })
         expect(granted['inlay.atomic-attach.v1']).toMatchObject({
+            available: false,
+            reason: 'temporarily-unavailable',
+        })
+    })
+
+    it('makes only the principal device cache callable while PixAI remains unavailable', async () => {
+        expect(DEVICE_CACHE_CAPABILITY_IDS).toEqual(['storage.device-cache.v1'])
+        expect(DEVICE_CACHE_CAPABILITY_IDS).not.toContain('local-model.pixai-v0.9.v1')
+        const descriptors = await getCapabilities(context, [
+            'storage.device-cache.v1',
+            'local-model.pixai-v0.9.v1',
+        ], {
+            permissionState: async () => 'granted',
+            runtime: { registeredServices: new Set(DEVICE_CACHE_CAPABILITY_IDS) },
+        })
+        expect(descriptors['storage.device-cache.v1']).toMatchObject({ available: true })
+        expect(descriptors['storage.device-cache.v1'].permission).toBeUndefined()
+        expect(descriptors['local-model.pixai-v0.9.v1']).toMatchObject({
             available: false,
             reason: 'temporarily-unavailable',
         })

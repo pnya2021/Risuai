@@ -1351,6 +1351,29 @@ interface CursorPage<T> {
     nextCursor?: string;
 }
 
+type PluginJsonValue =
+    | null | boolean | number | string
+    | PluginJsonValue[]
+    | { [key: string]: PluginJsonValue };
+
+type PluginDeviceCacheValue =
+    | { kind: 'json'; value: PluginJsonValue }
+    | { kind: 'bytes'; data: Uint8Array; mediaType?: string };
+
+interface PluginDeviceCacheDescriptor {
+    key: string;
+    revision: Revision;
+    kind: PluginDeviceCacheValue['kind'];
+    byteLength: number;
+    mediaType?: string;
+    createdAt: number;
+    updatedAt: number;
+    lastAccessedAt: number;
+    expiresAt?: number;
+}
+
+type PluginDeviceCacheEntry = PluginDeviceCacheDescriptor & PluginDeviceCacheValue;
+
 interface RisuaiPluginAPI {
     // ========== Version Information ==========
 
@@ -2115,6 +2138,32 @@ interface RisuaiPluginAPI {
 
     /** Pure feature discovery. This method never opens a permission prompt. */
     getCapabilities(ids?: string[]): Promise<Record<string, PluginCapability>>;
+
+    /** Stores an evictable value in this plugin principal's device-local cache. */
+    putDeviceCacheEntry(input: {
+        key: string;
+        value: PluginDeviceCacheValue;
+        /** `null` creates only; a revision performs compare-and-swap; omission upserts. */
+        expectedRevision?: Revision | null;
+        /** Positive device-local lifetime, at most 30 days. Omission does not expire by time. */
+        ttlMs?: number;
+    }): Promise<{ entry: PluginDeviceCacheDescriptor; evictedKeys: string[] }>;
+
+    /** Reads and touches one device-local cache entry owned by this plugin principal. */
+    getDeviceCacheEntry(key: string): Promise<PluginDeviceCacheEntry | null>;
+
+    /** Lists deterministic descriptors without exposing any other plugin principal. */
+    listDeviceCacheEntries(options?: {
+        prefix?: string;
+        cursor?: string;
+        limit?: number;
+    }): Promise<CursorPage<PluginDeviceCacheDescriptor>>;
+
+    /** Deletes one owned cache entry, optionally by compare-and-swap revision. */
+    deleteDeviceCacheEntry(key: string, options?: { expectedRevision?: Revision }): Promise<boolean>;
+
+    /** Clears this plugin principal's cache, optionally restricted to a key prefix. */
+    clearDeviceCache(options?: { prefix?: string }): Promise<number>;
 
     /** Returns stable references for the current card and conversation. */
     getCurrentContext(): Promise<CurrentContextRef>;
