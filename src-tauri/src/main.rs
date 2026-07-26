@@ -2,6 +2,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod plugin_fetch_policy;
+mod model_artifact_fetch;
 
 #[tauri::command]
 fn greet(name: &str) -> String {
@@ -581,6 +582,7 @@ fn main() {
 
     builder
         .manage(plugin_fetch_policy::PluginFetchState::default())
+        .manage(model_artifact_fetch::ModelArtifactFetchState::default())
         .plugin(tauri_plugin_http::init())
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_shell::init())
@@ -602,6 +604,10 @@ fn main() {
             streamed_fetch,
             plugin_fetch_policy::plugin_policy_fetch,
             plugin_fetch_policy::cancel_plugin_policy_fetch,
+            model_artifact_fetch::open_model_artifact_fetch,
+            model_artifact_fetch::read_model_artifact_fetch,
+            model_artifact_fetch::close_model_artifact_fetch,
+            model_artifact_fetch::cancel_model_artifact_fetch,
             oauth_login
         ])
         .run(tauri::generate_context!())
