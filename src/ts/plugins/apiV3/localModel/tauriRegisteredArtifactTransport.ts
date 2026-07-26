@@ -463,10 +463,12 @@ export function createTauriRegisteredArtifactTransport(
                     }),
                 }
             } catch (error) {
+                const failure = snapshot.signal.aborted
+                    ? abortReason(snapshot.signal)
+                    : error
                 snapshot.signal.removeEventListener("abort", onAbort)
                 await cancel(currentHandle)
-                if (snapshot.signal.aborted) throw abortReason(snapshot.signal)
-                throw error
+                throw failure
             }
         },
     }

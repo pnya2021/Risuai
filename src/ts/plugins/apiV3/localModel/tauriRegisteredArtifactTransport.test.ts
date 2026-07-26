@@ -201,14 +201,15 @@ describe("tauri registered artifact transport", () => {
             createRequestId: () => "request-race",
         })
         const pending = transport.request(request({ signal: controller.signal }))
+        const abortFailure = new Error("open aborted")
 
-        controller.abort()
+        controller.abort(abortFailure)
         gate.resolve({
             handle: "<opening>",
             status: 200,
             headers: [],
         })
-        await expect(pending).rejects.toThrow()
+        await expect(pending).rejects.toBe(abortFailure)
         expect(calls).toEqual([
             {
                 command: "open_model_artifact_fetch",
@@ -401,6 +402,47 @@ describe("tauri registered artifact transport", () => {
                 args: { requestId: "request-open-failure", handle: null },
             },
         ])
+
+        const latePrimary = new Error("late primary open failure")
+        const lateAbort = new Error("late abort")
+        const lateController = new AbortController()
+        const removeListener = vi.spyOn(
+            lateController.signal,
+            "removeEventListener",
+        )
+        const cleanupStarted = deferred<void>()
+        const cleanupGate = deferred<void>()
+        let lateCancelCalls = 0
+        const lateInvoke: TauriArtifactInvoke = async (command) => {
+            if (command === "open_model_artifact_fetch") throw latePrimary
+            if (command === "cancel_model_artifact_fetch") {
+                lateCancelCalls += 1
+                cleanupStarted.resolve()
+                return cleanupGate.promise
+            }
+            throw new Error(`unexpected command: ${command}`)
+        }
+        const lateTransport = createTauriRegisteredArtifactTransport({
+            invoke: lateInvoke,
+            createRequestId: () => "request-late-abort",
+        })
+        const latePending = lateTransport.request(
+            request({ signal: lateController.signal }),
+        )
+
+        await cleanupStarted.promise
+        lateController.abort(lateAbort)
+        cleanupGate.resolve()
+        let lateCaught: unknown
+        try {
+            await latePending
+        } catch (error) {
+            lateCaught = error
+        }
+        expect(lateCaught).toBe(latePrimary)
+        expect(lateCancelCalls).toBe(1)
+        expect(removeListener).toHaveBeenCalledTimes(1)
+        expect(removeListener).toHaveBeenCalledWith("abort", expect.any(Function))
     })
 
     it("cleans invalid handles and handle-inspection failures exactly once", async () => {
