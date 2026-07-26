@@ -232,6 +232,8 @@ class FailingBeginArtifactStore extends MemoryArtifactStore {
 }
 
 class FailingAbortArtifactStore extends MemoryArtifactStore {
+    abortCalls = 0
+
     override async beginWrite(
         digest: string,
         metadata: Parameters<ModelArtifactStore["beginWrite"]>[1],
@@ -242,6 +244,7 @@ class FailingAbortArtifactStore extends MemoryArtifactStore {
             write: (chunk) => handle.write(chunk),
             commit: (verifiedSha256) => handle.commit(verifiedSha256),
             abort: async (abortOptions) => {
+                this.abortCalls += 1
                 await handle.abort(abortOptions)
                 throw new Error("writer cleanup failed")
             },
@@ -610,6 +613,23 @@ describe("registered artifact download", () => {
         ).rejects.toThrow(/partial changed before streaming/i)
         expect(store.activeWriters).toBe(0)
         expect(tracked.cancellations()).toBe(1)
+    })
+
+    it("keeps complete-partial promotion mismatch primary when writer cleanup fails", async () => {
+        const store = new MismatchedOffsetArtifactStore()
+        store.setPartial(TINY_ARTIFACT, tinyArtifactBytes(), '"tiny"')
+
+        await expect(
+            downloadRegisteredArtifact(
+                options(store, {
+                    request: async () => {
+                        throw new Error("transport must not run")
+                    },
+                }),
+            ),
+        ).rejects.toThrow(/partial changed before promotion/i)
+        expect(store.abortCalls).toBe(1)
+        expect(store.activeWriters).toBe(0)
     })
 
     it("checks every redirect against the reviewed one-hop policy", async () => {

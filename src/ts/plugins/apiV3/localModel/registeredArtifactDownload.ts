@@ -329,8 +329,11 @@ async function executeDownload(
                     ...(etag ? { etag } : {}),
                 })
                 if (writer.offset !== artifact.bytes) {
-                    await writer.abort({ keepPartial: true })
-                    throw new Error("Artifact partial changed before promotion")
+                    const mismatch = new Error(
+                        "Artifact partial changed before promotion",
+                    )
+                    await writer.abort({ keepPartial: true }).catch(() => undefined)
+                    throw mismatch
                 }
                 try {
                     await commitVerified({ writer, store, digest, signal })
