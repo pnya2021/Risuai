@@ -55,6 +55,7 @@ import { PluginApiError } from './illustration/errors';
 import { INLAY_LIFECYCLE_CAPABILITY_IDS, InlayLifecycleService } from './illustration/inlayLifecycle';
 import { createRisuInlayLifecycleAdapter } from './illustration/inlayLifecycle.risu';
 import { DEVICE_CACHE_CAPABILITY_IDS, DeviceCacheService } from './illustration/deviceCache';
+import { getPixaiInstallLifecycle } from './localModel/pixaiInstallLifecycle';
 
 /*
     V3 API for RisuAI Plugins
@@ -1259,6 +1260,16 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
                 },
             })
         },
+        getLocalModelStatus: (profile: unknown) =>
+            getPixaiInstallLifecycle().getLocalModelStatus(context, profile),
+        installLocalModel: (profile: unknown, onProgress?: unknown) =>
+            getPixaiInstallLifecycle().installLocalModel(context, profile, onProgress),
+        getLocalModelOperation: (operationId: unknown) =>
+            getPixaiInstallLifecycle().getLocalModelOperation(context, operationId),
+        cancelLocalModelOperation: (operationId: unknown) =>
+            getPixaiInstallLifecycle().cancelLocalModelOperation(context, operationId),
+        removeLocalModel: (profile: unknown, options?: unknown) =>
+            getPixaiInstallLifecycle().removeLocalModel(context, profile, options),
         getCurrentContext: () => contextResources.getCurrentContext(),
         getCharacterCardSnapshot: (characterId?: string) => contextResources.getCharacterCardSnapshot(characterId),
         getConversationContextSnapshot: (conversationId?: string) => contextResources.getConversationContextSnapshot(conversationId),

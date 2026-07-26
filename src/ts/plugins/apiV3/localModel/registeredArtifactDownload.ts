@@ -42,10 +42,17 @@ export interface RegisteredArtifactDownloadOptions {
     store: ModelArtifactStore
     transport: RegisteredArtifactTransport
     signal?: AbortSignal
+    onProgress?: (progress: RegisteredArtifactDownloadProgress) => unknown
     currentHostOrigin?: string
     assertRegisteredArtifact?: (
         artifact: Readonly<RegisteredModelArtifact>,
     ) => void
+}
+
+export interface RegisteredArtifactDownloadProgress {
+    phase: "downloading" | "verifying" | "committing"
+    loadedBytes: number
+    totalBytes: number
 }
 
 export interface RegisteredArtifactDownloadResult {
@@ -56,9 +63,11 @@ export interface RegisteredArtifactDownloadResult {
 
 interface SharedDownload {
     readonly controller: AbortController
+    readonly observers: Map<symbol, NonNullable<RegisteredArtifactDownloadOptions["onProgress"]>>
     promise: Promise<RegisteredArtifactDownloadResult>
     waiters: number
     settled: boolean
+    progress?: RegisteredArtifactDownloadProgress
 }
 
 class DownloadFailure extends Error {
@@ -83,6 +92,28 @@ function abortReason(signal?: AbortSignal): unknown {
 
 function throwIfAborted(signal: AbortSignal): void {
     if (signal.aborted) throw abortReason(signal)
+}
+
+function notifyProgress(
+    observer: RegisteredArtifactDownloadOptions["onProgress"],
+    progress: RegisteredArtifactDownloadProgress,
+): void {
+    if (!observer) return
+    try {
+        void Promise.resolve(observer({ ...progress })).catch(() => undefined)
+    } catch {
+        // Progress is advisory and must not affect artifact state.
+    }
+}
+
+function publishSharedProgress(
+    operation: SharedDownload,
+    progress: RegisteredArtifactDownloadProgress,
+): void {
+    operation.progress = { ...progress }
+    for (const observer of operation.observers.values()) {
+        notifyProgress(observer, progress)
+    }
 }
 
 function header(
@@ -175,6 +206,7 @@ async function streamIntoStore(input: {
     offset: number
     artifact: Readonly<RegisteredModelArtifact>
     signal: AbortSignal
+    onProgress?: RegisteredArtifactDownloadOptions["onProgress"]
 }): Promise<void> {
     if (!input.response.body) throw new Error("Artifact response body is absent")
     let reader: ReadableStreamDefaultReader<Uint8Array> | undefined
@@ -204,14 +236,29 @@ async function streamIntoStore(input: {
             }
             input.hasher.update(chunk)
             await input.writer.write(chunk)
+            notifyProgress(input.onProgress, {
+                phase: "downloading",
+                loadedBytes: total,
+                totalBytes: input.artifact.bytes,
+            })
         }
         if (total !== input.artifact.bytes) {
             throw new DownloadFailure("Artifact stream ended before registered size", true)
         }
+        notifyProgress(input.onProgress, {
+            phase: "verifying",
+            loadedBytes: total,
+            totalBytes: input.artifact.bytes,
+        })
         const digest = toHex(await input.hasher.digest())
         if (digest !== input.artifact.sha256) {
             throw new DownloadFailure("Artifact SHA-256 verification failed", false)
         }
+        notifyProgress(input.onProgress, {
+            phase: "committing",
+            loadedBytes: total,
+            totalBytes: input.artifact.bytes,
+        })
         await commitVerified({
             writer: input.writer,
             store: input.store,
@@ -279,6 +326,12 @@ async function executeDownload(
     let redirectsFollowed = 0
     let restarted = false
 
+    notifyProgress(options.onProgress, {
+        phase: "downloading",
+        loadedBytes: offset,
+        totalBytes: artifact.bytes,
+    })
+
     if (offset > 0 && offset < artifact.bytes && etag === undefined) {
         await store.remove(artifact.sha256, {
             partial: true,
@@ -313,6 +366,11 @@ async function executeDownload(
             }
             hasher = partial.hasher
             if (offset === artifact.bytes) {
+                notifyProgress(options.onProgress, {
+                    phase: "verifying",
+                    loadedBytes: offset,
+                    totalBytes: artifact.bytes,
+                })
                 const digest = toHex(await hasher.digest())
                 if (digest !== artifact.sha256) {
                     await store.remove(artifact.sha256, {
@@ -336,6 +394,11 @@ async function executeDownload(
                     throw mismatch
                 }
                 try {
+                    notifyProgress(options.onProgress, {
+                        phase: "committing",
+                        loadedBytes: offset,
+                        totalBytes: artifact.bytes,
+                    })
                     await commitVerified({ writer, store, digest, signal })
                 } catch (error) {
                     await writer.abort({ keepPartial: true }).catch(() => undefined)
@@ -446,6 +509,7 @@ async function executeDownload(
                 offset,
                 artifact,
                 signal,
+                onProgress: options.onProgress,
             })
             return {
                 state: "verified",
@@ -462,8 +526,14 @@ async function executeDownload(
 function joinShared(
     operation: SharedDownload,
     signal?: AbortSignal,
+    observer?: RegisteredArtifactDownloadOptions["onProgress"],
 ): Promise<RegisteredArtifactDownloadResult> {
     if (signal?.aborted) return Promise.reject(abortReason(signal))
+    const observerId = Symbol("registered-artifact-progress")
+    if (observer) {
+        operation.observers.set(observerId, observer)
+        if (operation.progress) notifyProgress(observer, operation.progress)
+    }
     operation.waiters += 1
     return new Promise((resolve, reject) => {
         let detached = false
@@ -471,6 +541,7 @@ function joinShared(
             if (detached) return
             detached = true
             signal?.removeEventListener("abort", onAbort)
+            operation.observers.delete(observerId)
             operation.waiters -= 1
             if (operation.waiters === 0 && !operation.settled) {
                 operation.controller.abort()
@@ -522,6 +593,7 @@ export function downloadRegisteredArtifact(
     if (!operation) {
         operation = {
             controller: new AbortController(),
+            observers: new Map(),
             promise: Promise.resolve({
                 state: "verified",
                 bytes: 0,
@@ -531,17 +603,21 @@ export function downloadRegisteredArtifact(
             settled: false,
         }
         const current = operation
-        current.promise = executeDownload(options, current.controller.signal).finally(
-            () => {
-                current.settled = true
-                if (byDigest?.get(options.artifact.sha256) === current) {
-                    byDigest.delete(options.artifact.sha256)
-                }
+        current.promise = executeDownload(
+            {
+                ...options,
+                onProgress: (progress) => publishSharedProgress(current, progress),
             },
-        )
+            current.controller.signal,
+        ).finally(() => {
+            current.settled = true
+            if (byDigest?.get(options.artifact.sha256) === current) {
+                byDigest.delete(options.artifact.sha256)
+            }
+        })
         current.promise.catch(() => undefined)
         byDigest.set(options.artifact.sha256, current)
         operation = current
     }
-    return joinShared(operation, options.signal)
+    return joinShared(operation, options.signal, options.onProgress)
 }

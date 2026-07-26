@@ -7,6 +7,7 @@ import type {
 import type { RegisteredModelArtifact } from "./pixaiRegistry"
 import {
     downloadRegisteredArtifact,
+    type RegisteredArtifactDownloadProgress,
     type RegisteredArtifactRequest,
     type RegisteredArtifactResponse,
     type RegisteredArtifactTransport,
@@ -305,6 +306,42 @@ describe("registered artifact download", () => {
         )
         expect(store.maxWrittenChunk).toBe(13)
         expect(store.activeWriters).toBe(0)
+    })
+
+    it("reports exact download bytes before verification", async () => {
+        const store = new MemoryArtifactStore()
+        const progress: Array<{
+            phase: "downloading" | "verifying" | "committing"
+            loadedBytes: number
+            totalBytes: number
+        }> = []
+
+        await downloadRegisteredArtifact(
+            options(
+                store,
+                {
+                    request: async () =>
+                        response(200, chunksOf(tinyArtifactBytes(), 50)),
+                },
+                {
+                    onProgress: (update: (typeof progress)[number]) => {
+                        progress.push(update)
+                        throw new Error("observer failed")
+                    },
+                },
+            ),
+        )
+
+        expect(progress).toContainEqual({
+            phase: "downloading",
+            loadedBytes: 130,
+            totalBytes: 130,
+        })
+        expect(progress).toContainEqual({
+            phase: "verifying",
+            loadedBytes: 130,
+            totalBytes: 130,
+        })
     })
 
     it("accepts an exact 1 MiB incoming chunk", async () => {
@@ -708,6 +745,8 @@ describe("registered artifact download", () => {
         let streamController!: ReadableStreamDefaultController<Uint8Array>
         let underlyingSignal!: AbortSignal
         let calls = 0
+        const firstProgress: RegisteredArtifactDownloadProgress[] = []
+        const secondProgress: RegisteredArtifactDownloadProgress[] = []
         const started = deferred<void>()
         const transport: RegisteredArtifactTransport = {
             request: async (request) => {
@@ -726,18 +765,33 @@ describe("registered artifact download", () => {
         const firstAbort = new AbortController()
         const secondAbort = new AbortController()
         const first = downloadRegisteredArtifact(
-            options(store, transport, { signal: firstAbort.signal }),
+            options(store, transport, {
+                signal: firstAbort.signal,
+                onProgress: (progress: RegisteredArtifactDownloadProgress) =>
+                    firstProgress.push(progress),
+            }),
         )
         const second = downloadRegisteredArtifact(
-            options(store, transport, { signal: secondAbort.signal }),
+            options(store, transport, {
+                signal: secondAbort.signal,
+                onProgress: (progress: RegisteredArtifactDownloadProgress) =>
+                    secondProgress.push(progress),
+            }),
         )
         await started.promise
+        const firstUpdatesBeforeAbort = firstProgress.length
         firstAbort.abort()
         await expect(first).rejects.toThrow()
         expect(underlyingSignal.aborted).toBe(false)
         streamController.enqueue(bytes.slice(20))
         streamController.close()
         await expect(second).resolves.toMatchObject({ state: "verified" })
+        expect(firstProgress).toHaveLength(firstUpdatesBeforeAbort)
+        expect(secondProgress).toContainEqual({
+            phase: "verifying",
+            loadedBytes: 130,
+            totalBytes: 130,
+        })
         expect(calls).toBe(1)
         expect(store.activeWriters).toBe(0)
     })

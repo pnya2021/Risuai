@@ -1234,6 +1234,50 @@ interface PluginCapability {
     limits?: Record<string, string | number | boolean>;
 }
 
+type LocalModelProfileId = 'pixai-tagger-v0.9-onnx';
+
+interface LocalModelStatus {
+    state: 'absent' | 'partial' | 'downloading' | 'verifying' | 'ready' | 'corrupt' | 'evicted';
+    revision?: string;
+    sha256?: string;
+    storedBytes?: number;
+    /** Present only for an active operation owned by this plugin principal. */
+    operationId?: string;
+}
+
+interface LocalModelProgress {
+    phase: 'checking-capabilities' | 'awaiting-consent' | 'checking-quota'
+        | 'downloading' | 'verifying' | 'committing' | 'ready';
+    loadedBytes?: number;
+    totalBytes?: number;
+    bytesPerSecond?: number;
+    etaMs?: number;
+}
+
+interface PluginApiErrorShape {
+    name: 'PluginApiError';
+    code: 'INVALID_ARGUMENT' | 'UNSUPPORTED' | 'PERMISSION_DENIED' | 'NOT_FOUND'
+        | 'QUOTA_EXCEEDED' | 'NETWORK' | 'INTEGRITY_MISMATCH' | 'ABORTED'
+        | 'CONFLICT' | 'INTERNAL';
+    message: string;
+    retryable: boolean;
+    retryAfterMs?: number;
+    details?: Record<string, string | number | boolean>;
+}
+
+interface LocalModelOperationSnapshot {
+    state: 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled';
+    progress?: LocalModelProgress;
+    error?: PluginApiErrorShape;
+}
+
+interface LocalModelRemoveResult {
+    releasedPluginReference: boolean;
+    purgedBytes: number;
+    retainedForOtherOwners: boolean;
+    pending: boolean;
+}
+
 type PluginSecretUsePolicy =
     | { kind: 'header'; name: string; prefix?: string }
     | { kind: 'json-body'; pointer: string; prefix?: string };
@@ -2138,6 +2182,27 @@ interface RisuaiPluginAPI {
 
     /** Pure feature discovery. This method never opens a permission prompt. */
     getCapabilities(ids?: string[]): Promise<Record<string, PluginCapability>>;
+
+    /** Reports device-local state for the fixed PixAI tagger profile without prompting. */
+    getLocalModelStatus(profile: LocalModelProfileId): Promise<LocalModelStatus>;
+
+    /** Confirms and starts a Host-owned installation operation. */
+    installLocalModel(
+        profile: LocalModelProfileId,
+        onProgress?: (progress: LocalModelProgress) => void,
+    ): Promise<{ operationId: string }>;
+
+    /** Reads one operation owned by this plugin principal without prompting. */
+    getLocalModelOperation(operationId: string): Promise<LocalModelOperationSnapshot>;
+
+    /** Cancels one nonterminal operation owned by this plugin principal. */
+    cancelLocalModelOperation(operationId: string): Promise<void>;
+
+    /** Releases plugin ownership or, after confirmation, purges device bytes. */
+    removeLocalModel(
+        profile: LocalModelProfileId,
+        options?: { scope?: 'plugin' | 'device'; includePartial?: boolean },
+    ): Promise<LocalModelRemoveResult>;
 
     /** Stores an evictable value in this plugin principal's device-local cache. */
     putDeviceCacheEntry(input: {
