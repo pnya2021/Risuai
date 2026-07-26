@@ -318,6 +318,7 @@ export class PixaiInstallLifecycle {
     private readonly active = new Map<string, LocalModelOperation>()
     private readonly owners = new Set<string>()
     private nextSequence = 0
+    private lifecycleMutationTail: Promise<void> = Promise.resolve()
 
     constructor(options: PixaiInstallLifecycleOptions) {
         this.store = options.store
@@ -453,30 +454,44 @@ export class PixaiInstallLifecycle {
             throw new PluginApiError("ABORTED", "Plugin instance unloaded")
         }
 
-        const id = assertOperationId(this.createOperationId())
-        if (this.operations.has(id)) {
-            throw new PluginApiError("INTERNAL", "Local model operation ID collision")
-        }
-        const operation: LocalModelOperation = {
-            id,
-            principalId: context.principalId,
-            profile: profileId,
-            sequence: ++this.nextSequence,
-            controller: new AbortController(),
-            callbacks: new Map(),
-            state: "queued",
-            progress: {
-                phase: "checking-quota",
-                totalBytes: getPixaiProfile(profileId).totalBytes,
-            },
-        }
-        this.operations.set(id, operation)
-        this.active.set(key, operation)
-        this.attachCallback(operation, context, callback)
-        queueMicrotask(() => {
-            operation.task = this.runOperation(operation)
+        return this.withLifecycleMutation(() => {
+            if (context.signal.aborted) {
+                throw new PluginApiError("ABORTED", "Plugin instance unloaded")
+            }
+            const coalesced = this.active.get(key)
+            if (coalesced) {
+                this.attachCallback(coalesced, context, callback)
+                return { operationId: coalesced.id }
+            }
+
+            const id = assertOperationId(this.createOperationId())
+            if (this.operations.has(id)) {
+                throw new PluginApiError(
+                    "INTERNAL",
+                    "Local model operation ID collision",
+                )
+            }
+            const operation: LocalModelOperation = {
+                id,
+                principalId: context.principalId,
+                profile: profileId,
+                sequence: ++this.nextSequence,
+                controller: new AbortController(),
+                callbacks: new Map(),
+                state: "queued",
+                progress: {
+                    phase: "checking-quota",
+                    totalBytes: getPixaiProfile(profileId).totalBytes,
+                },
+            }
+            this.operations.set(id, operation)
+            this.active.set(key, operation)
+            this.attachCallback(operation, context, callback)
+            queueMicrotask(() => {
+                operation.task = this.runOperation(operation)
+            })
+            return { operationId: id }
         })
-        return { operationId: id }
     }
 
     async getLocalModelOperation(
@@ -559,42 +574,73 @@ export class PixaiInstallLifecycle {
             }
         }
 
-        const profile = getPixaiProfile(profileId)
-        const releasedPluginReference = this.owners.delete(context.principalId)
-        if (options.scope === "plugin" && this.owners.size > 0) {
+        return this.withLifecycleMutation(async () => {
+            if (context.signal.aborted) {
+                throw new PluginApiError("ABORTED", "Plugin instance unloaded")
+            }
+            if (this.active.size > 0) {
+                throw new PluginApiError(
+                    "CONFLICT",
+                    "A local model installation is active",
+                )
+            }
+
+            const profile = getPixaiProfile(profileId)
+            const releasedPluginReference = this.owners.delete(
+                context.principalId,
+            )
+            if (options.scope === "plugin" && this.owners.size > 0) {
+                return {
+                    releasedPluginReference,
+                    purgedBytes: 0,
+                    retainedForOtherOwners: true,
+                    pending: false,
+                }
+            }
+            if (options.scope === "device") this.owners.clear()
+
+            const states = await this.readStates(profile.artifacts)
+            let purgedBytes = 0
+            for (let index = 0; index < profile.artifacts.length; index += 1) {
+                const artifact = profile.artifacts[index]
+                const state = states[index]
+                const removePartial =
+                    options.includePartial && state.state === "partial"
+                const removeVerified = state.state === "verified"
+                if (!removePartial && !removeVerified) continue
+                await this.store.remove(artifact.sha256, {
+                    partial: removePartial,
+                    verified: removeVerified,
+                })
+                purgedBytes += state.bytes
+            }
             return {
                 releasedPluginReference,
-                purgedBytes: 0,
-                retainedForOtherOwners: true,
+                purgedBytes,
+                retainedForOtherOwners: false,
                 pending: false,
             }
-        }
-        if (options.scope === "device") this.owners.clear()
-
-        const states = await this.readStates(profile.artifacts)
-        let purgedBytes = 0
-        for (let index = 0; index < profile.artifacts.length; index += 1) {
-            const artifact = profile.artifacts[index]
-            const state = states[index]
-            const removePartial = options.includePartial && state.state === "partial"
-            const removeVerified = state.state === "verified"
-            if (!removePartial && !removeVerified) continue
-            await this.store.remove(artifact.sha256, {
-                partial: removePartial,
-                verified: removeVerified,
-            })
-            purgedBytes += state.bytes
-        }
-        return {
-            releasedPluginReference,
-            purgedBytes,
-            retainedForOtherOwners: false,
-            pending: false,
-        }
+        })
     }
 
     private activeKey(principalId: string): string {
         return `${principalId}\u0000${PIXAI_PROFILE_ID}`
+    }
+
+    private async withLifecycleMutation<T>(
+        mutation: () => T | Promise<T>,
+    ): Promise<T> {
+        let release!: () => void
+        const previous = this.lifecycleMutationTail
+        this.lifecycleMutationTail = new Promise<void>((resolve) => {
+            release = resolve
+        })
+        await previous
+        try {
+            return await mutation()
+        } finally {
+            release()
+        }
     }
 
     private async readStates(

@@ -29,6 +29,7 @@ class MemoryArtifactStore implements ModelArtifactStore {
     readonly kind = "opfs" as const
     readonly supportsResume = true
     readonly states = new Map<string, ArtifactStat>()
+    removeCalls = 0
 
     estimate() {
         return Promise.resolve({
@@ -61,6 +62,7 @@ class MemoryArtifactStore implements ModelArtifactStore {
         digest: string,
         options: { partial: boolean; verified: boolean },
     ): Promise<void> {
+        this.removeCalls += 1
         const state = await this.stat(digest)
         if (
             (state.state === "partial" && options.partial) ||
@@ -419,6 +421,47 @@ describe("PixAI install lifecycle", () => {
         ])
     })
 
+    it("coalesces concurrent confirmed installs for one principal", async () => {
+        let release!: () => void
+        const gate = new Promise<void>((resolve) => {
+            release = resolve
+        })
+        let modelDownloads = 0
+        const { lifecycle, queue, store } = setup({
+            download: async (options) => {
+                if (options.artifact.name === "model.onnx") {
+                    modelDownloads += 1
+                    await gate
+                }
+                store.set(options.artifact, "verified")
+                return {
+                    state: "verified",
+                    bytes: options.artifact.bytes,
+                    resumed: false,
+                }
+            },
+        })
+        const first = execution("owner", "owner-first").context
+        const second = execution("owner", "owner-second").context
+
+        const firstInstall = lifecycle.installLocalModel(first, PIXAI_PROFILE_ID)
+        const secondInstall = lifecycle.installLocalModel(second, PIXAI_PROFILE_ID)
+        await queue.whenPresented()
+        decide(queue, true)
+        await queue.whenPresented()
+        decide(queue, true)
+        const [one, two] = await Promise.all([firstInstall, secondInstall])
+        await vi.waitFor(() => expect(modelDownloads).toBeGreaterThan(0))
+        release()
+        await Promise.all([
+            operation(lifecycle, first, one.operationId),
+            operation(lifecycle, second, two.operationId),
+        ])
+
+        expect(two.operationId).toBe(one.operationId)
+        expect(modelDownloads).toBe(1)
+    })
+
     it.each([
         ["quota", "Insufficient model artifact storage quota", "QUOTA_EXCEEDED", false],
         ["network", "Artifact transport returned status 503", "NETWORK", true],
@@ -486,6 +529,49 @@ describe("PixAI install lifecycle", () => {
             operation(lifecycle, owner.context, installed.operationId),
         ).resolves.toMatchObject({ state: "succeeded" })
         expect(progress).toHaveLength(callbacksBeforeRelease)
+    })
+
+    it("rejects queued device removal when an approved install becomes active", async () => {
+        let release!: () => void
+        const gate = new Promise<void>((resolve) => {
+            release = resolve
+        })
+        const { lifecycle, queue, store } = setup({
+            download: async (options) => {
+                if (options.artifact.name === "model.onnx") await gate
+                store.set(options.artifact, "verified")
+                return {
+                    state: "verified",
+                    bytes: options.artifact.bytes,
+                    resumed: false,
+                }
+            },
+        })
+        store.set(profile.artifacts[0], "partial", 91)
+        const owner = execution("owner").context
+
+        const installation = lifecycle.installLocalModel(owner, PIXAI_PROFILE_ID)
+        const removal = lifecycle.removeLocalModel(owner, PIXAI_PROFILE_ID, {
+            scope: "device",
+        })
+        await queue.whenPresented()
+        expect(queue.current()?.request.kind).toBe("model-install")
+        decide(queue, true)
+        const installed = await installation
+        await queue.whenPresented()
+        expect(queue.current()?.request.kind).toBe("model-remove")
+        decide(queue, true)
+        const [removalResult] = await Promise.allSettled([removal])
+        release()
+        await operation(lifecycle, owner, installed.operationId)
+
+        expect(removalResult).toEqual(
+            expect.objectContaining({
+                status: "rejected",
+                reason: expect.objectContaining({ code: "CONFLICT" }),
+            }),
+        )
+        expect(store.removeCalls).toBe(0)
     })
 
     it("confirms device removal, preserves bytes on denial, and purges on approval", async () => {
