@@ -31,16 +31,19 @@ interface OpenResult {
     headers: Array<readonly [string, string]>
 }
 
+interface RequestSnapshot {
+    url: string
+    headers: Array<readonly [string, string]>
+    signal: AbortSignal
+    maxBytes: number
+}
+
 function abortReason(signal: AbortSignal): unknown {
     return signal.reason ?? new DOMException("Artifact fetch aborted", "AbortError")
 }
 
 function throwIfAborted(signal: AbortSignal): void {
     if (signal.aborted) throw abortReason(signal)
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-    return value !== null && typeof value === "object" && !Array.isArray(value)
 }
 
 function assertRegisteredUrl(url: string, maxBytes: number): void {
@@ -68,31 +71,117 @@ function assertRegisteredUrl(url: string, maxBytes: number): void {
     if (!approved) throw new Error("Artifact URL is not registered")
 }
 
-function validateRequest(
-    request: RegisteredArtifactRequest,
-): Array<readonly [string, string]> {
-    if (!request || typeof request !== "object") {
-        throw new Error("Invalid artifact request")
+function snapshotPlainRecord(
+    value: unknown,
+    expectedKeys: readonly string[],
+    message: string,
+    onValue?: (key: string, value: unknown) => void,
+): Record<string, unknown> {
+    if (
+        value === null ||
+        typeof value !== "object" ||
+        Array.isArray(value) ||
+        Object.getPrototypeOf(value) !== Object.prototype
+    ) {
+        throw new Error(message)
     }
-    const method = (request as RegisteredArtifactRequest & { method?: unknown })
-        .method
-    if (method !== undefined && method !== "GET") {
-        throw new Error("Artifact transport only permits GET")
+    const keys = Reflect.ownKeys(value)
+    const expected = new Set(expectedKeys)
+    if (
+        keys.length !== expectedKeys.length ||
+        keys.some((key) => typeof key !== "string" || !expected.has(key))
+    ) {
+        throw new Error(message)
     }
-    if (!Number.isSafeInteger(request.maxBytes) || request.maxBytes <= 0) {
+    const snapshot: Record<string, unknown> = {}
+    for (const key of expectedKeys) {
+        const descriptor = Object.getOwnPropertyDescriptor(value, key)
+        if (!descriptor || !descriptor.enumerable || !("value" in descriptor)) {
+            throw new Error(message)
+        }
+        const propertyValue = descriptor.value
+        snapshot[key] = propertyValue
+        onValue?.(key, propertyValue)
+    }
+    return snapshot
+}
+
+function snapshotDenseArray(
+    value: unknown,
+    maxLength: number,
+    message: string,
+): unknown[] {
+    if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype) {
+        throw new Error(message)
+    }
+    const lengthDescriptor = Object.getOwnPropertyDescriptor(value, "length")
+    if (
+        !lengthDescriptor ||
+        !("value" in lengthDescriptor) ||
+        lengthDescriptor.enumerable ||
+        !Number.isSafeInteger(lengthDescriptor.value) ||
+        lengthDescriptor.value < 0 ||
+        lengthDescriptor.value > maxLength
+    ) {
+        throw new Error(message)
+    }
+    const length = lengthDescriptor.value as number
+    const keys = Reflect.ownKeys(value)
+    if (keys.length !== length + 1 || keys[length] !== "length") {
+        throw new Error(message)
+    }
+    const snapshot = new Array<unknown>(length)
+    for (let index = 0; index < length; index += 1) {
+        const key = String(index)
+        if (keys[index] !== key) throw new Error(message)
+        const descriptor = Object.getOwnPropertyDescriptor(value, key)
+        if (!descriptor || !descriptor.enumerable || !("value" in descriptor)) {
+            throw new Error(message)
+        }
+        snapshot[index] = descriptor.value
+    }
+    return snapshot
+}
+
+function validateRequest(request: RegisteredArtifactRequest): RequestSnapshot {
+    const fields = snapshotPlainRecord(
+        request,
+        ["url", "headers", "signal", "maxBytes"],
+        "Invalid artifact request data properties",
+    )
+    const url = fields.url
+    const maxBytes = fields.maxBytes
+    const signal = fields.signal
+    if (typeof url !== "string") throw new Error("Invalid artifact request URL")
+    if (
+        typeof maxBytes !== "number" ||
+        !Number.isSafeInteger(maxBytes) ||
+        maxBytes <= 0
+    ) {
         throw new Error("Invalid artifact response limit")
     }
-    assertRegisteredUrl(request.url, request.maxBytes)
-    if (!Array.isArray(request.headers) || request.headers.length > 2) {
-        throw new Error("Artifact request headers rejected")
+    if (!(signal instanceof AbortSignal)) {
+        throw new Error("Invalid artifact request signal")
     }
+    assertRegisteredUrl(url, maxBytes)
+    const sourceHeaders = snapshotDenseArray(
+        fields.headers,
+        2,
+        "Artifact request headers rejected",
+    )
     const seen = new Set<string>()
     const result: Array<readonly [string, string]> = []
-    for (const entry of request.headers) {
-        if (!Array.isArray(entry) || entry.length !== 2) {
+    for (let index = 0; index < sourceHeaders.length; index += 1) {
+        const entry = snapshotDenseArray(
+            sourceHeaders[index],
+            2,
+            "Artifact request headers rejected",
+        )
+        if (entry.length !== 2) {
             throw new Error("Artifact request headers rejected")
         }
-        const [rawName, value] = entry
+        const rawName = entry[0]
+        const value = entry[1]
         if (typeof rawName !== "string" || typeof value !== "string") {
             throw new Error("Artifact request headers rejected")
         }
@@ -109,27 +198,35 @@ function validateRequest(
         if (name === "range") {
             const match = /^bytes=(0|[1-9]\d*)-$/.exec(value)
             const offset = match ? Number(match[1]) : Number.NaN
-            if (!Number.isSafeInteger(offset) || offset >= request.maxBytes) {
+            if (!Number.isSafeInteger(offset) || offset >= maxBytes) {
                 throw new Error("Artifact Range header rejected")
             }
         }
         seen.add(name)
         result.push([name === "range" ? "Range" : "If-Range", value])
     }
-    return result
+    return { url, headers: result, signal, maxBytes }
 }
 
 function parseHeaders(value: unknown): Array<readonly [string, string]> {
-    if (!Array.isArray(value) || value.length > RESPONSE_HEADER_NAMES.size) {
-        throw new Error("Artifact bridge headers rejected")
-    }
+    const source = snapshotDenseArray(
+        value,
+        RESPONSE_HEADER_NAMES.size,
+        "Artifact bridge headers rejected",
+    )
     const seen = new Set<string>()
     const result: Array<readonly [string, string]> = []
-    for (const entry of value) {
-        if (!Array.isArray(entry) || entry.length !== 2) {
+    for (let index = 0; index < source.length; index += 1) {
+        const entry = snapshotDenseArray(
+            source[index],
+            2,
+            "Artifact bridge headers rejected",
+        )
+        if (entry.length !== 2) {
             throw new Error("Artifact bridge headers rejected")
         }
-        const [rawName, rawValue] = entry
+        const rawName = entry[0]
+        const rawValue = entry[1]
         if (typeof rawName !== "string" || typeof rawValue !== "string") {
             throw new Error("Artifact bridge headers rejected")
         }
@@ -150,25 +247,36 @@ function parseHeaders(value: unknown): Array<readonly [string, string]> {
     return result
 }
 
-function possibleHandle(value: unknown): string | null {
-    if (!isRecord(value)) return null
-    const handle = value.handle
-    return typeof handle === "string" && handle.length <= 128 && !/[\r\n]/.test(handle)
-        ? handle
+function cleanupHandle(value: unknown): string | null {
+    return typeof value === "string" &&
+        value.length > 0 &&
+        value.length <= 128 &&
+        !/[\r\n]/.test(value)
+        ? value
         : null
 }
 
-function parseOpen(value: unknown): OpenResult {
-    if (!isRecord(value)) throw new Error("Artifact bridge open result rejected")
-    const status = value.status
+function parseOpen(
+    value: unknown,
+    onHandle: (handle: string | null) => void,
+): OpenResult {
+    const fields = snapshotPlainRecord(
+        value,
+        ["handle", "status", "headers"],
+        "Artifact bridge open result rejected",
+        (key, fieldValue) => {
+            if (key === "handle") onHandle(cleanupHandle(fieldValue))
+        },
+    )
+    const status = fields.status
     if (
         !Number.isInteger(status) ||
         (status !== 200 && status !== 206 && !REDIRECT_STATUSES.has(status as number))
     ) {
         throw new Error("Artifact bridge status rejected")
     }
-    const headers = parseHeaders(value.headers)
-    const handle = value.handle
+    const headers = parseHeaders(fields.headers)
+    const handle = fields.handle
     if (REDIRECT_STATUSES.has(status as number)) {
         if (handle !== null || !headers.some(([name]) => name === "Location")) {
             throw new Error("Artifact bridge redirect result rejected")
@@ -232,15 +340,21 @@ function createBody(input: {
                 })
                 if (terminal) return
                 throwIfAborted(input.signal)
-                if (!isRecord(value) || typeof value.done !== "boolean") {
+                const fields = snapshotPlainRecord(
+                    value,
+                    ["done", "chunk"],
+                    "Artifact bridge read result rejected",
+                )
+                if (typeof fields.done !== "boolean") {
                     throw new Error("Artifact bridge read result rejected")
                 }
-                const chunk = value.chunk
-                if (!Array.isArray(chunk)) {
-                    throw new Error("Artifact bridge chunk rejected")
-                }
-                if (value.done) {
-                    if (chunk.length !== 0) {
+                const chunkValues = snapshotDenseArray(
+                    fields.chunk,
+                    MODEL_ARTIFACT_MAX_CHUNK_BYTES,
+                    "Artifact bridge chunk rejected",
+                )
+                if (fields.done) {
+                    if (chunkValues.length !== 0) {
                         throw new Error("Artifact bridge EOF chunk rejected")
                     }
                     await finish("close")
@@ -248,20 +362,28 @@ function createBody(input: {
                     return
                 }
                 if (
-                    chunk.length === 0 ||
-                    chunk.length > MODEL_ARTIFACT_MAX_CHUNK_BYTES ||
-                    received + chunk.length > input.maxBytes
+                    chunkValues.length === 0 ||
+                    chunkValues.length > input.maxBytes - received
                 ) {
                     throw new Error("Artifact bridge chunk rejected")
                 }
-                for (let index = 0; index < chunk.length; index += 1) {
-                    const byte = chunk[index]
-                    if (!Number.isInteger(byte) || byte < 0 || byte > 255) {
+                for (let index = 0; index < chunkValues.length; index += 1) {
+                    const byte = chunkValues[index]
+                    if (
+                        typeof byte !== "number" ||
+                        !Number.isInteger(byte) ||
+                        byte < 0 ||
+                        byte > 255
+                    ) {
                         throw new Error("Artifact bridge chunk rejected")
                     }
                 }
-                received += chunk.length
-                nextController.enqueue(Uint8Array.from(chunk))
+                const chunk = new Uint8Array(chunkValues.length)
+                for (let index = 0; index < chunkValues.length; index += 1) {
+                    chunk[index] = chunkValues[index] as number
+                }
+                received += chunk.byteLength
+                nextController.enqueue(chunk)
             } catch (error) {
                 await fail(error)
             }
@@ -284,18 +406,23 @@ export function createTauriRegisteredArtifactTransport(
         options.createRequestId ?? (() => globalThis.crypto.randomUUID())
     return {
         async request(request): Promise<RegisteredArtifactResponse> {
-            const headers = validateRequest(request)
-            throwIfAborted(request.signal)
+            const snapshot = validateRequest(request)
+            throwIfAborted(snapshot.signal)
             const requestId = createRequestId()
             if (!/^[A-Za-z0-9._-]{1,128}$/.test(requestId)) {
                 throw new Error("Invalid artifact bridge request ID")
             }
             let currentHandle: string | null = null
-            const cancelled = new Set<string>()
+            let openingCancelled = false
+            const cancelledHandles = new Set<string>()
             const cancel = async (handle: string | null): Promise<void> => {
-                const key = handle ?? "<opening>"
-                if (cancelled.has(key)) return
-                cancelled.add(key)
+                if (handle === null) {
+                    if (openingCancelled) return
+                    openingCancelled = true
+                } else {
+                    if (cancelledHandles.has(handle)) return
+                    cancelledHandles.add(handle)
+                }
                 await invoke("cancel_model_artifact_fetch", {
                     requestId,
                     handle,
@@ -304,52 +431,42 @@ export function createTauriRegisteredArtifactTransport(
             const onAbort = () => {
                 void cancel(currentHandle)
             }
-            request.signal.addEventListener("abort", onAbort, { once: true })
-            let raw: unknown
+            snapshot.signal.addEventListener("abort", onAbort, { once: true })
             try {
-                raw = await invoke("open_model_artifact_fetch", {
+                const raw = await invoke("open_model_artifact_fetch", {
                     requestId,
-                    url: request.url,
-                    headers,
-                    maxBytes: request.maxBytes,
+                    url: snapshot.url,
+                    headers: snapshot.headers,
+                    maxBytes: snapshot.maxBytes,
                 })
-            } catch (error) {
-                request.signal.removeEventListener("abort", onAbort)
-                if (request.signal.aborted) {
-                    await cancel(null)
-                    throw abortReason(request.signal)
+                const opened = parseOpen(raw, (handle) => {
+                    currentHandle = handle
+                })
+                throwIfAborted(snapshot.signal)
+                snapshot.signal.removeEventListener("abort", onAbort)
+                if (opened.handle === null) {
+                    return {
+                        status: opened.status,
+                        headers: opened.headers,
+                        body: null,
+                    }
                 }
-                throw error
-            }
-            currentHandle = possibleHandle(raw)
-            if (request.signal.aborted) {
-                await cancel(currentHandle)
-                request.signal.removeEventListener("abort", onAbort)
-                throw abortReason(request.signal)
-            }
-            let opened: OpenResult
-            try {
-                opened = parseOpen(raw)
+                return {
+                    status: opened.status,
+                    headers: opened.headers,
+                    body: createBody({
+                        invoke,
+                        requestId,
+                        handle: opened.handle,
+                        signal: snapshot.signal,
+                        maxBytes: snapshot.maxBytes,
+                    }),
+                }
             } catch (error) {
-                request.signal.removeEventListener("abort", onAbort)
-                if (currentHandle) await cancel(currentHandle)
+                snapshot.signal.removeEventListener("abort", onAbort)
+                await cancel(currentHandle)
+                if (snapshot.signal.aborted) throw abortReason(snapshot.signal)
                 throw error
-            }
-            if (opened.handle === null) {
-                request.signal.removeEventListener("abort", onAbort)
-                return { status: opened.status, headers: opened.headers, body: null }
-            }
-            request.signal.removeEventListener("abort", onAbort)
-            return {
-                status: opened.status,
-                headers: opened.headers,
-                body: createBody({
-                    invoke,
-                    requestId,
-                    handle: opened.handle,
-                    signal: request.signal,
-                    maxBytes: request.maxBytes,
-                }),
             }
         },
     }

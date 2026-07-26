@@ -21,6 +21,13 @@ const RESPONSE_HEADERS = [
 ] as const
 const MAX_HEADER_VALUE_BYTES = 4_096
 
+interface RequestSnapshot {
+    url: string
+    headers: Array<readonly [string, string]>
+    signal: AbortSignal
+    maxBytes: number
+}
+
 function abortReason(signal: AbortSignal): unknown {
     return signal.reason ?? new DOMException("Artifact fetch aborted", "AbortError")
 }
@@ -54,31 +61,114 @@ function assertRegisteredUrl(url: string, maxBytes: number): void {
     if (!approved) throw new Error("Artifact URL is not registered")
 }
 
-function validateRequest(
-    request: RegisteredArtifactRequest,
-): Array<readonly [string, string]> {
-    if (!request || typeof request !== "object") {
-        throw new Error("Invalid artifact request")
+function snapshotPlainRecord(
+    value: unknown,
+    expectedKeys: readonly string[],
+    message: string,
+): Record<string, unknown> {
+    if (
+        value === null ||
+        typeof value !== "object" ||
+        Array.isArray(value) ||
+        Object.getPrototypeOf(value) !== Object.prototype
+    ) {
+        throw new Error(message)
     }
-    const method = (request as RegisteredArtifactRequest & { method?: unknown })
-        .method
-    if (method !== undefined && method !== "GET") {
-        throw new Error("Artifact transport only permits GET")
+    const keys = Reflect.ownKeys(value)
+    const expected = new Set(expectedKeys)
+    if (
+        keys.length !== expectedKeys.length ||
+        keys.some((key) => typeof key !== "string" || !expected.has(key))
+    ) {
+        throw new Error(message)
     }
-    if (!Number.isSafeInteger(request.maxBytes) || request.maxBytes <= 0) {
+    const snapshot: Record<string, unknown> = {}
+    for (const key of expectedKeys) {
+        const descriptor = Object.getOwnPropertyDescriptor(value, key)
+        if (!descriptor || !descriptor.enumerable || !("value" in descriptor)) {
+            throw new Error(message)
+        }
+        snapshot[key] = descriptor.value
+    }
+    return snapshot
+}
+
+function snapshotDenseArray(
+    value: unknown,
+    maxLength: number,
+    message: string,
+): unknown[] {
+    if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype) {
+        throw new Error(message)
+    }
+    const lengthDescriptor = Object.getOwnPropertyDescriptor(value, "length")
+    if (
+        !lengthDescriptor ||
+        !("value" in lengthDescriptor) ||
+        lengthDescriptor.enumerable ||
+        !Number.isSafeInteger(lengthDescriptor.value) ||
+        lengthDescriptor.value < 0 ||
+        lengthDescriptor.value > maxLength
+    ) {
+        throw new Error(message)
+    }
+    const length = lengthDescriptor.value as number
+    const keys = Reflect.ownKeys(value)
+    if (keys.length !== length + 1 || keys[length] !== "length") {
+        throw new Error(message)
+    }
+    const snapshot = new Array<unknown>(length)
+    for (let index = 0; index < length; index += 1) {
+        const key = String(index)
+        if (keys[index] !== key) throw new Error(message)
+        const descriptor = Object.getOwnPropertyDescriptor(value, key)
+        if (!descriptor || !descriptor.enumerable || !("value" in descriptor)) {
+            throw new Error(message)
+        }
+        snapshot[index] = descriptor.value
+    }
+    return snapshot
+}
+
+function validateRequest(request: RegisteredArtifactRequest): RequestSnapshot {
+    const fields = snapshotPlainRecord(
+        request,
+        ["url", "headers", "signal", "maxBytes"],
+        "Invalid artifact request data properties",
+    )
+    const url = fields.url
+    const maxBytes = fields.maxBytes
+    const signal = fields.signal
+    if (typeof url !== "string") throw new Error("Invalid artifact request URL")
+    if (
+        typeof maxBytes !== "number" ||
+        !Number.isSafeInteger(maxBytes) ||
+        maxBytes <= 0
+    ) {
         throw new Error("Invalid artifact response limit")
     }
-    assertRegisteredUrl(request.url, request.maxBytes)
-    if (!Array.isArray(request.headers) || request.headers.length > 2) {
-        throw new Error("Artifact request headers rejected")
+    if (!(signal instanceof AbortSignal)) {
+        throw new Error("Invalid artifact request signal")
     }
+    assertRegisteredUrl(url, maxBytes)
+    const sourceHeaders = snapshotDenseArray(
+        fields.headers,
+        2,
+        "Artifact request headers rejected",
+    )
     const seen = new Set<string>()
     const result: Array<readonly [string, string]> = []
-    for (const entry of request.headers) {
-        if (!Array.isArray(entry) || entry.length !== 2) {
+    for (let index = 0; index < sourceHeaders.length; index += 1) {
+        const entry = snapshotDenseArray(
+            sourceHeaders[index],
+            2,
+            "Artifact request headers rejected",
+        )
+        if (entry.length !== 2) {
             throw new Error("Artifact request headers rejected")
         }
-        const [rawName, value] = entry
+        const rawName = entry[0]
+        const value = entry[1]
         if (typeof rawName !== "string" || typeof value !== "string") {
             throw new Error("Artifact request headers rejected")
         }
@@ -95,14 +185,14 @@ function validateRequest(
         if (name === "range") {
             const match = /^bytes=(0|[1-9]\d*)-$/.exec(value)
             const offset = match ? Number(match[1]) : Number.NaN
-            if (!Number.isSafeInteger(offset) || offset >= request.maxBytes) {
+            if (!Number.isSafeInteger(offset) || offset >= maxBytes) {
                 throw new Error("Artifact Range header rejected")
             }
         }
         seen.add(name)
         result.push([name === "range" ? "Range" : "If-Range", value])
     }
-    return result
+    return { url, headers: result, signal, maxBytes }
 }
 
 function projectHeaders(response: Response): Array<readonly [string, string]> {
@@ -224,22 +314,24 @@ export function createWebRegisteredArtifactTransport(
     }
     return {
         async request(request): Promise<RegisteredArtifactResponse> {
-            const requestHeaders = validateRequest(request)
-            throwIfAborted(request.signal)
-            const response = await fetchImpl(request.url, {
+            const snapshot = validateRequest(request)
+            throwIfAborted(snapshot.signal)
+            const response = await fetchImpl(snapshot.url, {
                 method: "GET",
-                headers: new Headers(requestHeaders.map(([name, value]) => [name, value])),
-                signal: request.signal,
+                headers: new Headers(
+                    snapshot.headers.map(([name, value]) => [name, value]),
+                ),
+                signal: snapshot.signal,
                 redirect: "manual",
                 credentials: "omit",
                 referrerPolicy: "no-referrer",
             })
             try {
-                throwIfAborted(request.signal)
+                throwIfAborted(snapshot.signal)
                 if (
                     response.type === "opaqueredirect" ||
                     response.redirected ||
-                    (response.url !== "" && response.url !== request.url)
+                    (response.url !== "" && response.url !== snapshot.url)
                 ) {
                     throw new Error("Artifact redirect was not manually observable")
                 }
@@ -258,7 +350,7 @@ export function createWebRegisteredArtifactTransport(
                 return {
                     status: response.status,
                     headers,
-                    body: boundedBody(response, request.signal),
+                    body: boundedBody(response, snapshot.signal),
                 }
             } catch (error) {
                 await discardBody(response, error)

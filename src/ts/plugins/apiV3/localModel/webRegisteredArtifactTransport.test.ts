@@ -194,6 +194,28 @@ describe("web registered artifact transport", () => {
         expect(fetchImpl).not.toHaveBeenCalled()
     })
 
+    it("rejects request accessors without reading them or opening fetch", async () => {
+        let reads = 0
+        const candidate = {} as RegisteredArtifactRequest
+        for (const [key, value] of Object.entries(request())) {
+            Object.defineProperty(candidate, key, {
+                enumerable: true,
+                get: () => {
+                    reads += 1
+                    return value
+                },
+            })
+        }
+        const fetchImpl = vi.fn(async () => trackedResponse({}).response)
+        const transport = createWebRegisteredArtifactTransport({
+            fetch: fetchImpl as typeof fetch,
+        })
+
+        await expect(transport.request(candidate)).rejects.toThrow(/request|data|accessor/i)
+        expect(reads).toBe(0)
+        expect(fetchImpl).not.toHaveBeenCalled()
+    })
+
     it("rejects an already-aborted request before opening fetch", async () => {
         const controller = new AbortController()
         controller.abort()

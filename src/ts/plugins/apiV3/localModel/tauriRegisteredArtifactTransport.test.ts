@@ -161,6 +161,31 @@ describe("tauri registered artifact transport", () => {
         expect(invoke).not.toHaveBeenCalled()
     })
 
+    it("rejects request accessors without reading them or invoking the bridge", async () => {
+        let reads = 0
+        const candidate = {} as RegisteredArtifactRequest
+        for (const [key, value] of Object.entries(request())) {
+            Object.defineProperty(candidate, key, {
+                enumerable: true,
+                get: () => {
+                    reads += 1
+                    return value
+                },
+            })
+        }
+        const invoke = vi.fn(async () => {
+            throw new Error("bridge must not run")
+        })
+        const transport = createTauriRegisteredArtifactTransport({
+            invoke: invoke as TauriArtifactInvoke,
+            createRequestId: () => "request-accessor",
+        })
+
+        await expect(transport.request(candidate)).rejects.toThrow(/request|data|accessor/i)
+        expect(reads).toBe(0)
+        expect(invoke).not.toHaveBeenCalled()
+    })
+
     it("cancels both sides of an abort racing open without exposing the handle", async () => {
         const gate = deferred<unknown>()
         const calls: Array<{ command: string; args: unknown }> = []
@@ -179,7 +204,7 @@ describe("tauri registered artifact transport", () => {
 
         controller.abort()
         gate.resolve({
-            handle: "late-handle",
+            handle: "<opening>",
             status: 200,
             headers: [],
         })
@@ -200,7 +225,7 @@ describe("tauri registered artifact transport", () => {
             },
             {
                 command: "cancel_model_artifact_fetch",
-                args: { requestId: "request-race", handle: "late-handle" },
+                args: { requestId: "request-race", handle: "<opening>" },
             },
         ])
     })
@@ -272,6 +297,156 @@ describe("tauri registered artifact transport", () => {
         expect(copied).toBe(false)
         expect(openCalls).toBe(1)
         expect(cancelCalls).toBe(1)
+    })
+
+    it("rejects non-canonical bridge records and arrays before access or iteration", async () => {
+        let headerIterations = 0
+        const headers = [["ETag", '"fixed"']]
+        Object.defineProperty(headers, Symbol.iterator, {
+            value: function () {
+                headerIterations += 1
+                return Array.prototype[Symbol.iterator].call(this)
+            },
+        })
+        const openCalls: string[] = []
+        const openInvoke: TauriArtifactInvoke = async (command) => {
+            openCalls.push(command)
+            if (command === "open_model_artifact_fetch") {
+                return { handle: "header-handle", status: 200, headers }
+            }
+            if (command === "cancel_model_artifact_fetch") return true
+            throw new Error(`unexpected command: ${command}`)
+        }
+        const openTransport = createTauriRegisteredArtifactTransport({
+            invoke: openInvoke,
+            createRequestId: () => "request-header-shape",
+        })
+        await expect(openTransport.request(request())).rejects.toThrow(/bridge|header|array/i)
+        expect(headerIterations).toBe(0)
+        expect(openCalls).toEqual([
+            "open_model_artifact_fetch",
+            "cancel_model_artifact_fetch",
+        ])
+
+        let chunkReads = 0
+        const chunk = [1]
+        Object.defineProperty(chunk, "0", {
+            enumerable: true,
+            get: () => {
+                chunkReads += 1
+                return 1
+            },
+        })
+        let cancelCalls = 0
+        const readInvoke: TauriArtifactInvoke = async (command) => {
+            if (command === "open_model_artifact_fetch") {
+                return { handle: "chunk-handle", status: 200, headers: [] }
+            }
+            if (command === "read_model_artifact_fetch") {
+                return { done: false, chunk, extra: true }
+            }
+            if (command === "cancel_model_artifact_fetch") {
+                cancelCalls += 1
+                return true
+            }
+            throw new Error(`unexpected command: ${command}`)
+        }
+        const readTransport = createTauriRegisteredArtifactTransport({
+            invoke: readInvoke,
+            createRequestId: () => "request-read-shape",
+        })
+        const opened = await readTransport.request(request())
+        await expect(opened.body!.getReader().read()).rejects.toThrow(/bridge|read|chunk/i)
+        expect(chunkReads).toBe(0)
+        expect(cancelCalls).toBe(1)
+    })
+
+    it("preserves every open failure while attempting one matching cleanup", async () => {
+        const primary = new Error("primary open failure")
+        const controller = new AbortController()
+        const calls: Array<{ command: string; args: unknown }> = []
+        const invoke: TauriArtifactInvoke = async (command, args) => {
+            calls.push({ command, args })
+            if (command === "open_model_artifact_fetch") throw primary
+            if (command === "cancel_model_artifact_fetch") {
+                throw new Error("cleanup failure")
+            }
+            throw new Error(`unexpected command: ${command}`)
+        }
+        const transport = createTauriRegisteredArtifactTransport({
+            invoke,
+            createRequestId: () => "request-open-failure",
+        })
+        let caught: unknown
+        try {
+            await transport.request(request({ signal: controller.signal }))
+        } catch (error) {
+            caught = error
+        }
+        expect(caught).toBe(primary)
+        controller.abort()
+        await Promise.resolve()
+        expect(calls).toEqual([
+            {
+                command: "open_model_artifact_fetch",
+                args: {
+                    requestId: "request-open-failure",
+                    url: ARTIFACT.url,
+                    headers: [],
+                    maxBytes: ARTIFACT.bytes,
+                },
+            },
+            {
+                command: "cancel_model_artifact_fetch",
+                args: { requestId: "request-open-failure", handle: null },
+            },
+        ])
+    })
+
+    it("cleans invalid handles and handle-inspection failures exactly once", async () => {
+        const inspectionFailure = new Error("handle inspection failed")
+        const values: Array<{ value: unknown; expected: unknown }> = [
+            { value: { handle: "", status: 200, headers: [] }, expected: null },
+            { value: { handle: "x".repeat(129), status: 200, headers: [] }, expected: null },
+            {
+                value: new Proxy(
+                    { handle: "opaque", status: 200, headers: [] },
+                    {
+                        getOwnPropertyDescriptor(target, key) {
+                            if (key === "handle") throw inspectionFailure
+                            return Reflect.getOwnPropertyDescriptor(target, key)
+                        },
+                    },
+                ),
+                expected: inspectionFailure,
+            },
+        ]
+        for (const { value, expected } of values) {
+            const calls: Array<{ command: string; args: unknown }> = []
+            const invoke: TauriArtifactInvoke = async (command, args) => {
+                calls.push({ command, args })
+                if (command === "open_model_artifact_fetch") return value
+                if (command === "cancel_model_artifact_fetch") return true
+                throw new Error(`unexpected command: ${command}`)
+            }
+            const transport = createTauriRegisteredArtifactTransport({
+                invoke,
+                createRequestId: () => "request-invalid-handle",
+            })
+            let caught: unknown
+            try {
+                await transport.request(request())
+            } catch (error) {
+                caught = error
+            }
+            if (expected instanceof Error) expect(caught).toBe(expected)
+            else expect(caught).toBeInstanceOf(Error)
+            expect(calls.filter(({ command }) => command === "cancel_model_artifact_fetch"))
+                .toEqual([{
+                    command: "cancel_model_artifact_fetch",
+                    args: { requestId: "request-invalid-handle", handle: null },
+                }])
+        }
     })
 
     it("fails closed on malformed open values without a second allocation", async () => {
