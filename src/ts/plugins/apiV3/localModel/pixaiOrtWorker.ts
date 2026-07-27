@@ -1,6 +1,19 @@
 import * as ort from "onnxruntime-web/wasm"
 import ortWasmModuleUrl from "../../../../../node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.mjs?url"
 import ortWasmBinaryUrl from "../../../../../node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.wasm?url"
+import {
+    inspectPixaiEncodedImage,
+    normalizePixaiRunOptions,
+    parsePixaiPreprocess,
+    parsePixaiTags,
+    PIXAI_RESULT_METADATA,
+    PixaiInferenceCoreError,
+    postprocessPixaiScores,
+    rgbaToPixaiTensor,
+    type PixaiMediaType,
+    type PixaiRunOptions,
+    type PixaiTagDefinition,
+} from "./pixaiInferenceCore"
 
 const MAX_MODEL_BYTES = 1_271_365_854
 const MAX_CHUNK_BYTES = 1_048_576
@@ -11,6 +24,8 @@ type WorkerErrorCode =
     | "INVALID_ARGUMENT"
     | "RESOURCE_LIMIT"
     | "MODEL_LOAD_FAILED"
+    | "MODEL_CONFIG_FAILED"
+    | "IMAGE_DECODE_FAILED"
     | "INFERENCE_FAILED"
     | "RUNTIME_UNAVAILABLE"
     | "DISPOSED"
@@ -19,6 +34,8 @@ const ERROR_MESSAGES: Record<WorkerErrorCode, string> = {
     INVALID_ARGUMENT: "ORT worker request is invalid",
     RESOURCE_LIMIT: "ORT worker resource limit was exceeded",
     MODEL_LOAD_FAILED: "ORT model could not be loaded",
+    MODEL_CONFIG_FAILED: "PixAI model configuration is invalid",
+    IMAGE_DECODE_FAILED: "PixAI image could not be decoded",
     INFERENCE_FAILED: "ORT inference failed",
     RUNTIME_UNAVAILABLE: "ORT worker runtime is unavailable",
     DISPOSED: "ORT worker is disposed",
@@ -111,6 +128,57 @@ let expectedBytes = 0
 let receivedBytes = 0
 let modelParts: ArrayBuffer[] = []
 let disposed = false
+let pixaiTags: readonly Readonly<PixaiTagDefinition>[] | undefined
+let pixaiConfigured = false
+
+const boundedTiming = (value: number) =>
+    Math.min(60_000, Math.max(0, Number.isFinite(value) ? value : 0))
+
+const pixaiErrorCode = (error: unknown): WorkerErrorCode => {
+    if (error instanceof PixaiInferenceCoreError) {
+        if (error.code === "MODEL_CONFIG_FAILED") return "MODEL_CONFIG_FAILED"
+        if (error.code === "IMAGE_DECODE_FAILED") return "IMAGE_DECODE_FAILED"
+        if (error.code === "INVALID_ARGUMENT") return "INVALID_ARGUMENT"
+    }
+    return "INFERENCE_FAILED"
+}
+
+const decodeImage = async (
+    bytes: Uint8Array,
+    mediaType: PixaiMediaType,
+) => {
+    const inspected = inspectPixaiEncodedImage(bytes, mediaType)
+    let bitmap: ImageBitmap | undefined
+    let canvas: OffscreenCanvas | undefined
+    try {
+        bitmap = await createImageBitmap(new Blob([Uint8Array.from(bytes).buffer], { type: mediaType }))
+        if (
+            bitmap.width !== inspected.width ||
+            bitmap.height !== inspected.height ||
+            bitmap.width * bitmap.height > 64_000_000
+        ) {
+            throw new PixaiInferenceCoreError("IMAGE_DECODE_FAILED")
+        }
+        canvas = new OffscreenCanvas(bitmap.width, bitmap.height)
+        const context = canvas.getContext("2d", {
+            alpha: true,
+            willReadFrequently: true,
+        })
+        if (!context) throw new PixaiInferenceCoreError("IMAGE_DECODE_FAILED")
+        context.drawImage(bitmap, 0, 0)
+        const image = context.getImageData(0, 0, bitmap.width, bitmap.height)
+        if (image.data.byteLength !== bitmap.width * bitmap.height * 4) {
+            throw new PixaiInferenceCoreError("IMAGE_DECODE_FAILED")
+        }
+        return { rgba: image.data, width: bitmap.width, height: bitmap.height }
+    } catch (error) {
+        if (error instanceof PixaiInferenceCoreError) throw error
+        throw new PixaiInferenceCoreError("IMAGE_DECODE_FAILED")
+    } finally {
+        bitmap?.close()
+        canvas = undefined
+    }
+}
 
 const invalid = (id: number) => postError(id, "INVALID_ARGUMENT")
 
@@ -214,6 +282,106 @@ const handleMessage = async (value: unknown) => {
         return
     }
 
+    if (value.kind === "configurePixai") {
+        if (
+            !exactRecord(value, ["id", "kind", "preprocess", "selectedTags"]) ||
+            !(value.preprocess instanceof ArrayBuffer) ||
+            !(value.selectedTags instanceof ArrayBuffer) ||
+            !session ||
+            pixaiConfigured
+        ) {
+            invalid(id)
+            return
+        }
+        try {
+            parsePixaiPreprocess(new Uint8Array(value.preprocess))
+            const tags = parsePixaiTags(new Uint8Array(value.selectedTags))
+            pixaiTags = tags
+            pixaiConfigured = true
+            scope.postMessage({ id, kind: "pixaiConfigured" })
+        } catch {
+            pixaiTags = undefined
+            postError(id, "MODEL_CONFIG_FAILED")
+        }
+        return
+    }
+
+    if (value.kind === "runPixai") {
+        if (
+            !exactRecord(value, ["id", "kind", "data", "mediaType", "options"]) ||
+            !(value.data instanceof ArrayBuffer) ||
+            typeof value.mediaType !== "string" ||
+            !session ||
+            !pixaiConfigured ||
+            !pixaiTags
+        ) {
+            invalid(id)
+            return
+        }
+        const started = performance.now()
+        try {
+            const options = normalizePixaiRunOptions(value.options as PixaiRunOptions)
+            const encoded = new Uint8Array(value.data)
+            const decodeStarted = performance.now()
+            const decoded = await decodeImage(
+                encoded,
+                value.mediaType as PixaiMediaType,
+            )
+            const preprocessStarted = performance.now()
+            const tensor = rgbaToPixaiTensor(
+                decoded.rgba,
+                decoded.width,
+                decoded.height,
+            )
+            const inferenceStarted = performance.now()
+            const inputName = session.inputNames[0]!
+            const outputName = session.outputNames[0]!
+            const outputs = await session.run({
+                [inputName]: new ort.Tensor(
+                    "float32",
+                    tensor.data,
+                    [...tensor.dimensions],
+                ),
+            })
+            const postprocessStarted = performance.now()
+            const output = outputs[outputName]
+            if (
+                !output ||
+                output.type !== "float32" ||
+                !(output.data instanceof Float32Array)
+            ) {
+                postError(id, "INFERENCE_FAILED")
+                return
+            }
+            const processed = postprocessPixaiScores(
+                output.data,
+                output.dims,
+                pixaiTags,
+                options,
+            )
+            const completed = performance.now()
+            scope.postMessage({
+                id,
+                kind: "pixaiResult",
+                ...PIXAI_RESULT_METADATA,
+                tags: processed.tags,
+                thresholds: processed.thresholds,
+                truncated: processed.truncated,
+                timings: {
+                    decodeMs: boundedTiming(preprocessStarted - decodeStarted),
+                    preprocessMs: boundedTiming(inferenceStarted - preprocessStarted),
+                    inferenceMs: boundedTiming(postprocessStarted - inferenceStarted),
+                    postprocessMs: boundedTiming(completed - postprocessStarted),
+                    totalMs: boundedTiming(completed - started),
+                },
+                warnings: [],
+            })
+        } catch (error) {
+            postError(id, pixaiErrorCode(error))
+        }
+        return
+    }
+
     if (value.kind === "run") {
         if (
             !exactRecord(value, ["id", "kind", "data", "dimensions"]) ||
@@ -286,6 +454,8 @@ const handleMessage = async (value: unknown) => {
             return
         }
         disposed = true
+        pixaiTags = undefined
+        pixaiConfigured = false
         modelParts = []
         expectedBytes = 0
         receivedBytes = 0
