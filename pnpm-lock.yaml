@@ -161,6 +161,9 @@ importers:
       ollama:
         specifier: ^0.5.18
         version: 0.5.18
+      onnxruntime-web:
+        specifier: 1.22.0-dev.20250409-89f8206ba4
+        version: 1.22.0-dev.20250409-89f8206ba4
       openid-client:
         specifier: ^6.8.1
         version: 6.8.1
