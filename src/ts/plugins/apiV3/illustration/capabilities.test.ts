@@ -3,6 +3,7 @@ import { CAPABILITY_CONTRACT, CAPABILITY_IDS } from './capabilityContract'
 import { getCapabilities } from './capabilities'
 import { INLAY_LIFECYCLE_CAPABILITY_IDS } from './inlayLifecycle'
 import { DEVICE_CACHE_CAPABILITY_IDS } from './deviceCache'
+import { withPixaiInferenceCapability } from '../localModel/pixaiLocalModel'
 
 const context = {
     principalId: '11111111-1111-4111-8111-111111111111',
@@ -144,5 +145,57 @@ describe('V3 capability discovery', () => {
             available: false,
             reason: 'temporarily-unavailable',
         })
+    })
+
+    it('health-gates PixAI registration only when discovery actually requests it', async () => {
+        const unrelatedHealth = vi.fn(async () => true)
+        const unrelated = await withPixaiInferenceCapability(
+            ['context.current.v1'],
+            DEVICE_CACHE_CAPABILITY_IDS,
+            unrelatedHealth,
+        )
+        expect(unrelatedHealth).not.toHaveBeenCalled()
+        expect(unrelated.has('local-model.pixai-v0.9.v1')).toBe(false)
+
+        const health = vi.fn(async () => true)
+        const healthy = await withPixaiInferenceCapability(
+            undefined,
+            DEVICE_CACHE_CAPABILITY_IDS,
+            health,
+        )
+        const granted = await getCapabilities(context, ['local-model.pixai-v0.9.v1'], {
+            permissionState: async () => 'granted',
+            runtime: { registeredServices: healthy },
+        })
+        expect(health).toHaveBeenCalledTimes(1)
+        expect(granted['local-model.pixai-v0.9.v1']).toMatchObject({
+            supported: true,
+            available: true,
+            permissionState: 'granted',
+        })
+    })
+
+    it('keeps PixAI temporarily unavailable when the no-prompt backend probe is unhealthy or fails', async () => {
+        const permissionState = vi.fn(async () => 'granted' as const)
+        for (const backendHealth of [
+            vi.fn(async () => false),
+            vi.fn(async () => { throw new Error('private backend detail') }),
+        ]) {
+            const registered = await withPixaiInferenceCapability(
+                ['local-model.pixai-v0.9.v1'],
+                DEVICE_CACHE_CAPABILITY_IDS,
+                backendHealth,
+            )
+            const descriptor = await getCapabilities(context, ['local-model.pixai-v0.9.v1'], {
+                permissionState,
+                runtime: { registeredServices: registered },
+            })
+            expect(backendHealth).toHaveBeenCalledTimes(1)
+            expect(descriptor['local-model.pixai-v0.9.v1']).toMatchObject({
+                available: false,
+                reason: 'temporarily-unavailable',
+            })
+        }
+        expect(permissionState).not.toHaveBeenCalled()
     })
 })

@@ -14,7 +14,7 @@ import { changeColorScheme, updateColorScheme, updateTextThemeAndCSS, type Color
 import { isNodeServer, isTauri } from "src/ts/platform";
 import { get } from "svelte/store";
 import { registerMCPModule, registeredCustomPluginMCPs, unregisterMCPModule } from "src/ts/process/mcp/pluginmcp";
-import { getInlayAsset, getInlayAssetRecord, removeInlayAsset, writeInlayImageFromBytes } from "src/ts/process/files/inlays";
+import { getInlayAsset, getInlayAssetBlob, getInlayAssetRecord, removeInlayAsset, writeInlayImageFromBytes } from "src/ts/process/files/inlays";
 import { getColdStorageItem, listColdDataKeys } from "src/ts/process/coldstorage.svelte";
 import { getLLMCache, searchLLMCache } from "src/ts/translator/translator";
 import { LLMFlags, LLMFormat, LLMProvider, LLMTokenizer, type LLMModel } from "src/ts/model/types";
@@ -55,7 +55,8 @@ import { PluginApiError } from './illustration/errors';
 import { INLAY_LIFECYCLE_CAPABILITY_IDS, InlayLifecycleService } from './illustration/inlayLifecycle';
 import { createRisuInlayLifecycleAdapter } from './illustration/inlayLifecycle.risu';
 import { DEVICE_CACHE_CAPABILITY_IDS, DeviceCacheService } from './illustration/deviceCache';
-import { getPixaiInstallLifecycle } from './localModel/pixaiInstallLifecycle';
+import { getPixaiInstallLifecycle, getPixaiSessionBroker } from './localModel/pixaiInstallLifecycle';
+import { PixaiLocalModel, withPixaiInferenceCapability } from './localModel/pixaiLocalModel';
 
 /*
     V3 API for RisuAI Plugins
@@ -633,6 +634,35 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
         },
     )
     const deviceCache = new DeviceCacheService(context)
+    const pixaiLocalModel = new PixaiLocalModel({
+        context,
+        getBroker: () => getPixaiSessionBroker(),
+        getStatus: (profile) => getPixaiInstallLifecycle().getLocalModelStatus(context, profile),
+        backendHealthy: () => {
+            if (
+                isNodeServer ||
+                typeof Worker === 'undefined' ||
+                typeof WebAssembly === 'undefined' ||
+                typeof OffscreenCanvas === 'undefined' ||
+                typeof createImageBitmap === 'undefined' ||
+                typeof Blob === 'undefined'
+            ) return false
+            try {
+                getPixaiSessionBroker()
+                return true
+            } catch {
+                return false
+            }
+        },
+        storageBackend: isTauri ? 'cache' : 'opfs',
+        contextResources,
+        requirePermission: (permission) => pluginPermissionService.require(context, permission, {
+            locale: DBState.db.language === 'ko' ? 'ko' : 'en',
+        }),
+        getInlayAssetRecord,
+        getInlayAssetBlob,
+    })
+    addPluginUnloadCallback(context.instanceId, () => pixaiLocalModel.releaseAll())
     const secretService = new PluginSecretService(context, protectedPluginSecretBackend, {
         requirePermission: () => pluginPermissionService.require(context, 'secrets', {
             locale: DBState.db.language === 'ko' ? 'ko' : 'en',
@@ -1244,17 +1274,22 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
         },
         getCapabilities: async (ids?: string[]) => {
             const secretStatus = await protectedPluginSecretBackend.status()
+            const registeredServices = await withPixaiInferenceCapability(
+                ids,
+                [
+                    'context.current.v1',
+                    'context.assets.v1',
+                    'context.modules-installed.v1',
+                    'secrets.write-only.v1',
+                    ...INLAY_LIFECYCLE_CAPABILITY_IDS,
+                    ...DEVICE_CACHE_CAPABILITY_IDS,
+                ],
+                () => pixaiLocalModel.backendHealthy(),
+            )
             return getCapabilities(context, ids, {
                 permissionState: (principalId, permission) => pluginPermissionService.state(principalId, permission),
                 runtime: {
-                    registeredServices: new Set([
-                        'context.current.v1',
-                        'context.assets.v1',
-                        'context.modules-installed.v1',
-                        'secrets.write-only.v1',
-                        ...INLAY_LIFECYCLE_CAPABILITY_IDS,
-                        ...DEVICE_CACHE_CAPABILITY_IDS,
-                    ]),
+                    registeredServices,
                     hasCurrentContext: Boolean(getCurrentCharacter() && getCurrentChat()),
                     unavailableReasons: secretStatus.available ? {} : { 'secrets.write-only.v1': 'disabled' },
                 },
@@ -1262,6 +1297,8 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
         },
         getLocalModelStatus: (profile: unknown) =>
             getPixaiInstallLifecycle().getLocalModelStatus(context, profile),
+        getLocalModelCapabilities: (profile: unknown) =>
+            pixaiLocalModel.getLocalModelCapabilities(profile),
         installLocalModel: (profile: unknown, onProgress?: unknown) =>
             getPixaiInstallLifecycle().installLocalModel(context, profile, onProgress),
         getLocalModelOperation: (operationId: unknown) =>
@@ -1270,6 +1307,12 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
             getPixaiInstallLifecycle().cancelLocalModelOperation(context, operationId),
         removeLocalModel: (profile: unknown, options?: unknown) =>
             getPixaiInstallLifecycle().removeLocalModel(context, profile, options),
+        acquireLocalModelSession: (profile: unknown, options?: unknown) =>
+            pixaiLocalModel.acquireLocalModelSession(profile, options),
+        runLocalModel: (sessionId: unknown, request: unknown, options?: unknown) =>
+            pixaiLocalModel.runLocalModel(sessionId, request, options),
+        releaseLocalModelSession: (sessionId: unknown) =>
+            pixaiLocalModel.releaseLocalModelSession(sessionId),
         getCurrentContext: () => contextResources.getCurrentContext(),
         getCharacterCardSnapshot: (characterId?: string) => contextResources.getCharacterCardSnapshot(characterId),
         getConversationContextSnapshot: (conversationId?: string) => contextResources.getConversationContextSnapshot(conversationId),

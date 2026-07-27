@@ -1235,6 +1235,39 @@ interface PluginCapability {
 }
 
 type LocalModelProfileId = 'pixai-tagger-v0.9-onnx';
+type LocalModelProvider = 'auto' | 'webgpu' | 'wasm' | 'node';
+type LocalModelSessionId = string;
+
+interface LocalModelCapabilities {
+    supported: boolean;
+    reasons: string[];
+    providers: Record<
+        'webgpu' | 'wasm' | 'node',
+        { available: boolean; reason?: string }
+    >;
+    storage: {
+        backend: 'cache' | 'opfs' | 'node';
+        usageBytes?: number;
+        quotaBytes?: number;
+        availableBytes?: number;
+        persistent: boolean;
+        resumable: boolean;
+    };
+    limits: {
+        maxInputBytes: number;
+        maxInputPixels: number;
+        maxResultTags: number;
+    };
+}
+
+type LocalImageSource =
+    | { kind: 'context-asset'; assetId: string; revision?: Revision }
+    | { kind: 'inlay'; inlayId: string; revision?: Revision }
+    | {
+        kind: 'bytes';
+        data: Uint8Array;
+        mediaType: 'image/jpeg' | 'image/png' | 'image/webp';
+    };
 
 interface LocalModelStatus {
     state: 'absent' | 'partial' | 'downloading' | 'verifying' | 'ready' | 'corrupt' | 'evicted';
@@ -1257,8 +1290,8 @@ interface LocalModelProgress {
 interface PluginApiErrorShape {
     name: 'PluginApiError';
     code: 'INVALID_ARGUMENT' | 'UNSUPPORTED' | 'PERMISSION_DENIED' | 'NOT_FOUND'
-        | 'QUOTA_EXCEEDED' | 'NETWORK' | 'INTEGRITY_MISMATCH' | 'ABORTED'
-        | 'CONFLICT' | 'INTERNAL';
+        | 'QUOTA_EXCEEDED' | 'RESOURCE_LIMIT' | 'NETWORK' | 'INTEGRITY_MISMATCH'
+        | 'ABORTED' | 'CONFLICT' | 'DECODE_FAILED' | 'PROVIDER_ERROR' | 'INTERNAL';
     message: string;
     retryable: boolean;
     retryAfterMs?: number;
@@ -2186,6 +2219,9 @@ interface RisuaiPluginAPI {
     /** Reports device-local state for the fixed PixAI tagger profile without prompting. */
     getLocalModelStatus(profile: LocalModelProfileId): Promise<LocalModelStatus>;
 
+    /** Reports backend, model, provider, storage, and fixed input limits without prompting. */
+    getLocalModelCapabilities(profile: LocalModelProfileId): Promise<LocalModelCapabilities>;
+
     /** Confirms and starts a Host-owned installation operation. */
     installLocalModel(
         profile: LocalModelProfileId,
@@ -2197,6 +2233,54 @@ interface RisuaiPluginAPI {
 
     /** Cancels one nonterminal operation owned by this plugin principal. */
     cancelLocalModelOperation(operationId: string): Promise<void>;
+
+    /** Acquires one context-owned local inference session after permission. */
+    acquireLocalModelSession(
+        profile: LocalModelProfileId,
+        options?: { provider?: LocalModelProvider; signal?: AbortSignal },
+    ): Promise<{
+        sessionId: LocalModelSessionId;
+        provider: 'webgpu' | 'wasm' | 'node';
+    }>;
+
+    /** Resolves an authorized Host image source and runs the fixed PixAI tagger. */
+    runLocalModel(
+        sessionId: LocalModelSessionId,
+        request: {
+            image: LocalImageSource;
+            thresholds?: { general?: number; character?: number };
+            categories?: Array<'general' | 'character'>;
+            maxResults?: number;
+        },
+        options?: { signal?: AbortSignal },
+    ): Promise<{
+        model: {
+            profile: LocalModelProfileId;
+            revision: string;
+            sha256: string;
+            preprocessVersion: string;
+        };
+        execution: { provider: 'webgpu' | 'wasm' | 'node' };
+        tags: Array<{
+            index: number;
+            name: string;
+            score: number;
+            category: 'general' | 'character';
+        }>;
+        thresholds: { general: number; character: number };
+        truncated: boolean;
+        timingMs: {
+            decode: number;
+            preprocess: number;
+            inference: number;
+            postprocess: number;
+            total: number;
+        };
+        warnings: string[];
+    }>;
+
+    /** Releases one session owned by this plugin instance without re-prompting. */
+    releaseLocalModelSession(sessionId: LocalModelSessionId): Promise<void>;
 
     /** Releases plugin ownership or, after confirmation, purges device bytes. */
     removeLocalModel(
