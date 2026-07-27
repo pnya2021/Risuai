@@ -15,6 +15,7 @@ import {
 const WAITING_PER_PRINCIPAL = 4
 const WATCHDOG_MS = 300_000
 const IDLE_MS = 60_000
+const MAX_INPUT_BYTES = 33_554_432
 const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 
 export interface PixaiSessionWorkerClient {
@@ -158,6 +159,8 @@ const copyImage = (input: PixaiImageRunInput): PixaiImageRunInput => {
             !input ||
             !(input.data instanceof Uint8Array) ||
             Object.getPrototypeOf(input.data) !== Uint8Array.prototype ||
+            input.data.byteLength < 1 ||
+            input.data.byteLength > MAX_INPUT_BYTES ||
             (input.mediaType !== "image/jpeg" &&
                 input.mediaType !== "image/png" &&
                 input.mediaType !== "image/webp")
@@ -189,6 +192,7 @@ export class PixaiSessionBroker {
     private initialization?: Initialization
     private active?: RunEntry
     private idleTimer?: unknown
+    private disposal?: Promise<void>
     private removal?: RemovalEntry
     private generation = 0
 
@@ -208,6 +212,22 @@ export class PixaiSessionBroker {
         this.idleTimer = undefined
     }
 
+    private retireClient(client: PixaiSessionWorkerClient): Promise<void> {
+        const previous = this.disposal ?? Promise.resolve()
+        let disposal!: Promise<void>
+        disposal = previous
+            .then(() => client.dispose())
+            .catch(() => undefined)
+            .then(() => {
+                if (this.disposal !== disposal) return
+                this.disposal = undefined
+                this.maybePurge()
+                this.scheduleIdle()
+            })
+        this.disposal = disposal
+        return disposal
+    }
+
     private hasLiveAcquisition() {
         return [...this.acquiring.values()].some((entry) =>
             [...entry.joiners].some((joiner) => !joiner.settled))
@@ -225,6 +245,7 @@ export class PixaiSessionBroker {
         if (
             this.removal ||
             this.idleTimer !== undefined ||
+            this.disposal ||
             !this.client ||
             !this.canPurge()
         ) {
@@ -239,7 +260,7 @@ export class PixaiSessionBroker {
             const client = this.client
             this.client = undefined
             this.generation += 1
-            void client.dispose().catch(() => undefined)
+            void this.retireClient(client)
         }, IDLE_MS)
     }
 
@@ -331,6 +352,8 @@ export class PixaiSessionBroker {
         entry.started = true
         void (async () => {
             try {
+                await this.disposal
+                if (![...entry.joiners].some((joiner) => !joiner.settled)) return
                 await this.ensureInitialized()
                 if (![...entry.joiners].some((joiner) => !joiner.settled)) return
                 const existing = this.owners.get(entry.key)
@@ -607,7 +630,7 @@ export class PixaiSessionBroker {
         this.client = undefined
         this.initialization = undefined
         this.generation += 1
-        await client?.dispose().catch(() => undefined)
+        if (client) await this.retireClient(client)
         if (this.active?.generation === generation) this.active = undefined
         this.maybePurge()
         this.scheduleIdle()
@@ -625,11 +648,12 @@ export class PixaiSessionBroker {
         if (entry.running) return 0
         entry.running = true
         this.cancelIdle()
+        await this.disposal
         const client = this.client
         this.client = undefined
         if (client) {
             this.generation += 1
-            await client.dispose().catch(() => undefined)
+            await this.retireClient(client)
         }
         try {
             return await entry.purge()

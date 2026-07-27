@@ -64,6 +64,7 @@ class FakeClient implements PixaiSessionWorkerClient {
     }> = []
     disposeCalls = 0
     loadGate?: ReturnType<typeof deferred<void>>
+    disposeGate?: ReturnType<typeof deferred<void>>
 
     async load(readable: ModelArtifactReadable, options: { signal?: AbortSignal } = {}) {
         this.loadCalls.push(readable)
@@ -97,6 +98,7 @@ class FakeClient implements PixaiSessionWorkerClient {
         for (const run of this.runCalls) {
             run.operation.reject(new PixaiOrtWorkerError("DISPOSED"))
         }
+        await this.disposeGate?.promise
     }
 }
 
@@ -172,6 +174,15 @@ describe("Risu PixAI session broker", () => {
         const other = await broker.acquire(owner(PRINCIPAL_A, INSTANCE_B))
         expect(other.sessionId).not.toBe(first.sessionId)
         expect(clients).toHaveLength(1)
+        await expect(broker.run({
+            ...owner(),
+            sessionId: first.sessionId,
+            image: {
+                data: new Uint8Array(33_554_433),
+                mediaType: "image/png",
+            },
+        })).rejects.toMatchObject({ code: "INVALID_ARGUMENT" })
+        expect(clients[0].runCalls).toHaveLength(0)
         await expect(broker.release({
             ...owner(PRINCIPAL_B, INSTANCE_A),
             sessionId: first.sessionId,
@@ -294,8 +305,9 @@ describe("Risu PixAI session broker", () => {
         await broker.release({ ...owner(), sessionId: lease.sessionId })
         expect(purge).not.toHaveBeenCalled()
         clients[0].runCalls[0].operation.resolve(result)
-        await nextTurn()
-        await nextTurn()
+        for (let attempt = 0; attempt < 10 && broker.isRemovalPending(); attempt += 1) {
+            await nextTurn()
+        }
         expect(clients[0].disposeCalls).toBe(1)
         expect(purge).toHaveBeenCalledTimes(1)
         expect(events).toEqual(["purge"])
@@ -324,5 +336,53 @@ describe("Risu PixAI session broker", () => {
         expect(clients[1].disposeCalls).toBe(0)
         await vi.advanceTimersByTimeAsync(1)
         expect(clients[1].disposeCalls).toBe(1)
+    })
+
+    it("waits for idle disposal before replacement initialization and purge", async () => {
+        const clients: FakeClient[] = []
+        const firstDisposal = deferred<void>()
+        const secondDisposal = deferred<void>()
+        const store = fakeStore()
+        let sessionIndex = 0
+        const broker = new PixaiSessionBroker({
+            store,
+            createClient: () => {
+                const client = new FakeClient()
+                client.disposeGate = clients.length === 0
+                    ? firstDisposal
+                    : secondDisposal
+                clients.push(client)
+                return client
+            },
+            createSessionId: () => sessionIds[sessionIndex++],
+        })
+        const first = await broker.acquire(owner())
+        await broker.release({ ...owner(), sessionId: first.sessionId })
+        await vi.advanceTimersByTimeAsync(60_000)
+        expect(clients[0].disposeCalls).toBe(1)
+
+        const replacementPromise = broker.acquire(owner(PRINCIPAL_B, INSTANCE_B))
+        await nextTurn()
+        expect(clients).toHaveLength(1)
+        firstDisposal.resolve()
+        const replacement = await replacementPromise
+        expect(clients).toHaveLength(2)
+        await broker.release({
+            ...owner(PRINCIPAL_B, INSTANCE_B),
+            sessionId: replacement.sessionId,
+        })
+        await vi.advanceTimersByTimeAsync(60_000)
+        expect(clients[1].disposeCalls).toBe(1)
+
+        const purge = vi.fn(async () => 77)
+        const removal = broker.removeWhenIdle(purge)
+        await nextTurn()
+        expect(purge).not.toHaveBeenCalled()
+        secondDisposal.resolve()
+        await expect(removal).resolves.toEqual({
+            pending: false,
+            purgedBytes: 77,
+        })
+        expect(purge).toHaveBeenCalledTimes(1)
     })
 })
