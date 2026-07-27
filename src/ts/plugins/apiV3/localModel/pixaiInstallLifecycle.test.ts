@@ -16,6 +16,7 @@ import {
     PixaiInstallLifecycle,
     TERMINAL_OPERATION_TTL_MS,
     type LocalModelProgress,
+    type PixaiLifecycleInferenceBarrier,
     type PixaiInstallLifecycleOptions,
 } from "./pixaiInstallLifecycle"
 import type {
@@ -274,6 +275,65 @@ describe("PixAI install lifecycle", () => {
             lifecycle.installLocalModel(execution("owner").context, PIXAI_PROFILE_ID),
         ).rejects.toBe(denied)
         expect(queue.current()).toBeNull()
+    })
+
+    it("blocks installation before permission and confirmation while removal is pending", async () => {
+        const requirePermission = vi.fn(async () => undefined)
+        const barrier: PixaiLifecycleInferenceBarrier = {
+            assertInstallAllowed: () => {
+                throw new PluginApiError(
+                    "CONFLICT",
+                    "Local model removal is pending",
+                    { retryable: true },
+                )
+            },
+            removeWhenIdle: async (purge) => ({
+                pending: false,
+                purgedBytes: await purge(),
+            }),
+        }
+        const { lifecycle, queue } = setup({ barrier, requirePermission })
+
+        await expect(
+            lifecycle.installLocalModel(execution("owner").context, PIXAI_PROFILE_ID),
+        ).rejects.toMatchObject({ code: "CONFLICT", retryable: true })
+        expect(requirePermission).not.toHaveBeenCalled()
+        expect(queue.current()).toBeNull()
+    })
+
+    it("rechecks the removal barrier after delayed installation approval", async () => {
+        let checks = 0
+        const barrier: PixaiLifecycleInferenceBarrier = {
+            assertInstallAllowed: () => {
+                checks += 1
+                if (checks === 2) {
+                    throw new PluginApiError(
+                        "CONFLICT",
+                        "Local model removal is pending",
+                        { retryable: true },
+                    )
+                }
+            },
+            removeWhenIdle: async (purge) => ({
+                pending: false,
+                purgedBytes: await purge(),
+            }),
+        }
+        const { lifecycle, queue, store } = setup({ barrier })
+        const installation = lifecycle.installLocalModel(
+            execution("owner").context,
+            PIXAI_PROFILE_ID,
+        )
+
+        await queue.whenPresented()
+        decide(queue, true)
+
+        await expect(installation).rejects.toMatchObject({
+            code: "CONFLICT",
+            retryable: true,
+        })
+        expect(checks).toBe(2)
+        expect(store.states.size).toBe(0)
     })
 
     it("exposes active operationId and aggregate progress through verification", async () => {
@@ -603,6 +663,65 @@ describe("PixAI install lifecycle", () => {
             pending: false,
         })
         expect(store.states.size).toBe(0)
+    })
+
+    it("defers the exact artifact purge through the inference barrier", async () => {
+        let deferredPurge: (() => Promise<number>) | undefined
+        const barrier: PixaiLifecycleInferenceBarrier = {
+            assertInstallAllowed: () => undefined,
+            removeWhenIdle: async (purge) => {
+                deferredPurge = purge
+                return { pending: true, purgedBytes: 0 }
+            },
+        }
+        const { lifecycle, store } = setup({ barrier })
+        store.set(profile.artifacts[0], "verified")
+        store.set(profile.artifacts[1], "partial", 37)
+
+        await expect(
+            lifecycle.removeLocalModel(execution("owner").context, PIXAI_PROFILE_ID),
+        ).resolves.toEqual({
+            releasedPluginReference: false,
+            purgedBytes: 0,
+            retainedForOtherOwners: false,
+            pending: true,
+        })
+        expect(store.removeCalls).toBe(0)
+        if (!deferredPurge) throw new Error("purge closure was not retained")
+        await expect(deferredPurge()).resolves.toBe(
+            profile.artifacts[0].bytes + 37,
+        )
+        expect(store.removeCalls).toBe(2)
+        expect(store.states.size).toBe(0)
+    })
+
+    it("retains shared artifacts without opening the inference barrier", async () => {
+        const removeWhenIdle = vi.fn(async (purge: () => Promise<number>) => ({
+            pending: false,
+            purgedBytes: await purge(),
+        }))
+        const barrier: PixaiLifecycleInferenceBarrier = {
+            assertInstallAllowed: () => undefined,
+            removeWhenIdle,
+        }
+        const { lifecycle, queue, store } = setup({ barrier })
+        const first = execution("first").context
+        const second = execution("second").context
+        const firstInstall = await approvedInstall(lifecycle, queue, first)
+        await operation(lifecycle, first, firstInstall.operationId)
+        const secondInstall = await approvedInstall(lifecycle, queue, second)
+        await operation(lifecycle, second, secondInstall.operationId)
+
+        await expect(
+            lifecycle.removeLocalModel(first, PIXAI_PROFILE_ID),
+        ).resolves.toEqual({
+            releasedPluginReference: true,
+            purgedBytes: 0,
+            retainedForOtherOwners: true,
+            pending: false,
+        })
+        expect(removeWhenIdle).not.toHaveBeenCalled()
+        expect(store.states.size).toBe(profile.artifacts.length)
     })
 
     it("defaults plugin removal to include resumable partial bytes", async () => {

@@ -20,6 +20,7 @@ import {
     type PixaiProfileId,
     type RegisteredModelArtifact,
 } from "./pixaiRegistry"
+import { PixaiSessionBroker } from "./pixaiSessionBroker"
 import {
     downloadRegisteredArtifact,
     type RegisteredArtifactDownloadOptions,
@@ -82,9 +83,25 @@ type DownloadRegisteredArtifact = (
     options: RegisteredArtifactDownloadOptions,
 ) => Promise<RegisteredArtifactDownloadResult>
 
+export interface PixaiLifecycleInferenceBarrier {
+    assertInstallAllowed(): void
+    removeWhenIdle(
+        purge: () => Promise<number>,
+    ): Promise<{ pending: boolean; purgedBytes: number }>
+}
+
+const immediateInferenceBarrier: PixaiLifecycleInferenceBarrier = {
+    assertInstallAllowed: () => undefined,
+    removeWhenIdle: async (purge) => ({
+        pending: false,
+        purgedBytes: await purge(),
+    }),
+}
+
 export interface PixaiInstallLifecycleOptions {
     store: ModelArtifactStore
     transport: RegisteredArtifactTransport
+    barrier?: PixaiLifecycleInferenceBarrier
     queue?: SecurityConfirmationQueue
     requirePermission?: (context: PluginExecutionContext) => Promise<void>
     download?: DownloadRegisteredArtifact
@@ -314,6 +331,7 @@ export class PixaiInstallLifecycle {
     private readonly download: DownloadRegisteredArtifact
     private readonly now: () => number
     private readonly createOperationId: () => string
+    private readonly barrier: PixaiLifecycleInferenceBarrier
     private readonly operations = new Map<string, LocalModelOperation>()
     private readonly active = new Map<string, LocalModelOperation>()
     private readonly owners = new Set<string>()
@@ -330,6 +348,7 @@ export class PixaiInstallLifecycle {
                 pluginPermissionService.require(context, "localModelInference"))
         this.download = options.download ?? downloadRegisteredArtifact
         this.now = options.now ?? Date.now
+        this.barrier = options.barrier ?? immediateInferenceBarrier
         this.createOperationId =
             options.createOperationId ??
             (() => `lmo_${crypto.randomUUID().replaceAll("-", "")}`)
@@ -412,6 +431,7 @@ export class PixaiInstallLifecycle {
     ): Promise<{ operationId: string }> {
         const profileId = assertProfile(profileValue)
         const callback = assertProgressCallback(progressValue)
+        this.barrier.assertInstallAllowed()
         await this.requirePermission(context)
         if (context.signal.aborted) {
             throw new PluginApiError("ABORTED", "Plugin instance unloaded")
@@ -458,6 +478,7 @@ export class PixaiInstallLifecycle {
             if (context.signal.aborted) {
                 throw new PluginApiError("ABORTED", "Plugin instance unloaded")
             }
+            this.barrier.assertInstallAllowed()
             const coalesced = this.active.get(key)
             if (coalesced) {
                 this.attachCallback(coalesced, context, callback)
@@ -600,25 +621,30 @@ export class PixaiInstallLifecycle {
             if (options.scope === "device") this.owners.clear()
 
             const states = await this.readStates(profile.artifacts)
-            let purgedBytes = 0
-            for (let index = 0; index < profile.artifacts.length; index += 1) {
-                const artifact = profile.artifacts[index]
+            const targets = profile.artifacts.flatMap((artifact, index) => {
                 const state = states[index]
-                const removePartial =
-                    options.includePartial && state.state === "partial"
-                const removeVerified = state.state === "verified"
-                if (!removePartial && !removeVerified) continue
-                await this.store.remove(artifact.sha256, {
-                    partial: removePartial,
-                    verified: removeVerified,
-                })
-                purgedBytes += state.bytes
-            }
+                const partial = options.includePartial && state.state === "partial"
+                const verified = state.state === "verified"
+                return partial || verified
+                    ? [{ artifact, bytes: state.bytes, partial, verified }]
+                    : []
+            })
+            const removal = await this.barrier.removeWhenIdle(async () => {
+                let purgedBytes = 0
+                for (const target of targets) {
+                    await this.store.remove(target.artifact.sha256, {
+                        partial: target.partial,
+                        verified: target.verified,
+                    })
+                    purgedBytes += target.bytes
+                }
+                return purgedBytes
+            })
             return {
                 releasedPluginReference,
-                purgedBytes,
+                purgedBytes: removal.purgedBytes,
                 retainedForOtherOwners: false,
-                pending: false,
+                pending: removal.pending,
             }
         })
     }
@@ -804,10 +830,26 @@ export class PixaiInstallLifecycle {
     }
 }
 
-let defaultLifecycle: PixaiInstallLifecycle | undefined
+interface DefaultPixaiRuntime {
+    lifecycle: PixaiInstallLifecycle
+    broker: PixaiSessionBroker
+}
 
-export function getPixaiInstallLifecycle(): PixaiInstallLifecycle {
-    if (defaultLifecycle) return defaultLifecycle
+let defaultRuntime: DefaultPixaiRuntime | undefined
+
+function createDefaultRuntime(
+    store: ModelArtifactStore,
+    transport: RegisteredArtifactTransport,
+): DefaultPixaiRuntime {
+    const broker = new PixaiSessionBroker({ store })
+    return {
+        broker,
+        lifecycle: new PixaiInstallLifecycle({ store, transport, barrier: broker }),
+    }
+}
+
+function getDefaultRuntime(): DefaultPixaiRuntime {
+    if (defaultRuntime) return defaultRuntime
     if (isNodeServer) {
         throw new PluginApiError(
             "UNSUPPORTED",
@@ -815,11 +857,11 @@ export function getPixaiInstallLifecycle(): PixaiInstallLifecycle {
         )
     }
     if (isTauri) {
-        defaultLifecycle = new PixaiInstallLifecycle({
-            store: new TauriModelArtifactStore(),
-            transport: createTauriRegisteredArtifactTransport(),
-        })
-        return defaultLifecycle
+        defaultRuntime = createDefaultRuntime(
+            new TauriModelArtifactStore(),
+            createTauriRegisteredArtifactTransport(),
+        )
+        return defaultRuntime
     }
     if (
         typeof navigator === "undefined" ||
@@ -831,9 +873,17 @@ export function getPixaiInstallLifecycle(): PixaiInstallLifecycle {
             "Local model artifact storage is unavailable on this host",
         )
     }
-    defaultLifecycle = new PixaiInstallLifecycle({
-        store: new OpfsModelArtifactStore(),
-        transport: createWebRegisteredArtifactTransport(),
-    })
-    return defaultLifecycle
+    defaultRuntime = createDefaultRuntime(
+        new OpfsModelArtifactStore(),
+        createWebRegisteredArtifactTransport(),
+    )
+    return defaultRuntime
+}
+
+export function getPixaiInstallLifecycle(): PixaiInstallLifecycle {
+    return getDefaultRuntime().lifecycle
+}
+
+export function getPixaiSessionBroker(): PixaiSessionBroker {
+    return getDefaultRuntime().broker
 }
