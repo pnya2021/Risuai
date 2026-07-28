@@ -14,8 +14,8 @@ import { changeColorScheme, updateColorScheme, updateTextThemeAndCSS, type Color
 import { isNodeServer, isTauri } from "src/ts/platform";
 import { get } from "svelte/store";
 import { registerMCPModule, registeredCustomPluginMCPs, unregisterMCPModule } from "src/ts/process/mcp/pluginmcp";
-import { getInlayAsset, getInlayAssetBlob, getInlayAssetRecord, removeInlayAsset, writeInlayImageFromBytes } from "src/ts/process/files/inlays";
-import { getColdStorageItem, listColdDataKeys } from "src/ts/process/coldstorage.svelte";
+import { getInlayAsset, getInlayAssetBlob, getInlayAssetRecord, listInlayAssets, removeInlayAsset, writeInlayImageFromBytes } from "src/ts/process/files/inlays";
+import { coldStorageHeader, getColdStorageItem, listColdDataKeys, preLoadChat } from "src/ts/process/coldstorage.svelte";
 import { getLLMCache, searchLLMCache } from "src/ts/translator/translator";
 import { LLMFlags, LLMFormat, LLMProvider, LLMTokenizer, type LLMModel } from "src/ts/model/types";
 import { sendChat as processSendChat, doingChat } from "src/ts/process/index.svelte";
@@ -57,6 +57,8 @@ import { createRisuInlayLifecycleAdapter } from './illustration/inlayLifecycle.r
 import { DEVICE_CACHE_CAPABILITY_IDS, DeviceCacheService } from './illustration/deviceCache';
 import { getPixaiInstallLifecycle, getPixaiSessionBroker } from './localModel/pixaiInstallLifecycle';
 import { PixaiLocalModel, withPixaiInferenceCapability } from './localModel/pixaiLocalModel';
+import { MESSAGE_QUERY_CAPABILITY_IDS, MessageQueryService, type MessageRef } from './illustration/messageQuery';
+import { createRisuMessageQueryAdapter } from './illustration/messageQuery.risu';
 
 /*
     V3 API for RisuAI Plugins
@@ -631,6 +633,24 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
             require: (executionContext, permission) => pluginPermissionService.require(executionContext, permission, {
                 locale: DBState.db.language === 'ko' ? 'ko' : 'en',
             }),
+        },
+    )
+    const messageQuery = new MessageQueryService(
+        context,
+        createRisuMessageQueryAdapter({
+            getDatabase,
+            getCurrentCharacter,
+            getCurrentChat,
+            preLoadChat,
+            coldStorageHeader,
+            listInlayAssets,
+        }),
+        {
+            requirePermission: (executionContext, permission) => pluginPermissionService.require(
+                executionContext,
+                permission,
+                { locale: DBState.db.language === 'ko' ? 'ko' : 'en' },
+            ),
         },
     )
     const deviceCache = new DeviceCacheService(context)
@@ -1281,6 +1301,7 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
                     'context.assets.v1',
                     'context.modules-installed.v1',
                     'secrets.write-only.v1',
+                    ...MESSAGE_QUERY_CAPABILITY_IDS,
                     ...INLAY_LIFECYCLE_CAPABILITY_IDS,
                     ...DEVICE_CACHE_CAPABILITY_IDS,
                 ],
@@ -1320,6 +1341,11 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
         getActiveModules: (options) => contextResources.getActiveModules(options),
         listContextModules: (options) => contextResources.listContextModules(options),
         readContextAsset: (assetId: string, options) => contextResources.readContextAsset(assetId, options),
+        getMessageSnapshot: (target: MessageRef) => messageQuery.getMessageSnapshot(target),
+        getLatestCommittedMessage: (options?: Parameters<MessageQueryService['getLatestCommittedMessage']>[0]) =>
+            messageQuery.getLatestCommittedMessage(options),
+        getRecentCommittedMessages: (options: Parameters<MessageQueryService['getRecentCommittedMessages']>[0]) =>
+            messageQuery.getRecentCommittedMessages(options),
         //Internal use APIs
         _getOldKeys: () => {
             return Object.keys(oldApis)

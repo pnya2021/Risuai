@@ -4,6 +4,7 @@ import { getCapabilities } from './capabilities'
 import { INLAY_LIFECYCLE_CAPABILITY_IDS } from './inlayLifecycle'
 import { DEVICE_CACHE_CAPABILITY_IDS } from './deviceCache'
 import { withPixaiInferenceCapability } from '../localModel/pixaiLocalModel'
+import { MESSAGE_QUERY_CAPABILITY_IDS } from './messageQuery'
 
 const context = {
     principalId: '11111111-1111-4111-8111-111111111111',
@@ -145,6 +146,36 @@ describe('V3 capability discovery', () => {
             available: false,
             reason: 'temporarily-unavailable',
         })
+    })
+
+    it('advertises message query only after registration, permission, and current context', async () => {
+        expect(MESSAGE_QUERY_CAPABILITY_IDS).toEqual(['chat.message-query.v1'])
+        const beforeRegistration = await getCapabilities(context, [...MESSAGE_QUERY_CAPABILITY_IDS], {
+            permissionState: vi.fn(async () => 'granted' as const),
+            runtime: { registeredServices: new Set(), hasCurrentContext: true },
+        })
+        expect(beforeRegistration['chat.message-query.v1']).toMatchObject({
+            available: false, reason: 'temporarily-unavailable',
+        })
+        const permissionRequired = await getCapabilities(context, [...MESSAGE_QUERY_CAPABILITY_IDS], {
+            permissionState: async () => 'not-requested',
+            runtime: { registeredServices: new Set(MESSAGE_QUERY_CAPABILITY_IDS), hasCurrentContext: true },
+        })
+        expect(permissionRequired['chat.message-query.v1']).toMatchObject({
+            available: false, reason: 'permission-required',
+        })
+        const noContext = await getCapabilities(context, [...MESSAGE_QUERY_CAPABILITY_IDS], {
+            permissionState: async () => 'granted',
+            runtime: { registeredServices: new Set(MESSAGE_QUERY_CAPABILITY_IDS), hasCurrentContext: false },
+        })
+        expect(noContext['chat.message-query.v1']).toMatchObject({
+            available: false, reason: 'no-current-context',
+        })
+        const callable = await getCapabilities(context, [...MESSAGE_QUERY_CAPABILITY_IDS], {
+            permissionState: async () => 'granted',
+            runtime: { registeredServices: new Set(MESSAGE_QUERY_CAPABILITY_IDS), hasCurrentContext: true },
+        })
+        expect(callable['chat.message-query.v1']).toMatchObject({ available: true, permissionState: 'granted' })
     })
 
     it('health-gates PixAI registration only when discovery actually requests it', async () => {

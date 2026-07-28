@@ -1353,7 +1353,36 @@ type PluginNativeFetchInit = {
 
 type CharacterId = string;
 type ConversationId = string;
+type MessageId = string;
 type Revision = string;
+
+interface MessageRef {
+    characterId: CharacterId;
+    conversationId: ConversationId;
+    messageId: MessageId;
+}
+
+interface CallerPluginAttachmentSnapshot {
+    inlayId: string;
+    presentation: 'inline' | 'styled' | 'model-input';
+    utf16Offset: number;
+    metadata?: PluginJsonValue;
+}
+
+interface MessageSnapshot extends MessageRef {
+    role: 'user' | 'char';
+    speakerCharacterId?: CharacterId;
+    /** Logical UTF-16 text with recognized Inlay marker tokens omitted. */
+    content: string;
+    revision: Revision;
+    generationId?: string;
+    createdAt?: number;
+    updatedAt: number;
+    callerPluginState: {
+        metadata: Record<string, PluginJsonValue>;
+        attachments: CallerPluginAttachmentSnapshot[];
+    };
+}
 
 interface CurrentContextRef {
     characterId: CharacterId;
@@ -2364,6 +2393,24 @@ interface RisuaiPluginAPI {
         name: string;
         mediaType: string;
     }>;
+
+    /** Returns one complete caller-personalized committed message. */
+    getMessageSnapshot(target: MessageRef): Promise<MessageSnapshot>;
+
+    /** Returns the latest matching committed message, defaulting to the current conversation and char role. */
+    getLatestCommittedMessage(options?: {
+        characterId?: CharacterId;
+        conversationId?: ConversationId;
+        role?: 'user' | 'char';
+    }): Promise<MessageSnapshot | null>;
+
+    /** Returns complete messages strictly before the target in oldest-to-newest order. */
+    getRecentCommittedMessages(options: {
+        before: MessageRef;
+        roles?: Array<'user' | 'char'>;
+        limit?: number;
+        maxTotalUtf16?: number;
+    }): Promise<{ items: MessageSnapshot[]; truncatedBefore: boolean }>;
 
     /**
      * Unwraps a SafeClassArray into a standard array
