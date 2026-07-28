@@ -869,6 +869,17 @@ export interface Database{
         completedAt: number
         expiresAt: number
     }>
+    /** Host-private durable replay receipts for atomic generated-Inlay attachments. */
+    pluginAtomicAttachReceipts?: Array<{
+        version: 1
+        principalId: string
+        operation: 'inlay.atomic-attach.v1'
+        idempotencyKey: string
+        digest: string
+        target: { characterId: string; conversationId: string; messageId: string }
+        result: unknown
+        completedAt: number
+    }>
     currentPluginProvider: string
     zoomsize:number
     customBackground:string
@@ -1891,10 +1902,10 @@ export interface Message{
     /** Principal-namespaced state used by restricted V3 message APIs. */
     pluginMessageState?: Record<string, {
         metadata: Record<string, any>
-        /** Reserved for later attachment slices; H11-A never creates or exposes these. */
+        /** Caller-owned inline Inlay attachments managed by the restricted V3 APIs. */
         attachments: Array<{
             inlayId: string
-            presentation?: 'inline' | 'styled' | 'model-input'
+            presentation: 'inline'
             metadata?: any
             [key: string]: unknown
         }>

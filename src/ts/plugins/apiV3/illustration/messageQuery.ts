@@ -11,6 +11,7 @@ const MAX_RECENT_UTF16 = 65_536
 const MAX_SNAPSHOT_UTF16 = 262_144
 const MAX_SNAPSHOT_JSON_BYTES = 2_097_152
 const MAX_CALLER_METADATA_JSON_BYTES = 65_536
+export const MAX_CALLER_ATTACHMENTS = 256
 
 export interface MessageRef {
     characterId: string
@@ -21,6 +22,29 @@ export interface MessageRef {
 export type PluginJsonValue = null | boolean | number | string | PluginJsonValue[] | {
     [key: string]: PluginJsonValue
 }
+
+export interface MessageCallerAttachmentSnapshot {
+    inlayId: string
+    presentation: 'inline'
+    utf16Offset: number
+    metadata?: PluginJsonValue
+}
+
+export interface LogicalInlayMarker {
+    id: string
+    rawStart: number
+    rawEnd: number
+    utf16Offset: number
+}
+
+export interface LogicalMessageProjection {
+    content: string
+    markers: LogicalInlayMarker[]
+}
+
+export type LogicalMessagePlacement =
+    | { kind: 'end' }
+    | { kind: 'utf16-offset'; offset: number }
 
 export interface MessageQueryHostMessage {
     role: 'user' | 'char'
@@ -64,7 +88,10 @@ export interface MessageSnapshot extends MessageRef {
     generationId?: string
     createdAt?: number
     updatedAt: number
-    callerPluginState: { metadata: Record<string, PluginJsonValue>; attachments: never[] }
+    callerPluginState: {
+        metadata: Record<string, PluginJsonValue>
+        attachments: MessageCallerAttachmentSnapshot[]
+    }
 }
 
 type QueryKind =
@@ -125,14 +152,103 @@ const sourceSignature = (location: MessageQueryConversationLocation) => JSON.str
     messages: location.messages.map(canonicalMessageSource),
 })
 
+const recognizedMarker = /\{\{(?:inlay|inlayed|inlayeddata)::([^{}]+)\}\}/gu
+
+export const projectLogicalContent = (
+    raw: string,
+    recognized: ReadonlySet<string>,
+): LogicalMessageProjection => {
+    let rawCursor = 0
+    let content = ''
+    const markers: LogicalInlayMarker[] = []
+    for (const match of raw.matchAll(recognizedMarker)) {
+        const token = match[0]
+        const id = match[1]
+        const rawStart = match.index ?? 0
+        if (!recognized.has(id)) continue
+        content += raw.slice(rawCursor, rawStart)
+        const rawEnd = rawStart + token.length
+        markers.push({ id, rawStart, rawEnd, utf16Offset: content.length })
+        rawCursor = rawEnd
+    }
+    content += raw.slice(rawCursor)
+    return { content, markers }
+}
+
 export const projectMessageContent = (raw: string, recognized: ReadonlySet<string>) =>
-    raw.replace(/\{\{(?:inlay|inlayed|inlayeddata)::([^{}]+)\}\}/gu, (token, id: string) =>
-        recognized.has(id) ? '' : token)
+    projectLogicalContent(raw, recognized).content
+
+export const resolveLogicalInsertionOffset = (
+    raw: string,
+    recognized: ReadonlySet<string>,
+    placement: LogicalMessagePlacement,
+): number | null => {
+    const projection = projectLogicalContent(raw, recognized)
+    const offset = placement.kind === 'end' ? projection.content.length : placement.offset
+    if (!Number.isInteger(offset) || offset < 0 || offset > projection.content.length) return null
+    const previous = offset > 0 ? projection.content.charCodeAt(offset - 1) : 0
+    const next = offset < projection.content.length ? projection.content.charCodeAt(offset) : 0
+    if (previous >= 0xd800 && previous <= 0xdbff && next >= 0xdc00 && next <= 0xdfff) return null
+    const cluster = projection.markers.filter((marker) => marker.utf16Offset === offset)
+    if (cluster.length > 0) return cluster[cluster.length - 1].rawEnd
+
+    let rawCursor = 0
+    let logicalCursor = 0
+    for (const marker of projection.markers) {
+        const literalLength = marker.rawStart - rawCursor
+        if (offset <= logicalCursor + literalLength) return rawCursor + offset - logicalCursor
+        logicalCursor += literalLength
+        rawCursor = marker.rawEnd
+    }
+    return rawCursor + offset - logicalCursor
+}
 
 const plainRecord = (value: unknown): value is Record<string, unknown> => {
     if (!value || typeof value !== 'object' || Array.isArray(value)) return false
     const prototype = Object.getPrototypeOf(value)
     return prototype === Object.prototype || prototype === null
+}
+
+const cloneAttachmentMetadata = (value: unknown): PluginJsonValue | undefined => {
+    if (value === undefined) return undefined
+    try {
+        return JSON.parse(validateJsonLimits(value, {
+            maxDepth: 32, maxBytes: MAX_CALLER_METADATA_JSON_BYTES,
+        })) as PluginJsonValue
+    } catch {
+        return undefined
+    }
+}
+
+export const projectCallerAttachments = (
+    raw: string,
+    recognized: ReadonlySet<string>,
+    attachments: unknown,
+): MessageCallerAttachmentSnapshot[] => {
+    if (!Array.isArray(attachments)) return []
+    const managed = new Map<string, { metadata?: PluginJsonValue }>()
+    for (const attachment of attachments) {
+        if (!plainRecord(attachment) || typeof attachment.inlayId !== 'string' || attachment.inlayId.length === 0
+            || attachment.presentation !== 'inline' || !recognized.has(attachment.inlayId)
+            || managed.has(attachment.inlayId)) continue
+        if (attachment.metadata !== undefined && cloneAttachmentMetadata(attachment.metadata) === undefined) continue
+        const metadata = cloneAttachmentMetadata(attachment.metadata)
+        managed.set(attachment.inlayId, metadata === undefined ? {} : { metadata })
+    }
+    const result: MessageCallerAttachmentSnapshot[] = []
+    const emitted = new Set<string>()
+    for (const marker of projectLogicalContent(raw, recognized).markers) {
+        const attachment = managed.get(marker.id)
+        if (!attachment || emitted.has(marker.id)) continue
+        emitted.add(marker.id)
+        result.push({
+            inlayId: marker.id,
+            presentation: 'inline',
+            utf16Offset: marker.utf16Offset,
+            ...attachment,
+        })
+    }
+    return result
 }
 
 const descriptorValue = (record: Record<string, unknown>, key: string) => {
@@ -183,9 +299,16 @@ function normalizeRoles(value: Array<'user' | 'char'> | undefined) {
 }
 
 function assertSnapshotLimits(snapshot: MessageSnapshot) {
+    const details = {
+        contentUtf16: snapshot.content.length,
+        callerAttachmentCount: snapshot.callerPluginState.attachments.length,
+    }
+    if (snapshot.callerPluginState.attachments.length > MAX_CALLER_ATTACHMENTS) {
+        throw new PluginApiError('RESOURCE_LIMIT', 'Caller attachment limit exceeded', { details })
+    }
     if (snapshot.content.length > MAX_SNAPSHOT_UTF16) {
         throw new PluginApiError('RESOURCE_LIMIT', 'Message content exceeds snapshot limit', {
-            details: { contentUtf16: snapshot.content.length },
+            details,
         })
     }
     if (encoder.encode(JSON.stringify(snapshot)).byteLength > MAX_SNAPSHOT_JSON_BYTES) {
@@ -416,7 +539,11 @@ export class MessageQueryService {
             ),
             callerPluginState: {
                 metadata: cloneCallerMessageMetadata(message, this.context.principalId),
-                attachments: [],
+                attachments: projectCallerAttachments(
+                    message.data,
+                    recognizedInlayIds,
+                    callerState && descriptorValue(callerState, 'attachments'),
+                ),
             },
         }
         if (message.role === 'char') {

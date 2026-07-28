@@ -1364,7 +1364,7 @@ interface MessageRef {
 
 interface CallerPluginAttachmentSnapshot {
     inlayId: string;
-    presentation: 'inline' | 'styled' | 'model-input';
+    presentation: 'inline';
     utf16Offset: number;
     metadata?: PluginJsonValue;
 }
@@ -1398,6 +1398,29 @@ interface CurrentMessageMetadataPatchInput {
 
 interface MessagePatchResult {
     changed: boolean;
+    message: MessageSnapshot;
+    commitId: string;
+}
+
+type GeneratedInlayPlacement =
+    | { kind: 'end' }
+    | { kind: 'utf16-offset'; offset: number };
+
+interface GeneratedInlayAtomicAttachInput {
+    target: MessageRef;
+    expectedMessageRevision: Revision;
+    data: Uint8Array;
+    inlay: { name: string };
+    presentation: 'inline';
+    placement: GeneratedInlayPlacement;
+    attachmentMetadata: PluginJsonValue;
+    messageMetadata: [{ key: string; value: PluginJsonValue }];
+    idempotencyKey: string;
+    persist: 'immediate';
+}
+
+interface GeneratedInlayAtomicAttachResult {
+    inlay: OwnedInlayDescriptor;
     message: MessageSnapshot;
     commitId: string;
 }
@@ -2432,6 +2455,11 @@ interface RisuaiPluginAPI {
 
     /** Atomically checkpoints caller-owned metadata on one current committed message. */
     patchMessage(input: CurrentMessageMetadataPatchInput): Promise<MessagePatchResult>;
+
+    /** Creates an owned Inlay and atomically attaches it to one current committed message. */
+    attachGeneratedInlayToMessage(
+        input: GeneratedInlayAtomicAttachInput,
+    ): Promise<GeneratedInlayAtomicAttachResult>;
 
     /**
      * Unwraps a SafeClassArray into a standard array

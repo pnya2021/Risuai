@@ -59,8 +59,10 @@ import { getPixaiInstallLifecycle, getPixaiSessionBroker } from './localModel/pi
 import { PixaiLocalModel, withPixaiInferenceCapability } from './localModel/pixaiLocalModel';
 import { MESSAGE_QUERY_CAPABILITY_IDS, MessageQueryService, type MessageRef } from './illustration/messageQuery';
 import { createRisuMessageQueryAdapter } from './illustration/messageQuery.risu';
-import { MESSAGE_PATCH_CAPABILITY_IDS, MessagePatchService, type MessagePatchInput } from './illustration/messagePatch';
+import { MESSAGE_PATCH_CAPABILITY_IDS, MessageMutationRateLimiter, MessagePatchService, type MessagePatchInput } from './illustration/messagePatch';
 import { createRisuMessagePatchAdapter } from './illustration/messagePatch.risu';
+import { INLAY_ATOMIC_ATTACH_CAPABILITY_IDS, InlayAtomicAttachService, type InlayAtomicAttachInput } from './illustration/inlayAtomicAttach';
+import { createRisuInlayAtomicAttachAdapter } from './illustration/inlayAtomicAttach.risu';
 
 /*
     V3 API for RisuAI Plugins
@@ -83,6 +85,7 @@ import { createRisuMessagePatchAdapter } from './illustration/messagePatch.risu'
 
 const pluginChannels = new InstanceChannelRegistry();
 const pluginInstanceCleanup = new InstanceCleanupRegistry();
+const messageMutationRateLimiter = new MessageMutationRateLimiter();
 
 class SafeElement {
     #element: HTMLElement;
@@ -673,6 +676,30 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
                 permission,
                 { locale: DBState.db.language === 'ko' ? 'ko' : 'en' },
             ),
+            rateLimiter: messageMutationRateLimiter,
+        },
+    )
+    const inlayAtomicAttach = new InlayAtomicAttachService(
+        context,
+        createRisuInlayAtomicAttachAdapter({
+            getDatabase,
+            getCurrentCharacter,
+            getCurrentChat,
+            preLoadChat,
+            coldStorageHeader,
+            listInlayAssets,
+            createInlay: (data, options) => inlayLifecycle.createInlay(data, options),
+            deleteInlay: (id, options) => inlayLifecycle.deleteInlay(id, options),
+            waitForMessagePersistence,
+            requestDatabaseSaveNow,
+        }),
+        {
+            requirePermission: (executionContext, permission) => pluginPermissionService.require(
+                executionContext,
+                permission,
+                { locale: DBState.db.language === 'ko' ? 'ko' : 'en' },
+            ),
+            rateLimiter: messageMutationRateLimiter,
         },
     )
     const deviceCache = new DeviceCacheService(context)
@@ -1325,6 +1352,7 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
                     'secrets.write-only.v1',
                     ...MESSAGE_QUERY_CAPABILITY_IDS,
                     ...MESSAGE_PATCH_CAPABILITY_IDS,
+                    ...INLAY_ATOMIC_ATTACH_CAPABILITY_IDS,
                     ...INLAY_LIFECYCLE_CAPABILITY_IDS,
                     ...DEVICE_CACHE_CAPABILITY_IDS,
                 ],
@@ -1370,6 +1398,8 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
         getRecentCommittedMessages: (options: Parameters<MessageQueryService['getRecentCommittedMessages']>[0]) =>
             messageQuery.getRecentCommittedMessages(options),
         patchMessage: (input: MessagePatchInput) => messagePatch.patchMessage(input),
+        attachGeneratedInlayToMessage: (input: InlayAtomicAttachInput) =>
+            inlayAtomicAttach.attachGeneratedInlayToMessage(input),
         //Internal use APIs
         _getOldKeys: () => {
             return Object.keys(oldApis)

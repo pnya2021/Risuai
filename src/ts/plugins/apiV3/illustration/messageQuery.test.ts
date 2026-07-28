@@ -1,6 +1,9 @@
 import { describe, expect, it, vi } from 'vitest'
 import {
     MessageQueryService,
+    projectCallerAttachments,
+    projectLogicalContent,
+    resolveLogicalInsertionOffset,
     type MessageQueryConversationLocation,
     type MessageQueryHostAdapter,
     type MessageQueryHostMessage,
@@ -68,6 +71,49 @@ function harness(initialMessages: MessageQueryHostMessage[] = [
 const target = { characterId: 'character-1', conversationId: 'conversation-1', messageId: 'm2' }
 
 describe('message query core', () => {
+    it('projects only known marker variants and maps logical UTF-16 insertion points', () => {
+        const raw = 'A{{inlay::known}}{{inlayed::also}}B{{inlayeddata::missing}}C'
+        const projection = projectLogicalContent(raw, new Set(['known', 'also']))
+
+        expect(projection).toEqual({
+            content: 'AB{{inlayeddata::missing}}C',
+            markers: [
+                { id: 'known', rawStart: 1, rawEnd: 17, utf16Offset: 1 },
+                { id: 'also', rawStart: 17, rawEnd: 34, utf16Offset: 1 },
+            ],
+        })
+        expect(resolveLogicalInsertionOffset(raw, new Set(['known', 'also']), {
+            kind: 'utf16-offset', offset: 1,
+        })).toBe(34)
+        expect(resolveLogicalInsertionOffset('A\u{1F600}B', new Set(), {
+            kind: 'utf16-offset', offset: 2,
+        })).toBeNull()
+        expect(resolveLogicalInsertionOffset('a\u0301\u200Db', new Set(), {
+            kind: 'utf16-offset', offset: 1,
+        })).toBe(1)
+    })
+
+    it('projects caller-managed attachments in first-marker render order and clones metadata', () => {
+        const attachments = [
+            { inlayId: 'second', presentation: 'inline', metadata: { order: 2 } },
+            { inlayId: 'known', presentation: 'inline', metadata: { order: 1 } },
+            { inlayId: 'foreign', presentation: 'inline', metadata: { hidden: true } },
+            { inlayId: 'known', presentation: 'styled', metadata: { legacy: true } },
+        ]
+        const projection = projectCallerAttachments(
+            'a{{inlayed::known}}b{{inlay::second}}c{{inlayeddata::known}}',
+            new Set(['known', 'second']),
+            attachments,
+        )
+
+        expect(projection).toEqual([
+            { inlayId: 'known', presentation: 'inline', utf16Offset: 1, metadata: { order: 1 } },
+            { inlayId: 'second', presentation: 'inline', utf16Offset: 2, metadata: { order: 2 } },
+        ])
+        ;(projection[0].metadata as Record<string, number>).order = 99
+        expect(attachments[1].metadata).toEqual({ order: 1 })
+    })
+
     it('returns an exact stable snapshot with recognized Inlay markers removed', async () => {
         const h = harness([
             message('m2', 'char', 'A{{inlay::known}}B{{inlayed::unknown}}C', {

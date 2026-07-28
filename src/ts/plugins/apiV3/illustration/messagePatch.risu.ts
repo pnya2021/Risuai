@@ -5,8 +5,10 @@ import type {
     PreparedMessagePatch,
 } from './messagePatch'
 import {
+    MAX_CALLER_ATTACHMENTS,
     cloneCallerMessageMetadata,
     messageRevisionValue,
+    projectCallerAttachments,
     projectMessageContent,
     type MessageQueryHostMessage,
     type MessageRef,
@@ -303,6 +305,9 @@ const validateCallerState = (state: { metadata: Record<string, PluginJsonValue>;
     if (Object.keys(state.metadata).length > MAX_METADATA_KEYS) {
         throw new PluginApiError('RESOURCE_LIMIT', 'Caller message metadata key limit exceeded')
     }
+    if (state.attachments.length > MAX_CALLER_ATTACHMENTS) {
+        throw new PluginApiError('RESOURCE_LIMIT', 'Caller message attachment limit exceeded')
+    }
     validateJsonLimits({ metadata: state.metadata, attachments: state.attachments }, {
         maxDepth: 32,
         maxBytes: MAX_CALLER_METADATA_BYTES,
@@ -343,7 +348,10 @@ const snapshotFor = (
         content: projectMessageContent(message.data, recognized),
         revision,
         updatedAt,
-        callerPluginState: { metadata: cloneCallerMessageMetadata(message, principalId), attachments: [] },
+        callerPluginState: {
+            metadata: cloneCallerMessageMetadata(message, principalId),
+            attachments: projectCallerAttachments(message.data, recognized, own?.attachments),
+        },
     }
     const speaker = speakerFor(located.character, message)
     if (speaker) result.speakerCharacterId = speaker
@@ -360,7 +368,7 @@ const snapshotFor = (
 
 let mutationTail: Promise<void> = Promise.resolve()
 
-const withMutationLock = async <T>(operation: () => Promise<T>): Promise<T> => {
+export const withMessageMutationLock = async <T>(operation: () => Promise<T>): Promise<T> => {
     const previous = mutationTail
     let release!: () => void
     mutationTail = new Promise<void>((resolve) => { release = resolve })
@@ -441,7 +449,7 @@ export function createRisuMessagePatchAdapter(
             return { characterId: character.chaId, conversationId: chat.id }
         },
 
-        patchCurrentMessage: (request) => withMutationLock(async () => {
+        patchCurrentMessage: (request) => withMessageMutationLock(async () => {
             ensureBoundary(dependencies, request)
             const initialRoot = dependencies.getDatabase()
             const initialConversation = findConversation(initialRoot, request.input.target)
