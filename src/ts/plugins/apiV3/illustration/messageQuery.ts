@@ -52,7 +52,14 @@ export interface MessageQueryHostMessage {
     saying?: string
     chatId?: string
     time?: number
-    generationInfo?: { generationId?: string }
+    generationInfo?: {
+        generationId?: string
+        model?: unknown
+        inputTokens?: unknown
+        outputTokens?: unknown
+        maxContext?: unknown
+        stageTiming?: unknown
+    }
     pluginMessageState?: unknown
     pluginMessageUpdatedAt?: number
 }
@@ -298,7 +305,7 @@ function normalizeRoles(value: Array<'user' | 'char'> | undefined) {
     return [...new Set(value)]
 }
 
-function assertSnapshotLimits(snapshot: MessageSnapshot) {
+export function assertMessageSnapshotLimits(snapshot: MessageSnapshot) {
     const details = {
         contentUtf16: snapshot.content.length,
         callerAttachmentCount: snapshot.callerPluginState.attachments.length,
@@ -314,6 +321,97 @@ function assertSnapshotLimits(snapshot: MessageSnapshot) {
     if (encoder.encode(JSON.stringify(snapshot)).byteLength > MAX_SNAPSHOT_JSON_BYTES) {
         throw new PluginApiError('RESOURCE_LIMIT', 'Message snapshot exceeds serialized limit')
     }
+}
+
+export interface CapturedMessageSnapshotSource {
+    characterId: string
+    conversationId: string
+    currentCharacterId: string
+    memberCharacterIds?: string[]
+    message: MessageQueryHostMessage
+    recognizedInlayIds: string[]
+}
+
+export function captureMessageSnapshotSource(input: {
+    characterId: string
+    conversationId: string
+    currentCharacterId: string
+    memberCharacterIds?: string[]
+    message: MessageQueryHostMessage
+    recognizedInlayIds: ReadonlySet<string>
+}): CapturedMessageSnapshotSource {
+    return {
+        characterId: requireNonEmpty(input.characterId, 'characterId'),
+        conversationId: requireNonEmpty(input.conversationId, 'conversationId'),
+        currentCharacterId: requireNonEmpty(input.currentCharacterId, 'currentCharacterId'),
+        ...(input.memberCharacterIds ? { memberCharacterIds: [...input.memberCharacterIds] } : {}),
+        message: safeStructuredClone(input.message),
+        recognizedInlayIds: [...input.recognizedInlayIds],
+    }
+}
+
+export async function projectCapturedMessageSnapshot(
+    sourceValue: unknown,
+    principalId: string,
+    options: {
+        enforceLimits?: boolean
+        createRevision?: (value: unknown) => Promise<string>
+    } = {},
+): Promise<MessageSnapshot> {
+    const source = sourceValue as CapturedMessageSnapshotSource
+    if (!source || typeof source !== 'object'
+        || !isStableMessageId(source.message?.chatId)
+        || (source.message.role !== 'user' && source.message.role !== 'char')
+        || typeof source.message.data !== 'string'
+        || typeof source.characterId !== 'string'
+        || typeof source.conversationId !== 'string'
+        || typeof source.currentCharacterId !== 'string'
+        || !Array.isArray(source.recognizedInlayIds)) {
+        throw new PluginApiError('INTERNAL', 'Captured message source is invalid')
+    }
+    const message = source.message
+    const recognized = new Set(source.recognizedInlayIds)
+    const stateRoot = plainRecord(message.pluginMessageState) ? message.pluginMessageState : undefined
+    const callerState = stateRoot && plainRecord(descriptorValue(stateRoot, principalId))
+        ? descriptorValue(stateRoot, principalId) as Record<string, unknown>
+        : undefined
+    const callerUpdatedAt = callerState && typeof descriptorValue(callerState, 'updatedAt') === 'number'
+        ? descriptorValue(callerState, 'updatedAt') as number
+        : 0
+    const result: MessageSnapshot = {
+        characterId: source.characterId,
+        conversationId: source.conversationId,
+        messageId: message.chatId,
+        role: message.role,
+        content: projectMessageContent(message.data, recognized),
+        revision: await (options.createRevision ?? createCanonicalRevision)(messageRevisionValue(message)),
+        updatedAt: Math.max(
+            typeof message.time === 'number' ? message.time : 0,
+            typeof message.pluginMessageUpdatedAt === 'number' ? message.pluginMessageUpdatedAt : 0,
+            callerUpdatedAt,
+        ),
+        callerPluginState: {
+            metadata: cloneCallerMessageMetadata(message, principalId),
+            attachments: projectCallerAttachments(
+                message.data,
+                recognized,
+                callerState && descriptorValue(callerState, 'attachments'),
+            ),
+        },
+    }
+    if (message.role === 'char') {
+        if (source.memberCharacterIds === undefined) {
+            result.speakerCharacterId = source.currentCharacterId
+        } else if (typeof message.saying === 'string' && source.memberCharacterIds.includes(message.saying)) {
+            result.speakerCharacterId = message.saying
+        }
+    }
+    if (typeof message.generationInfo?.generationId === 'string') {
+        result.generationId = message.generationInfo.generationId
+    }
+    if (typeof message.time === 'number') result.createdAt = message.time
+    if (options.enforceLimits !== false) assertMessageSnapshotLimits(result)
+    return result
 }
 
 export class MessageQueryService {
@@ -558,7 +656,7 @@ export class MessageQueryService {
             result.generationId = message.generationInfo.generationId
         }
         if (typeof message.time === 'number') result.createdAt = message.time
-        assertSnapshotLimits(result)
+        assertMessageSnapshotLimits(result)
         return result
     }
 

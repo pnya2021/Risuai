@@ -1,5 +1,5 @@
 import { allowedDbKeys, applyProgrammaticDatabaseMutation, customProviderStore, getV2PluginAPIs, handlePluginInstallViaPlugin, pluginV2, type PluginV2ProviderArgument, type PluginV2ProviderOptions, type RisuPlugin } from "../plugins.svelte";
-import { invokeSandboxCleanupCallback, SandboxHost } from "./factory";
+import { cancelSandboxCallbackInvocation, invokeSandboxCleanupCallback, SandboxHost } from "./factory";
 import { replacePluginV3RuntimeSnapshot } from "../pluginV3Reload";
 import { getCurrentCharacter, getCurrentChat, getDatabase } from "src/ts/storage/database.svelte";
 import { SafeLocalPluginStorage, tagWhitelist } from "../pluginSafeClass";
@@ -57,8 +57,10 @@ import { createRisuInlayLifecycleAdapter } from './illustration/inlayLifecycle.r
 import { DEVICE_CACHE_CAPABILITY_IDS, DeviceCacheService } from './illustration/deviceCache';
 import { getPixaiInstallLifecycle, getPixaiSessionBroker } from './localModel/pixaiInstallLifecycle';
 import { PixaiLocalModel, withPixaiInferenceCapability } from './localModel/pixaiLocalModel';
-import { MESSAGE_QUERY_CAPABILITY_IDS, MessageQueryService, type MessageRef } from './illustration/messageQuery';
+import { MESSAGE_QUERY_CAPABILITY_IDS, MessageQueryService, projectCapturedMessageSnapshot, type MessageRef } from './illustration/messageQuery';
 import { createRisuMessageQueryAdapter } from './illustration/messageQuery.risu';
+import { MESSAGE_EVENT_CAPABILITY_IDS, MessageEventService, type MessageCommittedEvent, type MessageEventOptions } from './illustration/messageEvents';
+import { subscribeRisuMessageCommits } from './illustration/messageEvents.risu';
 import { MESSAGE_PATCH_CAPABILITY_IDS, MessageMutationRateLimiter, MessagePatchService, type MessagePatchInput } from './illustration/messagePatch';
 import { createRisuMessagePatchAdapter } from './illustration/messagePatch.risu';
 import { INLAY_ATOMIC_ATTACH_CAPABILITY_IDS, InlayAtomicAttachService, type InlayAtomicAttachInput } from './illustration/inlayAtomicAttach';
@@ -86,6 +88,29 @@ import { createRisuInlayAtomicAttachAdapter } from './illustration/inlayAtomicAt
 const pluginChannels = new InstanceChannelRegistry();
 const pluginInstanceCleanup = new InstanceCleanupRegistry();
 const messageMutationRateLimiter = new MessageMutationRateLimiter();
+const committedMessageEvents = new MessageEventService({
+    current: () => {
+        const character = getCurrentCharacter()
+        const chat = getCurrentChat()
+        return character?.chaId && chat?.id
+            ? { characterId: character.chaId, conversationId: chat.id }
+            : null
+    },
+    snapshot: async (execution, commit) => {
+        const snapshot = await projectCapturedMessageSnapshot(commit.source, execution.principalId, {
+            enforceLimits: false,
+        })
+        if (snapshot.revision !== commit.revision) {
+            throw new PluginApiError('CONFLICT', 'Committed message source changed')
+        }
+        return snapshot
+    },
+    requirePermission: (execution, permission) => pluginPermissionService.require(execution, permission, {
+        locale: DBState.db.language === 'ko' ? 'ko' : 'en',
+    }),
+    cancelCallbackInvocation: cancelSandboxCallbackInvocation,
+})
+subscribeRisuMessageCommits((commit) => committedMessageEvents.publish(commit))
 
 class SafeElement {
     #element: HTMLElement;
@@ -658,6 +683,9 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
             ),
         },
     )
+    addPluginUnloadCallback(context.instanceId, () => {
+        committedMessageEvents.cleanupInstance(context.instanceId)
+    })
     const messagePatch = new MessagePatchService(
         context,
         createRisuMessagePatchAdapter({
@@ -1351,6 +1379,7 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
                     'context.assets.v1',
                     'context.modules-installed.v1',
                     'secrets.write-only.v1',
+                    ...MESSAGE_EVENT_CAPABILITY_IDS,
                     ...MESSAGE_QUERY_CAPABILITY_IDS,
                     ...MESSAGE_PATCH_CAPABILITY_IDS,
                     ...INLAY_ATOMIC_ATTACH_CAPABILITY_IDS,
@@ -1393,6 +1422,19 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
         getActiveModules: (options) => contextResources.getActiveModules(options),
         listContextModules: (options) => contextResources.listContextModules(options),
         readContextAsset: (assetId: string, options) => contextResources.readContextAsset(assetId, options),
+        onMessageCommitted: async (
+            listener: (event: MessageCommittedEvent) => void | Promise<void>,
+            options?: MessageEventOptions,
+        ) => {
+            try {
+                return await committedMessageEvents.onMessageCommitted(context, listener, options)
+            } catch (error) {
+                try { (listener as typeof listener & { release?: () => void }).release?.() } catch { /* best effort */ }
+                throw error
+            }
+        },
+        offMessageCommitted: (subscriptionId: string) =>
+            committedMessageEvents.offMessageCommitted(context, subscriptionId),
         getMessageSnapshot: (target: MessageRef) => messageQuery.getMessageSnapshot(target),
         getLatestCommittedMessage: (options?: Parameters<MessageQueryService['getLatestCommittedMessage']>[0]) =>
             messageQuery.getLatestCommittedMessage(options),

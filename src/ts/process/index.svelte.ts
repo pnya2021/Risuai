@@ -32,6 +32,12 @@ import { getModelInfo, LLMFlags } from "../model/modellist";
 import { hypaMemoryV3 } from "./memory/hypav3";
 import { getModuleAssets, getModuleToggles } from "./modules";
 import { readImage } from "../globalApi.svelte";
+import {
+    applyContinueMessageIdentity,
+    collectTerminalMessageCommitCandidates,
+    commitRisuMessages,
+    reconcileGeneratedRerollTail,
+} from "../plugins/apiV3/illustration/messageEvents.risu";
 
 export interface OpenAIChat{
     role: 'system'|'user'|'assistant'|'function'
@@ -64,14 +70,139 @@ export let requestTokenParts:{[key:string]:requestTokenPart[]} = {}
 export let previewFormated:OpenAIChat[] = []
 export let previewBody:string = ''
 
-export async function sendChat(chatProcessIndex = -1,arg:{
+export interface GenerationRerollPlan {
+    insertionIndex: number
+    originalTail: Message[]
+}
+
+interface SendChatArguments {
     chatAdditonalTokens?:number,
     signal?:AbortSignal,
     continue?:boolean,
     usedContinueTokens?:number,
     preview?:boolean
     previewPrompt?:boolean
-} = {}):Promise<boolean> {
+    rerollPlan?: GenerationRerollPlan
+}
+
+export function reconcileTerminalContinueMessage(
+    baseline: Message[],
+    messages: Message[],
+    continuingMessageId: string,
+    now = Date.now(),
+) {
+    const previousIndex = baseline.findIndex((message) => message.chatId === continuingMessageId)
+    const currentIndex = messages.findIndex((message) => message.chatId === continuingMessageId)
+    const baselineIds = new Set(baseline.flatMap((message) => message.chatId ? [message.chatId] : []))
+    const replacementIndex = messages.findIndex((message) =>
+        message.role === 'char' && message.generationInfo && !baselineIds.has(message.chatId ?? ''))
+    if (previousIndex >= 0 && currentIndex >= 0) {
+        messages[currentIndex] = applyContinueMessageIdentity(
+            baseline[previousIndex] as any,
+            messages[currentIndex] as any,
+            now,
+        ) as Message
+    } else if (previousIndex >= 0 && replacementIndex >= 0) {
+        const continued = applyContinueMessageIdentity(
+            baseline[previousIndex] as any,
+            messages[replacementIndex] as any,
+            now,
+        ) as Message
+        messages.splice(replacementIndex, 1)
+        messages[previousIndex] = continued
+    }
+}
+
+let messageCommitBatchDepth = 0
+
+export async function sendChat(chatProcessIndex = -1, arg: SendChatArguments = {}): Promise<boolean> {
+    const outermost = messageCommitBatchDepth === 0 && !arg.preview && !arg.previewPrompt
+    let baseline: Message[] | undefined
+    let characterId: string | undefined
+    let conversationId: string | undefined
+    let continuingMessageId: string | undefined
+    if (outermost) {
+        const character = DBState.db.characters?.[get(selectedCharID)]
+        const conversation = character?.chats?.[character.chatPage]
+        if (character?.chaId && conversation) {
+            conversation.id ??= v4()
+            for (const message of conversation.message) message.chatId ??= v4()
+            baseline = safeStructuredClone(conversation.message)
+            characterId = character.chaId
+            conversationId = conversation.id
+            continuingMessageId = arg.continue ? conversation.message.at(-1)?.chatId : undefined
+        }
+    }
+
+    messageCommitBatchDepth += 1
+    let result: boolean
+    try {
+        result = await sendChatCore(chatProcessIndex, arg)
+    } finally {
+        messageCommitBatchDepth -= 1
+    }
+    if (!outermost || !result || arg.signal?.aborted || !baseline || !characterId || !conversationId) return result
+
+    try {
+        const character = DBState.db.characters.find((candidate) => candidate.chaId === characterId)
+        const conversation = character?.chats?.find((candidate) => candidate.id === conversationId)
+        if (!character || !conversation) return result
+        for (const message of conversation.message) message.chatId ??= v4()
+
+        let before = baseline
+        if (arg.continue && continuingMessageId) {
+            reconcileTerminalContinueMessage(baseline, conversation.message, continuingMessageId)
+        }
+        if (arg.rerollPlan) {
+            const replacementTail = conversation.message.slice(arg.rerollPlan.insertionIndex)
+            const reconciled = reconcileGeneratedRerollTail(
+                arg.rerollPlan.originalTail,
+                replacementTail,
+            )
+            conversation.message.splice(arg.rerollPlan.insertionIndex, replacementTail.length, ...reconciled)
+            before = [
+                ...baseline.slice(0, arg.rerollPlan.insertionIndex),
+                ...safeStructuredClone(arg.rerollPlan.originalTail),
+                ...baseline.slice(arg.rerollPlan.insertionIndex),
+            ]
+        }
+
+        const beforeIds = new Set(before.flatMap((message) => message.chatId ? [message.chatId] : []))
+        const primaryCause = arg.rerollPlan ? 'reroll' : arg.continue ? 'continue' : 'model'
+        const primaryMessageIds = new Set<string>()
+        for (let index = 0; index < conversation.message.length; index += 1) {
+            const message = conversation.message[index]
+            if (message.role !== 'char' || !message.chatId) continue
+            if (arg.rerollPlan && index >= arg.rerollPlan.insertionIndex && message.generationInfo) {
+                primaryMessageIds.add(message.chatId)
+            } else if (arg.continue && message.chatId === continuingMessageId) {
+                primaryMessageIds.add(message.chatId)
+            } else if (arg.continue && !beforeIds.has(message.chatId) && message.generationInfo) {
+                primaryMessageIds.add(message.chatId)
+            } else if (!arg.rerollPlan && !arg.continue && !beforeIds.has(message.chatId) && message.generationInfo) {
+                primaryMessageIds.add(message.chatId)
+            }
+        }
+        const candidates = collectTerminalMessageCommitCandidates({
+            before,
+            after: conversation.message,
+            primaryCause,
+            primaryMessageIds,
+        })
+        await commitRisuMessages(candidates.map((candidate) => ({
+            characterId,
+            conversationId,
+            currentCharacterId: characterId,
+            ...(character.type === 'group' ? { memberCharacterIds: [...character.characters] } : {}),
+            ...candidate,
+        })))
+    } catch (error) {
+        console.error('Failed to publish committed message events', error)
+    }
+    return result
+}
+
+async function sendChatCore(chatProcessIndex = -1,arg: SendChatArguments = {}):Promise<boolean> {
 
     chatProcessStage.set(0)
     const abortSignal = arg.signal ?? (new AbortController()).signal
@@ -1495,7 +1626,11 @@ export async function sendChat(chatProcessIndex = -1,arg:{
     if(inputTokens + outputTokens > maxContextTokens){
         outputTokens = maxContextTokens - inputTokens
     }
-    const generationId = v4()
+    const requestGenerationId = v4()
+    const continuingMessage = arg.continue
+        ? DBState.db.characters[selectedChar].chats[selectedChat].message.at(-1)
+        : undefined
+    const generationId = continuingMessage?.generationInfo?.generationId ?? requestGenerationId
     const generationModel = getGenerationModelString()
 
     generationInfo = {
@@ -1527,7 +1662,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         isGroupChat: nowChatroom.type === 'group',
         bias: {},
         continue: arg.continue,
-        chatId: generationId,
+        chatId: requestGenerationId,
         imageResponse: DBState.db.outputImageModal,
         previewBody: arg.previewPrompt,
         escape: nowChatroom.type === 'character' && nowChatroom.escapeOutput,
@@ -1628,6 +1763,10 @@ export async function sendChat(chatProcessIndex = -1,arg:{
             return false
         }
 
+        if (arg.continue) {
+            DBState.db.characters[selectedChar].chats[selectedChat].message[msgIndex].pluginMessageUpdatedAt = Date.now()
+        }
+
         addRerolls(generationId, Object.values(lastResponseChunk))
 
         DBState.db.characters[selectedChar].chats[selectedChat] = runCurrentChatFunction(DBState.db.characters[selectedChar].chats[selectedChat])
@@ -1661,9 +1800,10 @@ export async function sendChat(chatProcessIndex = -1,arg:{
             let mess = msg[1]
             let msgIndex = DBState.db.characters[selectedChar].chats[selectedChat].message.length
             let result2 = await processScriptFull(nowChatroom, reformatContent(mess), 'editoutput', msgIndex)
+            let beforeChat: Message | undefined
             if(i === 0 && arg.continue){
                 msgIndex -= 1
-                let beforeChat = DBState.db.characters[selectedChar].chats[selectedChat].message[msgIndex]
+                beforeChat = DBState.db.characters[selectedChar].chats[selectedChat].message[msgIndex]
                 result2 = await processScriptFull(nowChatroom, reformatContent(beforeChat.data + mess), 'editoutput', msgIndex)
             }
             if(DBState.db.removeIncompleteResponse){
@@ -1674,7 +1814,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
             result = inlayResult.text
             emoChanged = result2.emoChanged
             if(i === 0 && arg.continue){
-                DBState.db.characters[selectedChar].chats[selectedChat].message[msgIndex] = {
+                const replacement: Message = {
                     role: 'char',
                     data: result,
                     saying: currentChar.chaId,
@@ -1682,7 +1822,9 @@ export async function sendChat(chatProcessIndex = -1,arg:{
                     generationInfo,
                     promptInfo,
                     chatId: generationId,
-                }       
+                }
+                DBState.db.characters[selectedChar].chats[selectedChat].message[msgIndex] =
+                    applyContinueMessageIdentity(beforeChat! as any, replacement as any) as Message
                 if(inlayResult.promise){
                     const p = await inlayResult.promise
                     DBState.db.characters[selectedChar].chats[selectedChat].message[msgIndex].data = p

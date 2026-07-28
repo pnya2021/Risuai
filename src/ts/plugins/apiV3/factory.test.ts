@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { parse } from 'acorn'
 
-import { invokeSandboxCleanupCallback, SandboxHost } from './factory'
+import { cancelSandboxCallbackInvocation, invokeSandboxCleanupCallback, SandboxHost } from './factory'
 import { serializePluginApiError } from './illustration/errors'
 
 vi.stubGlobal('ImageBitmap', class ImageBitmap {})
@@ -385,6 +385,29 @@ describe('SandboxHost binary RPC safety', () => {
 })
 
 describe('SandboxHost callback and teardown lifecycle', () => {
+  it('cancels exactly one pending callback invocation without releasing its registration', async () => {
+    let callback!: (() => Promise<unknown>) & { release: () => void }
+    const { dispatch, host, posted } = createHarness({
+      capture: (received: typeof callback) => { callback = received },
+    })
+    dispatch({
+      type: 'CALL_ROOT', reqId: 'capture-cancellable', method: 'capture',
+      args: [{ __type: 'CALLBACK_REF', id: 'cancellable-callback' }],
+    })
+    await postedMessage(posted, 'RESPONSE', 'capture-cancellable')
+
+    const invocation = callback()
+    const request = await postedMessage(posted, 'INVOKE_CALLBACK')
+    expect(cancelSandboxCallbackInvocation(invocation)).toBe(true)
+    await expect(invocation).rejects.toMatchObject({ name: 'PluginApiError', code: 'ABORTED' })
+    expect(cancelSandboxCallbackInvocation(invocation)).toBe(false)
+    expect((host as any).callbackWrapperCache.has('cancellable-callback')).toBe(true)
+
+    dispatch({ type: 'CALLBACK_RETURN', reqId: request.message.reqId, result: 'late' })
+    callback.release()
+    expect((host as any).callbackWrapperCache.has('cancellable-callback')).toBe(false)
+  })
+
   it('reference-counts callback registrations and releases only the final host wrapper reference', async () => {
     let callbacks: Array<(() => Promise<unknown>) & { release?: () => void }> = []
     const { dispatch, host, posted } = createHarness({

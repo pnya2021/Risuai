@@ -1394,6 +1394,26 @@ interface MessageSnapshot extends MessageRef {
     };
 }
 
+type MessageCommitCause = 'model' | 'continue' | 'reroll' | 'trigger';
+type MessageCommitDurability = 'state' | 'persisted';
+
+type MessageCommittedEvent = {
+    eventId: string;
+    change: 'created' | 'updated';
+    cause: MessageCommitCause;
+    durability: MessageCommitDurability;
+} & (
+    | { message: MessageSnapshot; unavailable?: never }
+    | {
+        message?: never;
+        unavailable: MessageRef & {
+            reason: 'resource-limit';
+            contentUtf16: number;
+            callerAttachmentCount: number;
+        };
+    }
+);
+
 interface CurrentMessageMetadataPatchInput {
     target: MessageRef;
     expectedRevision: Revision;
@@ -2447,6 +2467,20 @@ interface RisuaiPluginAPI {
         name: string;
         mediaType: string;
     }>;
+
+    /** Subscribes to live A1 character-message commits. Events are not replayed. */
+    onMessageCommitted(
+        listener: (event: MessageCommittedEvent) => void | Promise<void>,
+        options?: {
+            scope?: 'current' | 'all';
+            roles?: Array<'user' | 'char'>;
+            causes?: MessageCommitCause[];
+            durability?: MessageCommitDurability;
+        },
+    ): Promise<{ subscriptionId: string }>;
+
+    /** Stops a message subscription owned by this plugin instance. */
+    offMessageCommitted(subscriptionId: string): Promise<void>;
 
     /** Returns one complete caller-personalized committed message. */
     getMessageSnapshot(target: MessageRef): Promise<MessageSnapshot>;

@@ -60,6 +60,7 @@ interface AbortSignalRef {
 
 const CLEANUP_CALLBACK_INVOKER = Symbol('cleanupCallbackInvoker')
 const invokedCleanupCallbacks = new WeakSet<Function>()
+const sandboxCallbackInvocationCancellations = new WeakMap<object, () => boolean>()
 type CallbackWrapper = ((...args: any[]) => Promise<any>) & {
     release: () => void
     [CLEANUP_CALLBACK_INVOKER]: (...args: any[]) => Promise<any>
@@ -71,6 +72,12 @@ export function invokeSandboxCleanupCallback(callback: (...args: any[]) => unkno
     if (invokedCleanupCallbacks.has(wrapper)) return Promise.resolve()
     invokedCleanupCallbacks.add(wrapper)
     return wrapper[CLEANUP_CALLBACK_INVOKER](...args)
+}
+
+/** Rejects one in-flight guest callback RPC without releasing its shared callback registration. */
+export function cancelSandboxCallbackInvocation(invocation: unknown) {
+    if ((typeof invocation !== 'object' && typeof invocation !== 'function') || invocation === null) return false
+    return sandboxCallbackInvocationCancellations.get(invocation)?.() ?? false
 }
 
 interface CallbackWrapperEntry {
@@ -1064,13 +1071,13 @@ export class SandboxHost {
                     return cached.wrapper;
                 }
 
-                const invoke = async (cleanup: boolean, innerArgs: any[]) => {
+                const invoke = (cleanup: boolean, innerArgs: any[]) => {
                     if (!this.isCurrentRun(runGeneration) || (!cleanup && !this.isCallbackAuthorized())) {
                         if (this.isCurrentRun(runGeneration)) this.terminateUnauthorized()
-                        throw new PluginApiError('ABORTED', 'Plugin sandbox terminated');
+                        return Promise.reject(new PluginApiError('ABORTED', 'Plugin sandbox terminated'));
                     }
-                    return new Promise((resolve, reject) => {
-                        const reqId = 'cb_req_' + Math.random().toString(36).substring(2);
+                    const reqId = 'cb_req_' + Math.random().toString(36).substring(2);
+                    const invocation = new Promise((resolve, reject) => {
                         this.pendingCallbacks.set(reqId, { resolve, reject, cleanup, runGeneration });
 
                         // AbortSignal cannot be structured-cloned for postMessage.
@@ -1113,6 +1120,18 @@ export class SandboxHost {
                             reject(deserializePluginApiError(undefined));
                         }
                     });
+                    sandboxCallbackInvocationCancellations.set(invocation, () => {
+                        const pending = this.pendingCallbacks.get(reqId)
+                        if (!pending || pending.runGeneration !== runGeneration) return false
+                        this.pendingCallbacks.delete(reqId)
+                        pending.reject(new PluginApiError('ABORTED', 'Plugin callback invocation cancelled'))
+                        return true
+                    })
+                    void invocation.then(
+                        () => { sandboxCallbackInvocationCancellations.delete(invocation) },
+                        () => { sandboxCallbackInvocationCancellations.delete(invocation) },
+                    )
+                    return invocation
                 }
                 const wrapper = ((...innerArgs: any[]) => invoke(false, innerArgs)) as CallbackWrapper;
                 wrapper[CLEANUP_CALLBACK_INVOKER] = (...innerArgs: any[]) => invoke(true, innerArgs)
