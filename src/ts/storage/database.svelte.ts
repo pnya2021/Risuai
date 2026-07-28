@@ -857,6 +857,18 @@ export interface Database{
     language: string
     translator: string
     plugins: RisuPlugin[]
+    /** Host-private replay receipts for restricted V3 message metadata patches. */
+    pluginMessagePatchReceipts?: Array<{
+        version: 1
+        principalId: string
+        operation: 'chat.message-patch.v1'
+        idempotencyKey: string
+        digest: string
+        target: { characterId: string; conversationId: string; messageId: string }
+        result: unknown
+        completedAt: number
+        expiresAt: number
+    }>
     currentPluginProvider: string
     zoomsize:number
     customBackground:string
@@ -1876,6 +1888,20 @@ export interface Message{
     otherUser?:boolean
     disabled?:false|true|'allBefore'
     isComment?:boolean
+    /** Principal-namespaced state used by restricted V3 message APIs. */
+    pluginMessageState?: Record<string, {
+        metadata: Record<string, any>
+        /** Reserved for later attachment slices; H11-A never creates or exposes these. */
+        attachments: Array<{
+            inlayId: string
+            presentation?: 'inline' | 'styled' | 'model-input'
+            metadata?: any
+            [key: string]: unknown
+        }>
+        updatedAt?: number
+    }>
+    /** Last Host-owned restricted mutation timestamp. */
+    pluginMessageUpdatedAt?: number
 }
 
 export interface MessageGenerationInfo{

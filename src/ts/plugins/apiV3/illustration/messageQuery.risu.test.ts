@@ -85,6 +85,28 @@ describe('Risu message query adapter', () => {
             .toBe('hydrated-message')
     })
 
+    it('retains persisted principal message state supplied by cold hydration', async () => {
+        const h = host()
+        const chat = h.root.characters[0].chats[0]
+        chat.message = [{ role: 'char', data: `${COLD}cold-key` }]
+        h.dependencies.preLoadChat = async () => {
+            chat.message = [{
+                role: 'char', data: 'hydrated', chatId: 'hydrated-message',
+                pluginMessageState: {
+                    'plugin-a': { metadata: { ledger: 1 }, attachments: [] },
+                },
+            }]
+        }
+        h.adapter = createRisuMessageQueryAdapter(h.dependencies)
+
+        await h.adapter.prepareConversation({ characterId: 'group-1', conversationId: 'conversation-1' })
+        expect(h.adapter.resolveConversation({
+            characterId: 'group-1', conversationId: 'conversation-1',
+        })?.messages[0].pluginMessageState).toEqual({
+            'plugin-a': { metadata: { ledger: 1 }, attachments: [] },
+        })
+    })
+
     it('fails closed when cold hydration remains a pointer, produces a synthetic failure, or corrupts messages', async () => {
         for (const replacement of [
             [{ role: 'char', data: `${COLD}cold-key` }],

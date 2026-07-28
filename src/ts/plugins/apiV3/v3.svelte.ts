@@ -9,7 +9,7 @@ import { v4 } from "uuid";
 import { sleep } from "src/ts/util";
 import { alertConfirm, alertError, alertNormal } from "src/ts/alert";
 import { language } from "src/lang";
-import { checkCharOrder, fetchPluginPolicyNative, forageStorage, getAssetStorageRevision, getFetchLogs, readImage } from "src/ts/globalApi.svelte";
+import { checkCharOrder, fetchPluginPolicyNative, forageStorage, getAssetStorageRevision, getFetchLogs, readImage, requestDatabaseSaveNow, waitForMessagePersistence } from "src/ts/globalApi.svelte";
 import { changeColorScheme, updateColorScheme, updateTextThemeAndCSS, type ColorScheme } from "src/ts/gui/colorscheme";
 import { isNodeServer, isTauri } from "src/ts/platform";
 import { get } from "svelte/store";
@@ -59,6 +59,8 @@ import { getPixaiInstallLifecycle, getPixaiSessionBroker } from './localModel/pi
 import { PixaiLocalModel, withPixaiInferenceCapability } from './localModel/pixaiLocalModel';
 import { MESSAGE_QUERY_CAPABILITY_IDS, MessageQueryService, type MessageRef } from './illustration/messageQuery';
 import { createRisuMessageQueryAdapter } from './illustration/messageQuery.risu';
+import { MESSAGE_PATCH_CAPABILITY_IDS, MessagePatchService, type MessagePatchInput } from './illustration/messagePatch';
+import { createRisuMessagePatchAdapter } from './illustration/messagePatch.risu';
 
 /*
     V3 API for RisuAI Plugins
@@ -644,6 +646,26 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
             preLoadChat,
             coldStorageHeader,
             listInlayAssets,
+        }),
+        {
+            requirePermission: (executionContext, permission) => pluginPermissionService.require(
+                executionContext,
+                permission,
+                { locale: DBState.db.language === 'ko' ? 'ko' : 'en' },
+            ),
+        },
+    )
+    const messagePatch = new MessagePatchService(
+        context,
+        createRisuMessagePatchAdapter({
+            getDatabase,
+            getCurrentCharacter,
+            getCurrentChat,
+            preLoadChat,
+            coldStorageHeader,
+            listInlayAssets,
+            waitForMessagePersistence,
+            requestDatabaseSaveNow,
         }),
         {
             requirePermission: (executionContext, permission) => pluginPermissionService.require(
@@ -1302,6 +1324,7 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
                     'context.modules-installed.v1',
                     'secrets.write-only.v1',
                     ...MESSAGE_QUERY_CAPABILITY_IDS,
+                    ...MESSAGE_PATCH_CAPABILITY_IDS,
                     ...INLAY_LIFECYCLE_CAPABILITY_IDS,
                     ...DEVICE_CACHE_CAPABILITY_IDS,
                 ],
@@ -1346,6 +1369,7 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
             messageQuery.getLatestCommittedMessage(options),
         getRecentCommittedMessages: (options: Parameters<MessageQueryService['getRecentCommittedMessages']>[0]) =>
             messageQuery.getRecentCommittedMessages(options),
+        patchMessage: (input: MessagePatchInput) => messagePatch.patchMessage(input),
         //Internal use APIs
         _getOldKeys: () => {
             return Object.keys(oldApis)

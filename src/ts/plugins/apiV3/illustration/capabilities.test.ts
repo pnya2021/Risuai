@@ -5,6 +5,7 @@ import { INLAY_LIFECYCLE_CAPABILITY_IDS } from './inlayLifecycle'
 import { DEVICE_CACHE_CAPABILITY_IDS } from './deviceCache'
 import { withPixaiInferenceCapability } from '../localModel/pixaiLocalModel'
 import { MESSAGE_QUERY_CAPABILITY_IDS } from './messageQuery'
+import { MESSAGE_PATCH_CAPABILITY_IDS } from './messagePatch'
 
 const context = {
     principalId: '11111111-1111-4111-8111-111111111111',
@@ -176,6 +177,39 @@ describe('V3 capability discovery', () => {
             runtime: { registeredServices: new Set(MESSAGE_QUERY_CAPABILITY_IDS), hasCurrentContext: true },
         })
         expect(callable['chat.message-query.v1']).toMatchObject({ available: true, permissionState: 'granted' })
+    })
+
+    it('advertises only the narrow message patch after registration, chatWrite, and current context', async () => {
+        expect(MESSAGE_PATCH_CAPABILITY_IDS).toEqual(['chat.message-patch.v1'])
+        const beforeRegistration = await getCapabilities(context, [...MESSAGE_PATCH_CAPABILITY_IDS], {
+            permissionState: vi.fn(async () => 'granted' as const),
+            runtime: { registeredServices: new Set(), hasCurrentContext: true },
+        })
+        expect(beforeRegistration['chat.message-patch.v1']).toMatchObject({
+            available: false, reason: 'temporarily-unavailable',
+        })
+        const permissionRequired = await getCapabilities(context, [...MESSAGE_PATCH_CAPABILITY_IDS], {
+            permissionState: async () => 'not-requested',
+            runtime: { registeredServices: new Set(MESSAGE_PATCH_CAPABILITY_IDS), hasCurrentContext: true },
+        })
+        expect(permissionRequired['chat.message-patch.v1']).toMatchObject({
+            available: false, reason: 'permission-required', permission: 'chatWrite',
+        })
+        const noContext = await getCapabilities(context, [...MESSAGE_PATCH_CAPABILITY_IDS], {
+            permissionState: async () => 'granted',
+            runtime: { registeredServices: new Set(MESSAGE_PATCH_CAPABILITY_IDS), hasCurrentContext: false },
+        })
+        expect(noContext['chat.message-patch.v1']).toMatchObject({
+            available: false, reason: 'no-current-context',
+        })
+        const callable = await getCapabilities(context, [...MESSAGE_PATCH_CAPABILITY_IDS], {
+            permissionState: async () => 'granted',
+            runtime: { registeredServices: new Set(MESSAGE_PATCH_CAPABILITY_IDS), hasCurrentContext: true },
+        })
+        expect(callable['chat.message-patch.v1']).toMatchObject({
+            available: true, permissionState: 'granted', permission: 'chatWrite',
+        })
+        expect(callable['inlay.atomic-attach.v1']).toBeUndefined()
     })
 
     it('health-gates PixAI registration only when discovery actually requests it', async () => {

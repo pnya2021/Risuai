@@ -1384,6 +1384,24 @@ interface MessageSnapshot extends MessageRef {
     };
 }
 
+interface CurrentMessageMetadataPatchInput {
+    target: MessageRef;
+    expectedRevision: Revision;
+    patch: {
+        op: 'setPluginMetadata';
+        key: string;
+        value: PluginJsonValue;
+    };
+    idempotencyKey: string;
+    persist: 'immediate';
+}
+
+interface MessagePatchResult {
+    changed: boolean;
+    message: MessageSnapshot;
+    commitId: string;
+}
+
 interface CurrentContextRef {
     characterId: CharacterId;
     conversationId: ConversationId;
@@ -2411,6 +2429,9 @@ interface RisuaiPluginAPI {
         limit?: number;
         maxTotalUtf16?: number;
     }): Promise<{ items: MessageSnapshot[]; truncatedBefore: boolean }>;
+
+    /** Atomically checkpoints caller-owned metadata on one current committed message. */
+    patchMessage(input: CurrentMessageMetadataPatchInput): Promise<MessagePatchResult>;
 
     /**
      * Unwraps a SafeClassArray into a standard array

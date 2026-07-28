@@ -1,6 +1,6 @@
 import { PluginApiError } from './errors'
 import type { PluginExecutionContext, PluginPermissionId } from './permissions'
-import { createRevision as createCanonicalRevision } from './revision'
+import { canonicalJson, createRevision as createCanonicalRevision, validateJsonLimits } from './revision'
 
 export const MESSAGE_QUERY_CAPABILITY_IDS = ['chat.message-query.v1'] as const
 
@@ -10,11 +10,16 @@ const DEFAULT_RECENT_UTF16 = 12_000
 const MAX_RECENT_UTF16 = 65_536
 const MAX_SNAPSHOT_UTF16 = 262_144
 const MAX_SNAPSHOT_JSON_BYTES = 2_097_152
+const MAX_CALLER_METADATA_JSON_BYTES = 65_536
 
 export interface MessageRef {
     characterId: string
     conversationId: string
     messageId: string
+}
+
+export type PluginJsonValue = null | boolean | number | string | PluginJsonValue[] | {
+    [key: string]: PluginJsonValue
 }
 
 export interface MessageQueryHostMessage {
@@ -24,6 +29,8 @@ export interface MessageQueryHostMessage {
     chatId?: string
     time?: number
     generationInfo?: { generationId?: string }
+    pluginMessageState?: unknown
+    pluginMessageUpdatedAt?: number
 }
 
 export interface MessageQueryConversationLocation {
@@ -57,7 +64,7 @@ export interface MessageSnapshot extends MessageRef {
     generationId?: string
     createdAt?: number
     updatedAt: number
-    callerPluginState: { metadata: Record<string, never>; attachments: never[] }
+    callerPluginState: { metadata: Record<string, PluginJsonValue>; attachments: never[] }
 }
 
 type QueryKind =
@@ -96,12 +103,19 @@ const requireNonEmpty = (value: unknown, name: string) => {
 const isStableMessageId = (value: unknown): value is string =>
     typeof value === 'string' && value.length > 0 && !value.startsWith('legacy-message:')
 
-const canonicalMessageSource = (message: MessageQueryHostMessage) => JSON.stringify([
+export const messageRevisionValue = (message: MessageQueryHostMessage) => ({
+    role: message.role,
+    data: message.data,
+    saying: message.saying ?? null,
+    generationId: message.generationInfo?.generationId ?? null,
+    pluginMessageState: message.pluginMessageState ?? {},
+})
+
+const canonicalMessageSource = (message: MessageQueryHostMessage) => canonicalJson([
     message.chatId ?? null,
-    message.role,
-    message.data,
-    message.saying ?? null,
-    message.generationInfo?.generationId ?? null,
+    messageRevisionValue(message),
+    message.time ?? null,
+    message.pluginMessageUpdatedAt ?? null,
 ])
 
 const sourceSignature = (location: MessageQueryConversationLocation) => JSON.stringify({
@@ -111,9 +125,53 @@ const sourceSignature = (location: MessageQueryConversationLocation) => JSON.str
     messages: location.messages.map(canonicalMessageSource),
 })
 
-const projectContent = (raw: string, recognized: ReadonlySet<string>) =>
+export const projectMessageContent = (raw: string, recognized: ReadonlySet<string>) =>
     raw.replace(/\{\{(?:inlay|inlayed|inlayeddata)::([^{}]+)\}\}/gu, (token, id: string) =>
         recognized.has(id) ? '' : token)
+
+const plainRecord = (value: unknown): value is Record<string, unknown> => {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+    const prototype = Object.getPrototypeOf(value)
+    return prototype === Object.prototype || prototype === null
+}
+
+const descriptorValue = (record: Record<string, unknown>, key: string) => {
+    const descriptor = Object.getOwnPropertyDescriptor(record, key)
+    if (!descriptor) return undefined
+    if (!descriptor.enumerable || !Object.hasOwn(descriptor, 'value')) {
+        throw new PluginApiError('INTERNAL', 'Plugin message state is invalid', { retryable: true })
+    }
+    return descriptor.value
+}
+
+export const cloneCallerMessageMetadata = (
+    message: MessageQueryHostMessage,
+    principalId: string,
+): Record<string, PluginJsonValue> => {
+    const root = message.pluginMessageState
+    if (root === undefined) return {}
+    if (!plainRecord(root)) {
+        throw new PluginApiError('INTERNAL', 'Plugin message state is invalid', { retryable: true })
+    }
+    const state = descriptorValue(root, principalId)
+    if (state === undefined) return {}
+    if (!plainRecord(state)) {
+        throw new PluginApiError('INTERNAL', 'Caller message state is invalid', { retryable: true })
+    }
+    const metadata = descriptorValue(state, 'metadata')
+    if (!plainRecord(metadata)) {
+        throw new PluginApiError('INTERNAL', 'Caller message state is invalid', { retryable: true })
+    }
+    try {
+        return JSON.parse(validateJsonLimits(metadata, {
+            maxDepth: 32,
+            maxBytes: MAX_CALLER_METADATA_JSON_BYTES,
+        })) as Record<string, PluginJsonValue>
+    } catch (error) {
+        if (error instanceof PluginApiError && error.code === 'RESOURCE_LIMIT') throw error
+        throw new PluginApiError('INTERNAL', 'Caller message state is invalid', { retryable: true })
+    }
+}
 
 function normalizeRoles(value: Array<'user' | 'char'> | undefined) {
     if (value === undefined) return ['user', 'char'] as Array<'user' | 'char'>
@@ -336,21 +394,30 @@ export class MessageQueryService {
         const message = selected.message
         const messageId = message.chatId
         if (!isStableMessageId(messageId)) throw notFound()
-        const revision = await this.awaitBoundary(this.createRevision({
-            role: message.role,
-            data: message.data,
-            saying: message.saying ?? null,
-            generationId: message.generationInfo?.generationId ?? null,
-        }), baseline, scope)
+        const revision = await this.awaitBoundary(this.createRevision(messageRevisionValue(message)), baseline, scope)
+        const stateRoot = plainRecord(message.pluginMessageState) ? message.pluginMessageState : undefined
+        const callerState = stateRoot && plainRecord(descriptorValue(stateRoot, this.context.principalId))
+            ? descriptorValue(stateRoot, this.context.principalId) as Record<string, unknown>
+            : undefined
+        const callerUpdatedAt = callerState && typeof descriptorValue(callerState, 'updatedAt') === 'number'
+            ? descriptorValue(callerState, 'updatedAt') as number
+            : 0
         const result: MessageSnapshot = {
             characterId: baseline.location.characterId,
             conversationId: baseline.location.conversationId,
             messageId,
             role: message.role,
-            content: projectContent(message.data, recognizedInlayIds),
+            content: projectMessageContent(message.data, recognizedInlayIds),
             revision,
-            updatedAt: typeof message.time === 'number' ? message.time : 0,
-            callerPluginState: { metadata: {}, attachments: [] },
+            updatedAt: Math.max(
+                typeof message.time === 'number' ? message.time : 0,
+                typeof message.pluginMessageUpdatedAt === 'number' ? message.pluginMessageUpdatedAt : 0,
+                callerUpdatedAt,
+            ),
+            callerPluginState: {
+                metadata: cloneCallerMessageMetadata(message, this.context.principalId),
+                attachments: [],
+            },
         }
         if (message.role === 'char') {
             if (baseline.location.memberCharacterIds === undefined) {
@@ -445,7 +512,7 @@ export class MessageQueryService {
                 break
             }
             const candidate = baseline.selection[index]
-            const contentUtf16 = projectContent(candidate.message.data, recognized).length
+            const contentUtf16 = projectMessageContent(candidate.message.data, recognized).length
             if (contentUtf16 > maxTotalUtf16 - totalUtf16) {
                 truncatedBefore = true
                 break

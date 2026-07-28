@@ -48,6 +48,10 @@ import { databasePersistenceCoordinator } from './storage/databasePersistenceCoo
 import { isLocalNetworkUrl } from "./network/localNetwork";
 import { decodeProxyJobWsChunk, formatProxyStreamErrorMessage, parseProxyJobWsEvent } from "./network/proxyJobWs";
 import { getNodeServerProxyAuth } from "./storage/nodeStorage";
+import {
+    messagePersistenceWaiter,
+    type MessagePersistenceBatch,
+} from './plugins/apiV3/illustration/messagePatch.risu';
 
 export const forageStorage = new AutoStorage()
 
@@ -323,8 +327,26 @@ export let saving = $state({
 export let requiresFullEncoderReload = $state({
     state: false
 })
+
+let requestDatabaseSaveNowImpl: (() => void) | undefined
+
+export function requestDatabaseSaveNow() {
+    requestDatabaseSaveNowImpl?.()
+}
+
+export function waitForMessagePersistence(
+    target: { characterId: string; conversationId: string; messageId: string },
+    revision: string,
+) {
+    const pending = messagePersistenceWaiter.wait(target, revision)
+    requiresFullEncoderReload.state = true
+    requestDatabaseSaveNow()
+    return pending
+}
+
 export async function saveDb() {
     let changed = false
+    requestDatabaseSaveNowImpl = () => { changed = true }
     syncDrive()
     let gotChannel = false
     const sessionID = v4()
@@ -448,17 +470,8 @@ export async function saveDb() {
 
         saving.state = true
         changed = false
+        let persistenceBatch: MessagePersistenceBatch | undefined
         try {
-
-            if (requiresFullEncoderReload.state) {
-                encoder = new RisuSaveEncoder()
-                await encoder.init(getDatabase(), {
-                    compression: forageStorage.isAccount,
-                    skipRemoteSavingOnCharacters: false
-                })
-                requiresFullEncoderReload.state = false
-            }
-
             let toSave = safeStructuredClone(changeTracker)
             changeTracker.character = changeTracker.character.length === 0 ? [] : [changeTracker.character[0]]
             changeTracker.chat = changeTracker.chat.length === 0 ? [] : [changeTracker.chat[0]]
@@ -466,22 +479,43 @@ export async function saveDb() {
             changeTracker.modules = false
             if (gotChannel) {
                 //Data is saved in other tab
+                if (messagePersistenceWaiter.hasPending()) changed = true
                 await sleep(1000)
                 continue
             }
             if (channel) {
                 channel.postMessage(sessionID)
             }
-            let db = getDatabase()
+            const hasPersistenceWaiters = messagePersistenceWaiter.hasPending()
+            let db = hasPersistenceWaiters ? getDatabase({ snapshot: true }) : getDatabase()
             if (!db.characters) {
+                if (hasPersistenceWaiters) changed = true
                 await sleep(1000)
                 continue
+            }
+
+            if (hasPersistenceWaiters) {
+                persistenceBatch = await messagePersistenceWaiter.capture(db)
+            }
+
+            if (requiresFullEncoderReload.state) {
+                encoder = new RisuSaveEncoder()
+                await encoder.init(db, {
+                    compression: forageStorage.isAccount,
+                    skipRemoteSavingOnCharacters: false
+                })
+                requiresFullEncoderReload.state = false
             }
 
             const persistenceGeneration = databasePersistenceCoordinator.captureGeneration()
             await encoder.set(db, toSave)
             const encoded = encoder.encode()
             if (!encoded) {
+                if (persistenceBatch) {
+                    messagePersistenceWaiter.release(persistenceBatch)
+                    persistenceBatch = undefined
+                    changed = true
+                }
                 await sleep(1000)
                 continue
             }
@@ -498,9 +532,17 @@ export async function saveDb() {
                 }
             })
             if (!write.executed) {
+                if (persistenceBatch) {
+                    messagePersistenceWaiter.release(persistenceBatch)
+                    persistenceBatch = undefined
+                }
                 requiresFullEncoderReload.state = true
                 changed = true
             } else {
+                if (persistenceBatch) {
+                    messagePersistenceWaiter.acknowledge(persistenceBatch)
+                    persistenceBatch = undefined
+                }
                 if (forageStorage.isAccount) await sleep(3000)
                 if (!forageStorage.isAccount) await getDbBackups()
                 savetrys = 0
@@ -508,6 +550,10 @@ export async function saveDb() {
                 await sleep(500)
             }
         } catch (error) {
+            if (persistenceBatch) {
+                messagePersistenceWaiter.fail(persistenceBatch, error)
+                persistenceBatch = undefined
+            }
             savetrys += 1
             if (savetrys > 4) {
                 alertError(error)

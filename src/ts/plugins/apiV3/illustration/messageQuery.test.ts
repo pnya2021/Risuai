@@ -103,6 +103,47 @@ describe('message query core', () => {
         expect(changed.revision).not.toBe(first.revision)
     })
 
+    it('projects only cloned caller metadata and revisions all principals and future attachment state', async () => {
+        const h = harness([message('m2', 'char', 'same', {
+            pluginMessageState: {
+                [context().principalId]: {
+                    metadata: { ledger: { prefix: 1 } },
+                    attachments: [{ inlayId: 'future-own' }],
+                },
+                foreign: { metadata: { secret: true }, attachments: [{ inlayId: 'future-foreign' }] },
+            },
+            pluginMessageUpdatedAt: 9,
+        })])
+        const first = await h.service.getMessageSnapshot(target)
+        expect(first).toMatchObject({
+            updatedAt: 9,
+            callerPluginState: { metadata: { ledger: { prefix: 1 } }, attachments: [] },
+        })
+        expect(JSON.stringify(first)).not.toContain('secret')
+        ;(first.callerPluginState.metadata.ledger as { prefix: number }).prefix = 99
+        expect((await h.service.getMessageSnapshot(target)).callerPluginState.metadata)
+            .toEqual({ ledger: { prefix: 1 } })
+
+        ;(h.state.messages[0].pluginMessageState as any).foreign.metadata.secret = false
+        const foreignChanged = await h.service.getMessageSnapshot(target)
+        expect(foreignChanged.revision).not.toBe(first.revision)
+        ;(h.state.messages[0].pluginMessageState as any).foreign.attachments.push({ inlayId: 'later' })
+        expect((await h.service.getMessageSnapshot(target)).revision).not.toBe(foreignChanged.revision)
+    })
+
+    it('conflicts when plugin message state changes across an async query boundary', async () => {
+        const h = harness([message('m2', 'char', 'same', {
+            pluginMessageState: { foreign: { metadata: { version: 1 }, attachments: [] } },
+        })])
+        h.adapter.recognizedInlayIds = async () => {
+            ;(h.state.messages[0].pluginMessageState as any).foreign.metadata.version = 2
+            return new Set()
+        }
+        await expect(h.service.getMessageSnapshot(target)).rejects.toMatchObject({
+            code: 'CONFLICT', retryable: true,
+        })
+    })
+
     it('fails closed for missing, legacy, and duplicate message identities', async () => {
         for (const [messages, messageId] of [
             [[message(undefined, 'char', 'legacy')], 'm2'],
