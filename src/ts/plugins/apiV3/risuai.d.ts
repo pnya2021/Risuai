@@ -1234,6 +1234,16 @@ interface PluginCapability {
     limits?: Record<string, string | number | boolean>;
 }
 
+interface OwnedInlayReadOptions {
+    ifRevision: string;
+    maxBytes: number;
+}
+
+interface OwnedInlayRead extends OwnedInlayDescriptor {
+    mediaType: string;
+    data: Uint8Array;
+}
+
 type LocalModelProfileId = 'pixai-tagger-v0.9-onnx';
 type LocalModelProvider = 'auto' | 'webgpu' | 'wasm' | 'node';
 type LocalModelSessionId = string;
@@ -2225,6 +2235,9 @@ interface RisuaiPluginAPI {
 
     /** Creates an image Inlay owned by this plugin in the current character context. */
     createInlay(data: Uint8Array, options: OwnedInlayCreateOptions): Promise<OwnedInlayDescriptor>;
+
+    /** Reads bytes from an image Inlay owned by this plugin at an expected revision. */
+    readOwnedInlay(id: string, options: OwnedInlayReadOptions): Promise<OwnedInlayRead | null>;
 
     /** Deletes an unreferenced Inlay owned by this plugin. */
     deleteInlay(id: string, options?: { expectedRevision?: string }): Promise<OwnedInlayDeleteResult>;

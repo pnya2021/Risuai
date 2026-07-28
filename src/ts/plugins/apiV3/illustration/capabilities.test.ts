@@ -112,12 +112,14 @@ describe('V3 capability discovery', () => {
     it('registers only the usable owned Inlay lifecycle and still gates it on inlayWrite', async () => {
         expect(INLAY_LIFECYCLE_CAPABILITY_IDS).toEqual([
             'inlay.create.v1',
+            'inlay.read.v1',
             'inlay.delete-own.v1',
         ])
         expect(INLAY_LIFECYCLE_CAPABILITY_IDS).not.toContain('inlay.atomic-attach.v1')
 
         const granted = await getCapabilities(context, [
             'inlay.create.v1',
+            'inlay.read.v1',
             'inlay.delete-own.v1',
             'inlay.atomic-attach.v1',
         ], {
@@ -125,6 +127,7 @@ describe('V3 capability discovery', () => {
             runtime: { registeredServices: new Set(INLAY_LIFECYCLE_CAPABILITY_IDS) },
         })
         expect(granted['inlay.create.v1']).toMatchObject({ available: true, permission: 'inlayWrite' })
+        expect(granted['inlay.read.v1']).toMatchObject({ available: true, permission: 'inlayWrite' })
         expect(granted['inlay.delete-own.v1']).toMatchObject({ available: true, permission: 'inlayWrite' })
         expect(granted['inlay.atomic-attach.v1']).toMatchObject({
             available: false,
@@ -147,6 +150,22 @@ describe('V3 capability discovery', () => {
         expect(descriptors['local-model.pixai-v0.9.v1']).toMatchObject({
             available: false,
             reason: 'temporarily-unavailable',
+        })
+
+        const unavailable = await getCapabilities(context, ['inlay.read.v1'], {
+            permissionState: async () => 'granted',
+            runtime: { registeredServices: new Set(), hasCurrentContext: false },
+        })
+        expect(unavailable['inlay.read.v1']).toMatchObject({
+            available: false, reason: 'temporarily-unavailable', permission: 'inlayWrite',
+        })
+
+        const permissionRequired = await getCapabilities(context, ['inlay.read.v1'], {
+            permissionState: async () => 'denied',
+            runtime: { registeredServices: new Set(['inlay.read.v1']), hasCurrentContext: false },
+        })
+        expect(permissionRequired['inlay.read.v1']).toMatchObject({
+            available: false, reason: 'permission-required', permission: 'inlayWrite', permissionState: 'denied',
         })
     })
 

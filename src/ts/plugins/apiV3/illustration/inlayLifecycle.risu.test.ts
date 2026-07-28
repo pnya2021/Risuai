@@ -12,6 +12,13 @@ const lifecycle = {
     context: { kind: 'character' as const, characterId: 'character-1' },
 }
 
+const approvedRecord = (id = 'inlay-1') => ({
+    id,
+    name: 'image.png',
+    revision: lifecycle.revision,
+    lifecycle,
+})
+
 function harness(overrides: Record<string, unknown> = {}) {
     const stored = new Map<string, InlayAssetRecord>()
     const dependencies = {
@@ -89,6 +96,121 @@ describe('Risu owned Inlay adapter', () => {
         await expect(adapter.writeImage(new Uint8Array([1]), {
             id: 'inlay-1', name: 'image.png', lifecycle, beforeMutation: async () => undefined,
         })).rejects.toMatchObject({ name: 'PluginApiError', code: 'DECODE_FAILED' })
+    })
+
+    it('returns null for a missing raw record and sanitizes raw storage failures', async () => {
+        const missing = harness()
+        await expect(missing.adapter.readImage('missing', 10, approvedRecord('missing'))).resolves.toBeNull()
+
+        const failed = harness({
+            getInlayAssetRecord: vi.fn(async () => { throw new Error('private storage path') }),
+        })
+        await expect(failed.adapter.readImage('inlay-1', 10, approvedRecord())).rejects.toMatchObject({
+            name: 'PluginApiError', code: 'INTERNAL', retryable: true,
+        })
+    })
+
+    it('reads only an image Blob, normalizes its MIME type, and returns an independent byte copy', async () => {
+        const { adapter, stored } = harness()
+        const blob = new Blob([new Uint8Array([1, 2, 3])], { type: 'IMAGE/PNG; Charset=Binary' })
+        stored.set('inlay-1', {
+            data: blob, ext: 'png', name: 'image.png', type: 'image', lifecycle,
+        })
+
+        const result = await adapter.readImage('inlay-1', 3, approvedRecord())
+
+        expect(result).toEqual({
+            record: { id: 'inlay-1', name: 'image.png', revision: lifecycle.revision, lifecycle },
+            mediaType: 'image/png',
+            data: new Uint8Array([1, 2, 3]),
+        })
+        expect(result!.data.buffer).not.toBe(await blob.arrayBuffer())
+    })
+
+    it.each([
+        ['legacy string', 'data:image/png;base64,AQID', 'image'],
+        ['non-image record', new Blob([new Uint8Array([1])], { type: 'image/png' }), 'audio'],
+        ['non-image MIME', new Blob([new Uint8Array([1])], { type: 'audio/wav' }), 'image'],
+        ['empty MIME', new Blob([new Uint8Array([1])]), 'image'],
+    ])('rejects %s without returning bytes', async (_label, data, type) => {
+        const { adapter, stored } = harness()
+        stored.set('inlay-1', {
+            data, ext: 'png', name: 'image.png', type: type as 'image', lifecycle,
+        })
+
+        await expect(adapter.readImage('inlay-1', 10, approvedRecord())).rejects.toMatchObject({
+            name: 'PluginApiError', code: 'DECODE_FAILED',
+        })
+    })
+
+    it('accepts exact maxBytes and rejects one byte over before arrayBuffer allocation', async () => {
+        const exact = harness()
+        const exactBlob = new Blob([new Uint8Array([1, 2, 3])], { type: 'image/png' })
+        exact.stored.set('inlay-1', {
+            data: exactBlob, ext: 'png', name: 'image.png', type: 'image', lifecycle,
+        })
+        await expect(exact.adapter.readImage('inlay-1', 3, approvedRecord())).resolves.toMatchObject({
+            data: new Uint8Array([1, 2, 3]),
+        })
+
+        const over = harness()
+        const overBlob = new Blob([new Uint8Array([1])], { type: 'image/png' })
+        const arrayBuffer = vi.spyOn(overBlob, 'arrayBuffer')
+        Object.defineProperty(overBlob, 'size', { value: 33_554_433 })
+        over.stored.set('inlay-1', {
+            data: overBlob, ext: 'png', name: 'image.png', type: 'image', lifecycle,
+        })
+
+        await expect(over.adapter.readImage('inlay-1', 33_554_432, approvedRecord())).rejects.toMatchObject({
+            name: 'PluginApiError', code: 'RESOURCE_LIMIT',
+        })
+        expect(arrayBuffer).not.toHaveBeenCalled()
+    })
+
+    it('rejects caller maxBytes before allocation', async () => {
+        const { adapter, stored } = harness()
+        const blob = new Blob([new Uint8Array([1, 2, 3])], { type: 'image/png' })
+        const arrayBuffer = vi.spyOn(blob, 'arrayBuffer')
+        stored.set('inlay-1', {
+            data: blob, ext: 'png', name: 'image.png', type: 'image', lifecycle,
+        })
+
+        await expect(adapter.readImage('inlay-1', 2, approvedRecord())).rejects.toMatchObject({ code: 'RESOURCE_LIMIT' })
+        expect(arrayBuffer).not.toHaveBeenCalled()
+    })
+
+    it('rejects a raw lifecycle or descriptor mismatch against the service-approved record before allocation', async () => {
+        const { adapter, stored } = harness()
+        const blob = new Blob([new Uint8Array([1, 2, 3])], { type: 'image/png' })
+        const arrayBuffer = vi.spyOn(blob, 'arrayBuffer')
+        stored.set('inlay-1', {
+            data: blob, ext: 'png', name: 'image.png', type: 'image',
+            lifecycle: { ...lifecycle, ownerPrincipalId: 'foreign-principal' },
+        })
+
+        await expect(adapter.readImage('inlay-1', 3, approvedRecord())).rejects.toMatchObject({
+            name: 'PluginApiError', code: 'CONFLICT', retryable: true,
+        })
+        expect(arrayBuffer).not.toHaveBeenCalled()
+    })
+
+    it('detects descriptor and raw Blob MIME evidence races around byte allocation', async () => {
+        const { adapter, stored } = harness()
+        const blob = new Blob([new Uint8Array([1, 2, 3])], { type: 'image/png; charset=first' })
+        vi.spyOn(blob, 'arrayBuffer').mockImplementationOnce(async () => {
+            stored.set('inlay-1', {
+                data: new Blob([new Uint8Array([1, 2, 3])], { type: 'image/png; charset=second' }),
+                ext: 'png', name: 'image.png', type: 'image', lifecycle,
+            })
+            return new Uint8Array([1, 2, 3]).buffer
+        })
+        stored.set('inlay-1', {
+            data: blob, ext: 'png', name: 'image.png', type: 'image', lifecycle,
+        })
+
+        await expect(adapter.readImage('inlay-1', 3, approvedRecord())).rejects.toMatchObject({
+            name: 'PluginApiError', code: 'CONFLICT', retryable: true,
+        })
     })
 
     it.each(['inlay', 'inlayed', 'inlayeddata'])('finds an exact hydrated %s token', async (kind) => {
