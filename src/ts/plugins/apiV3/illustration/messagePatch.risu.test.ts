@@ -3,6 +3,7 @@ import { PluginApiError } from './errors'
 import {
     MessagePersistenceWaiter,
     createRisuMessagePatchAdapter,
+    withMessageMutationLock,
 } from './messagePatch.risu'
 
 const request = {
@@ -18,6 +19,41 @@ const request = {
     },
 }
 
+const deferred = <T>() => {
+    let resolve!: (value: T | PromiseLike<T>) => void
+    const promise = new Promise<T>((settle) => { resolve = settle })
+    return { promise, resolve }
+}
+
+const hex = (bytes: ArrayBuffer) => [...new Uint8Array(bytes)]
+    .map((value) => value.toString(16).padStart(2, '0')).join('')
+
+const ownedAsset = async (
+    idempotencyKey: string,
+    ownerPrincipalId = 'plugin-a',
+    characterId = 'character-1',
+) => {
+    const encoded = new TextEncoder().encode(JSON.stringify([
+        ownerPrincipalId, 'inlay.create.v1', idempotencyKey,
+    ]))
+    const id = `inlay_${hex(await crypto.subtle.digest('SHA-256', encoded))}`
+    return [id, {
+        name: `${id}.png`,
+        type: 'image',
+        data: new Blob([Uint8Array.of(1)], { type: 'image/png' }),
+        ext: 'png',
+        lifecycle: {
+            version: 1,
+            ownerPrincipalId,
+            operation: 'inlay.create.v1',
+            idempotencyKey,
+            argumentDigest: 'a'.repeat(64),
+            revision: `sha256:${'b'.repeat(64)}`,
+            context: { kind: 'character', characterId },
+        },
+    }] as const
+}
+
 const harness = (options: { chat?: any; character?: any } = {}) => {
     const chat: any = options.chat ?? {
         id: 'conversation-1', name: 'Chat', note: '', localLore: [],
@@ -27,6 +63,7 @@ const harness = (options: { chat?: any; character?: any } = {}) => {
         chaId: 'character-1', type: 'character', chatPage: 0, chats: [chat],
     }
     const database: any = { characters: [character] }
+    const inlayAssets = new Map<string, any>()
     const persistedSnapshots: any[] = []
     const dependencies = {
         getDatabase: vi.fn(() => database),
@@ -34,12 +71,13 @@ const harness = (options: { chat?: any; character?: any } = {}) => {
         getCurrentChat: vi.fn(() => character.chats[0]),
         preLoadChat: vi.fn(async () => undefined),
         coldStorageHeader: '__cold__',
-        listInlayAssets: vi.fn(async () => [] as Array<[string, unknown]>),
+        listInlayAssets: vi.fn(async () => [...inlayAssets.entries()] as Array<[string, unknown]>),
+        getInlayAssetRecord: vi.fn(async (id: string) => inlayAssets.get(id) ?? null),
         waitForMessagePersistence: vi.fn(async () => {
             persistedSnapshots.push(JSON.parse(JSON.stringify(database)))
         }),
         requestDatabaseSaveNow: vi.fn(),
-        createRevision: vi.fn(async (value: any) => Object.keys(value.pluginMessageState ?? {}).length === 0
+        createRevision: vi.fn(async (value: any): Promise<string> => Object.keys(value.pluginMessageState ?? {}).length === 0
             ? 'sha256:before'
             : 'sha256:after'),
         createId: vi.fn(() => 'commit-1'),
@@ -50,6 +88,7 @@ const harness = (options: { chat?: any; character?: any } = {}) => {
         chat,
         character,
         database,
+        inlayAssets,
         dependencies,
         persistedSnapshots,
     }
@@ -123,6 +162,218 @@ describe('RisuAI current-message metadata persistence', () => {
         expect(state.chat.message[0].pluginMessageUpdatedAt).toBe(updatedAt)
         expect(state.database.pluginMessagePatchReceipts).toHaveLength(2)
         expect(state.dependencies.waitForMessagePersistence).toHaveBeenCalledTimes(2)
+    })
+
+    it('attaches an existing owned Inlay at a logical UTF-16 offset', async () => {
+        const state = harness({ chat: {
+            id: 'conversation-1', message: [{
+                role: 'char', data: 'A😀B', chatId: 'message-1', time: 1,
+            }],
+        } })
+        const [inlayId, record] = await ownedAsset('staged-attach')
+        state.inlayAssets.set(inlayId, record)
+        state.dependencies.createRevision.mockImplementation(async (value: any) =>
+            value.data.includes(inlayId) ? 'sha256:attached' : 'sha256:before')
+
+        const result = await state.adapter.patchCurrentMessage({
+            ...request,
+            input: {
+                ...request.input,
+                patch: {
+                    op: 'attachInlay',
+                    inlayId,
+                    presentation: 'inline',
+                    placement: { kind: 'utf16-offset', offset: 3 },
+                    metadata: { slot: 2 },
+                },
+                idempotencyKey: 'attach-existing-1',
+            },
+        } as never)
+
+        expect(result).toMatchObject({
+            changed: true,
+            message: {
+                content: 'A😀B',
+                revision: 'sha256:attached',
+                callerPluginState: { attachments: [{
+                    inlayId, presentation: 'inline', utf16Offset: 3, metadata: { slot: 2 },
+                }] },
+            },
+        })
+        expect(state.chat.message[0].data).toBe(`A😀{{inlay::${inlayId}}}B`)
+        expect(state.persistedSnapshots).toHaveLength(1)
+    })
+
+    it('atomically replaces one managed own marker without copying old metadata', async () => {
+        const [oldId, oldRecord] = await ownedAsset('old-slot')
+        const [newId, newRecord] = await ownedAsset('new-slot')
+        const state = harness({ chat: {
+            id: 'conversation-1', message: [{
+                role: 'char', data: `A{{inlay::${oldId}}}B`, chatId: 'message-1', time: 1,
+                pluginMessageState: { 'plugin-a': {
+                    metadata: { ledger: 1 },
+                    attachments: [{ inlayId: oldId, presentation: 'inline', metadata: { old: true } }],
+                } },
+            }],
+        } })
+        state.inlayAssets.set(oldId, oldRecord)
+        state.inlayAssets.set(newId, newRecord)
+        state.dependencies.createRevision.mockImplementation(async (value: any) =>
+            value.data.includes(newId) ? 'sha256:new' : 'sha256:old')
+
+        const result = await state.adapter.patchCurrentMessage({
+            ...request,
+            input: {
+                ...request.input,
+                expectedRevision: 'sha256:old',
+                patch: {
+                    op: 'attachInlay',
+                    inlayId: newId,
+                    presentation: 'inline',
+                    placement: { kind: 'replace-own-inlay', inlayId: oldId },
+                },
+                idempotencyKey: 'replace-existing-1',
+            },
+        } as never)
+
+        expect(state.chat.message[0].data).toBe(`A{{inlay::${newId}}}B`)
+        expect(state.chat.message[0].pluginMessageState['plugin-a'].attachments)
+            .toEqual([{ inlayId: newId, presentation: 'inline' }])
+        expect(result.message.callerPluginState.attachments).toEqual([{
+            inlayId: newId, presentation: 'inline', utf16Offset: 1,
+        }])
+        expect(state.inlayAssets.has(oldId)).toBe(true)
+    })
+
+    it('detaches exactly one managed owned marker and keeps the asset', async () => {
+        const [oldId, oldRecord] = await ownedAsset('detach-slot')
+        const state = harness({ chat: {
+            id: 'conversation-1', message: [{
+                role: 'char', data: `A{{inlay::${oldId}}}B`, chatId: 'message-1', time: 1,
+                pluginMessageState: { 'plugin-a': {
+                    metadata: {},
+                    attachments: [{ inlayId: oldId, presentation: 'inline', metadata: { keep: false } }],
+                } },
+            }],
+        } })
+        state.inlayAssets.set(oldId, oldRecord)
+        state.dependencies.createRevision.mockImplementation(async (value: any) =>
+            value.data.includes(oldId) ? 'sha256:old' : 'sha256:detached')
+
+        const result = await state.adapter.patchCurrentMessage({
+            ...request,
+            input: {
+                ...request.input,
+                expectedRevision: 'sha256:old',
+                patch: { op: 'detachOwnInlay', inlayId: oldId },
+                idempotencyKey: 'detach-existing-1',
+            },
+        } as never)
+
+        expect(state.chat.message[0].data).toBe('AB')
+        expect(result.message.callerPluginState.attachments).toEqual([])
+        expect(state.inlayAssets.has(oldId)).toBe(true)
+    })
+
+    it('restores raw marker, caller state, and receipt when replacement persistence fails', async () => {
+        const [oldId, oldRecord] = await ownedAsset('rollback-old')
+        const [newId, newRecord] = await ownedAsset('rollback-new')
+        const state = harness({ chat: {
+            id: 'conversation-1', message: [{
+                role: 'char', data: `A{{inlay::${oldId}}}B`, chatId: 'message-1', time: 1,
+                pluginMessageState: { 'plugin-a': {
+                    metadata: {},
+                    attachments: [{ inlayId: oldId, presentation: 'inline', metadata: { old: true } }],
+                } },
+            }],
+        } })
+        state.inlayAssets.set(oldId, oldRecord)
+        state.inlayAssets.set(newId, newRecord)
+        state.dependencies.createRevision.mockImplementation(async (value: any) =>
+            value.data.includes(newId) ? 'sha256:new' : 'sha256:old')
+        state.dependencies.waitForMessagePersistence.mockRejectedValueOnce(new Error('offline'))
+
+        await expect(state.adapter.patchCurrentMessage({
+            ...request,
+            input: {
+                ...request.input,
+                expectedRevision: 'sha256:old',
+                patch: {
+                    op: 'attachInlay',
+                    inlayId: newId,
+                    presentation: 'inline',
+                    placement: { kind: 'replace-own-inlay', inlayId: oldId },
+                },
+                idempotencyKey: 'replace-rollback-1',
+            },
+        } as never)).rejects.toMatchObject({ code: 'INTERNAL' })
+
+        expect(state.chat.message[0].data).toBe(`A{{inlay::${oldId}}}B`)
+        expect(state.chat.message[0].pluginMessageState['plugin-a'].attachments)
+            .toEqual([{ inlayId: oldId, presentation: 'inline', metadata: { old: true } }])
+        expect(state.database.pluginMessagePatchReceipts).toBeUndefined()
+    })
+
+    it('rejects a foreign staged Inlay before changing the message', async () => {
+        const [foreignId, foreignRecord] = await ownedAsset('foreign-slot', 'plugin-b')
+        const state = harness()
+        state.inlayAssets.set(foreignId, foreignRecord)
+
+        await expect(state.adapter.patchCurrentMessage({
+            ...request,
+            input: {
+                ...request.input,
+                patch: {
+                    op: 'attachInlay', inlayId: foreignId, presentation: 'inline',
+                    placement: { kind: 'end' },
+                },
+                idempotencyKey: 'foreign-attach-1',
+            },
+        } as never)).rejects.toMatchObject({ code: 'PERMISSION_DENIED' })
+        expect(state.chat.message[0].data).toBe('hello')
+        expect(state.database.pluginMessagePatchReceipts).toBeUndefined()
+    })
+
+    it('holds the shared mutation lock from final ownership validation through persistence', async () => {
+        const [inlayId, record] = await ownedAsset('locked-staged-attach')
+        const state = harness()
+        state.inlayAssets.set(inlayId, record)
+        state.dependencies.createRevision.mockImplementation(async (value: any): Promise<string> =>
+            value.data.includes(inlayId) ? 'sha256:attached' : 'sha256:before')
+        const persistenceStarted = deferred<void>()
+        const releasePersistence = deferred<void>()
+        state.dependencies.waitForMessagePersistence.mockImplementationOnce(async () => {
+            persistenceStarted.resolve()
+            await releasePersistence.promise
+        })
+
+        const attaching = state.adapter.patchCurrentMessage({
+            ...request,
+            input: {
+                ...request.input,
+                patch: {
+                    op: 'attachInlay', inlayId, presentation: 'inline',
+                    placement: { kind: 'end' },
+                },
+                idempotencyKey: 'locked-attach-1',
+            },
+        } as never)
+        await persistenceStarted.promise
+
+        let deletionSettled = false
+        const deletion = withMessageMutationLock(async () => {
+            const referenced = state.chat.message[0].data.includes(inlayId)
+            if (!referenced) state.inlayAssets.delete(inlayId)
+            return referenced
+        }).finally(() => { deletionSettled = true })
+        await Promise.resolve()
+        expect(deletionSettled).toBe(false)
+        expect(state.inlayAssets.has(inlayId)).toBe(true)
+
+        releasePersistence.resolve()
+        await expect(attaching).resolves.toMatchObject({ changed: true })
+        await expect(deletion).resolves.toBe(true)
+        expect(state.inlayAssets.has(inlayId)).toBe(true)
     })
 
     it('preserves foreign and future attachment state while projecting no attachments', async () => {

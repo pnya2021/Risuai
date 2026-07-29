@@ -433,10 +433,11 @@ export function createRisuInlayAtomicAttachAdapter(
             return { characterId: character.chaId, conversationId: chat.id }
         },
 
-        attachCurrentMessage: (request) => withMessageMutationLock(async () => {
+        attachCurrentMessage: async (request) => {
             let staged: InlayDescriptor | undefined
             let persistenceRequested = false
             try {
+                return await withMessageMutationLock(async () => {
                 ensureBoundary(dependencies, request)
                 const initialRoot = dependencies.getDatabase()
                 const initialConversation = findConversation(initialRoot, request.input.target)
@@ -634,7 +635,8 @@ export function createRisuInlayAtomicAttachAdapter(
                     restoreAfterFailure(dependencies, request.input.target, stagedBaseline, previous)
                     throw error
                 }
-                return result
+                    return result
+                })
             } catch (error) {
                 if (staged && !persistenceRequested) {
                     try {
@@ -645,6 +647,6 @@ export function createRisuInlayAtomicAttachAdapter(
                 }
                 throw error
             }
-        }),
+        },
     }
 }

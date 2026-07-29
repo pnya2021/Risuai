@@ -62,7 +62,7 @@ import { createRisuMessageQueryAdapter } from './illustration/messageQuery.risu'
 import { MESSAGE_EVENT_CAPABILITY_IDS, MessageEventService, type MessageCommittedEvent, type MessageEventOptions } from './illustration/messageEvents';
 import { subscribeRisuMessageCommits } from './illustration/messageEvents.risu';
 import { MESSAGE_PATCH_CAPABILITY_IDS, MessageMutationRateLimiter, MessagePatchService, type MessagePatchInput } from './illustration/messagePatch';
-import { createRisuMessagePatchAdapter } from './illustration/messagePatch.risu';
+import { createRisuMessagePatchAdapter, withMessageMutationLock } from './illustration/messagePatch.risu';
 import { INLAY_ATOMIC_ATTACH_CAPABILITY_IDS, InlayAtomicAttachService, type InlayAtomicAttachInput } from './illustration/inlayAtomicAttach';
 import { createRisuInlayAtomicAttachAdapter } from './illustration/inlayAtomicAttach.risu';
 
@@ -695,6 +695,7 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
             preLoadChat,
             coldStorageHeader,
             listInlayAssets,
+            getInlayAssetRecord,
             waitForMessagePersistence,
             requestDatabaseSaveNow,
         }),
@@ -717,7 +718,9 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
             coldStorageHeader,
             listInlayAssets,
             createInlay: (data, options) => inlayLifecycle.createInlay(data, options),
-            deleteInlay: (id, options) => inlayLifecycle.deleteInlay(id, options),
+            deleteInlay: (id, options) => withMessageMutationLock(
+                () => inlayLifecycle.deleteInlay(id, options),
+            ),
             waitForMessagePersistence,
             requestDatabaseSaveNow,
         }),
@@ -881,7 +884,9 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
         },
         createInlay: (data, options) => inlayLifecycle.createInlay(data, options),
         readOwnedInlay: (id, options) => inlayLifecycle.readOwnedInlay(id, options),
-        deleteInlay: (id, options) => inlayLifecycle.deleteInlay(id, options),
+        deleteInlay: (id, options) => withMessageMutationLock(
+            () => inlayLifecycle.deleteInlay(id, options),
+        ),
         putDeviceCacheEntry: (input) => deviceCache.putDeviceCacheEntry(input),
         getDeviceCacheEntry: (key) => deviceCache.getDeviceCacheEntry(key),
         listDeviceCacheEntries: (options) => deviceCache.listDeviceCacheEntries(options),

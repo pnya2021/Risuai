@@ -3,13 +3,16 @@ import type {
     MessagePatchHostAdapter,
     MessagePatchResult,
     PreparedMessagePatch,
+    RestrictedMessagePatch,
 } from './messagePatch'
 import {
     MAX_CALLER_ATTACHMENTS,
     cloneCallerMessageMetadata,
     messageRevisionValue,
     projectCallerAttachments,
+    projectLogicalContent,
     projectMessageContent,
+    resolveLogicalInsertionOffset,
     type MessageQueryHostMessage,
     type MessageRef,
     type MessageSnapshot,
@@ -49,6 +52,7 @@ export interface RisuMessagePatchAdapterDependencies {
     preLoadChat(characterIndex: number, chatIndex: number): Promise<void>
     coldStorageHeader: string
     listInlayAssets(): Promise<Array<[string, unknown]>>
+    getInlayAssetRecord(id: string): Promise<unknown | null>
     waitForMessagePersistence(target: MessageRef, revision: string): Promise<void>
     requestDatabaseSaveNow?(): void
     createRevision?: (value: unknown) => Promise<string>
@@ -215,6 +219,100 @@ const ensureBoundary = (
     if (failure.code === 'INTERNAL') return
     throw failure
 }
+
+const ownedInlayFailure = () => new PluginApiError(
+    'PERMISSION_DENIED',
+    'Inlay is not owned by the current plugin',
+)
+
+const deterministicInlayId = async (principalId: string, idempotencyKey: string) => {
+    const bytes = encoder.encode(JSON.stringify([principalId, 'inlay.create.v1', idempotencyKey]))
+    const digest = await crypto.subtle.digest('SHA-256', bytes)
+    return `inlay_${[...new Uint8Array(digest)]
+        .map((byte) => byte.toString(16).padStart(2, '0')).join('')}`
+}
+
+const assertOwnedInlay = async (
+    dependencies: RisuMessagePatchAdapterDependencies,
+    request: PreparedMessagePatch,
+    baseline: SourceBaseline,
+    inlayId: string,
+) => {
+    let record: unknown
+    try {
+        record = await dependencies.getInlayAssetRecord(inlayId)
+    } catch (error) {
+        throw classifyBoundaryError(dependencies, request, error, 'Inlay ownership', baseline)
+    }
+    ensureBoundary(dependencies, request, baseline)
+    if (record === null) throw new PluginApiError('NOT_FOUND', 'Owned Inlay was not found')
+    const lifecycle = plainRecord(record) && plainRecord(record.lifecycle)
+        ? record.lifecycle
+        : undefined
+    const context = lifecycle && plainRecord(lifecycle.context) ? lifecycle.context : undefined
+    if (!lifecycle
+        || lifecycle.version !== 1
+        || lifecycle.ownerPrincipalId !== request.principalId
+        || lifecycle.operation !== 'inlay.create.v1'
+        || !nonEmpty(lifecycle.idempotencyKey)
+        || encoder.encode(lifecycle.idempotencyKey).byteLength > 256
+        || typeof lifecycle.argumentDigest !== 'string'
+        || !/^[0-9a-f]{64}$/.test(lifecycle.argumentDigest)
+        || typeof lifecycle.revision !== 'string'
+        || !/^sha256:[0-9a-f]{64}$/.test(lifecycle.revision)
+        || !context
+        || context.kind !== 'character'
+        || context.characterId !== request.input.target.characterId) throw ownedInlayFailure()
+    let expectedId: string
+    try {
+        expectedId = await deterministicInlayId(request.principalId, lifecycle.idempotencyKey)
+    } catch (error) {
+        throw classifyBoundaryError(dependencies, request, error, 'Inlay ownership', baseline)
+    }
+    ensureBoundary(dependencies, request, baseline)
+    if (expectedId !== inlayId) throw ownedInlayFailure()
+    let confirmed: unknown
+    try {
+        confirmed = await dependencies.getInlayAssetRecord(inlayId)
+    } catch (error) {
+        throw classifyBoundaryError(dependencies, request, error, 'Inlay ownership', baseline)
+    }
+    ensureBoundary(dependencies, request, baseline)
+    const confirmedLifecycle = plainRecord(confirmed) && plainRecord(confirmed.lifecycle)
+        ? confirmed.lifecycle
+        : undefined
+    if (!confirmedLifecycle || canonicalJson(confirmedLifecycle) !== canonicalJson(lifecycle)) {
+        throw conflict('Owned Inlay changed before message staging')
+    }
+}
+
+const storedAttachmentIndexes = (attachments: unknown[], inlayId: string) => attachments
+    .flatMap((attachment, index) => plainRecord(attachment) && attachment.inlayId === inlayId
+        ? [{ attachment, index }] : [])
+
+const managedAttachment = (
+    data: string,
+    recognized: ReadonlySet<string>,
+    attachments: unknown[],
+    inlayId: string,
+) => {
+    const matches = storedAttachmentIndexes(attachments, inlayId)
+    if (matches.length === 0) {
+        throw new PluginApiError('NOT_FOUND', 'Caller-owned Inlay attachment was not found')
+    }
+    if (matches.length !== 1 || matches[0].attachment.presentation !== 'inline') {
+        throw conflict('Caller-owned Inlay attachment is ambiguous')
+    }
+    const marker = projectLogicalContent(data, recognized).markers.find((candidate) => candidate.id === inlayId)
+    if (!marker) throw conflict('Caller-owned Inlay marker is missing')
+    return { ...matches[0], marker }
+}
+
+const attachedDescriptor = (patch: Extract<RestrictedMessagePatch, { op: 'attachInlay' }>) => ({
+    inlayId: patch.inlayId,
+    presentation: 'inline' as const,
+    ...(patch.metadata === undefined ? {} : { metadata: cloneJson(patch.metadata) }),
+})
 
 const restoredReceiptResult = (value: unknown, target: MessageRef): MessagePatchResult => {
     let cloned: unknown
@@ -385,6 +483,7 @@ const restoreAfterFailure = (
     request: PreparedMessagePatch,
     stagedBaseline: SourceBaseline,
     previous: {
+        data: string
         hadMessageState: boolean
         hadOwnState: boolean
         ownState: unknown
@@ -398,6 +497,7 @@ const restoreAfterFailure = (
     try {
         const root = dependencies.getDatabase()
         const located = findMessage(root, request.input.target)
+        located.message.data = previous.data
         const currentState = located.message.pluginMessageState === undefined
             ? {}
             : cloneJson(located.message.pluginMessageState)
@@ -509,10 +609,28 @@ export function createRisuMessagePatchAdapter(
             }
             ensureBoundary(dependencies, request, baseline)
 
+            const patch = request.input.patch
+            const mutationInlayIds = patch.op === 'detachOwnInlay'
+                ? [patch.inlayId]
+                : patch.op === 'attachInlay'
+                    ? [
+                        patch.inlayId,
+                        ...(patch.placement.kind === 'replace-own-inlay'
+                            ? [patch.placement.inlayId] : []),
+                    ]
+                    : []
+            if (patch.op === 'attachInlay'
+                && patch.placement.kind === 'replace-own-inlay'
+                && patch.inlayId === patch.placement.inlayId) {
+                throw conflict('Replacement Inlay must be different')
+            }
+            recognized = new Set([...recognized, ...mutationInlayIds])
+
             const ownDescriptor = plainRecord(located.message.pluginMessageState)
                 ? Object.getOwnPropertyDescriptor(located.message.pluginMessageState, request.principalId)
                 : undefined
             const previous = {
+                data: located.message.data,
                 hadMessageState: located.message.pluginMessageState !== undefined,
                 hadOwnState: !!ownDescriptor,
                 ownState: ownDescriptor && Object.hasOwn(ownDescriptor, 'value')
@@ -526,20 +644,69 @@ export function createRisuMessagePatchAdapter(
             }
             const prepared = callerState(located.message, request.principalId)
             const metadata = cloneJson(prepared.state.metadata)
-            const previousValue = Object.getOwnPropertyDescriptor(metadata, request.input.patch.key)?.value
-            const changed = !Object.hasOwn(metadata, request.input.patch.key)
-                || canonicalJson(previousValue) !== canonicalJson(request.input.patch.value)
-            Object.defineProperty(metadata, request.input.patch.key, {
-                value: cloneJson(request.input.patch.value),
-                enumerable: true,
-                configurable: true,
-                writable: true,
-            })
+            const attachments = cloneJson(prepared.state.attachments)
+            let nextData = located.message.data
+            let changed = false
+            if (patch.op === 'setPluginMetadata') {
+                const previousValue = Object.getOwnPropertyDescriptor(metadata, patch.key)?.value
+                changed = !Object.hasOwn(metadata, patch.key)
+                    || canonicalJson(previousValue) !== canonicalJson(patch.value)
+                Object.defineProperty(metadata, patch.key, {
+                    value: cloneJson(patch.value),
+                    enumerable: true,
+                    configurable: true,
+                    writable: true,
+                })
+            } else if (patch.op === 'attachInlay') {
+                const projection = projectLogicalContent(nextData, recognized)
+                if (storedAttachmentIndexes(attachments, patch.inlayId).length > 0
+                    || projection.markers.some((marker) => marker.id === patch.inlayId)) {
+                    throw conflict('Inlay is already attached to this message')
+                }
+                const descriptor = attachedDescriptor(patch)
+                if (patch.placement.kind === 'replace-own-inlay') {
+                    const existing = managedAttachment(
+                        nextData,
+                        recognized,
+                        attachments,
+                        patch.placement.inlayId,
+                    )
+                    attachments.splice(existing.index, 1, descriptor)
+                    nextData = nextData.slice(0, existing.marker.rawStart)
+                        + `{{inlay::${patch.inlayId}}}`
+                        + nextData.slice(existing.marker.rawEnd)
+                } else {
+                    const insertionOffset = resolveLogicalInsertionOffset(
+                        nextData,
+                        recognized,
+                        patch.placement,
+                    )
+                    if (insertionOffset === null) {
+                        throw new PluginApiError('INVALID_ARGUMENT', 'Invalid logical UTF-16 placement')
+                    }
+                    attachments.push(descriptor)
+                    nextData = nextData.slice(0, insertionOffset)
+                        + `{{inlay::${patch.inlayId}}}`
+                        + nextData.slice(insertionOffset)
+                }
+                changed = true
+            } else {
+                const existing = managedAttachment(
+                    nextData,
+                    recognized,
+                    attachments,
+                    patch.inlayId,
+                )
+                attachments.splice(existing.index, 1)
+                nextData = nextData.slice(0, existing.marker.rawStart)
+                    + nextData.slice(existing.marker.rawEnd)
+                changed = true
+            }
             const timestamp = now()
             const nextState = {
                 ...prepared.state,
                 metadata,
-                attachments: cloneJson(prepared.state.attachments),
+                attachments,
                 ...(changed ? { updatedAt: timestamp } : {}),
             }
             validateCallerState(nextState)
@@ -554,6 +721,7 @@ export function createRisuMessagePatchAdapter(
             const stagedMessage = {
                 ...located.message,
                 ...(changed ? {
+                    data: nextData,
                     pluginMessageState: prepared.root,
                     pluginMessageUpdatedAt: timestamp,
                 } : {}),
@@ -563,6 +731,10 @@ export function createRisuMessagePatchAdapter(
                 nextRevision = await revision(messageRevisionValue(stagedMessage as MessageQueryHostMessage))
             } catch (error) {
                 throw classifyBoundaryError(dependencies, request, error, 'Message revision', baseline)
+            }
+            ensureBoundary(dependencies, request, baseline)
+            for (const id of new Set(mutationInlayIds)) {
+                await assertOwnedInlay(dependencies, request, baseline, id)
             }
             ensureBoundary(dependencies, request, baseline)
 
@@ -596,6 +768,7 @@ export function createRisuMessagePatchAdapter(
             }
             ensureBoundary(dependencies, request, baseline)
             if (changed) {
+                located.message.data = stagedMessage.data
                 located.message.pluginMessageState = prepared.root
                 located.message.pluginMessageUpdatedAt = timestamp
             }

@@ -11,10 +11,26 @@ const OPERATION = MESSAGE_PATCH_CAPABILITY_IDS[0]
 const MAX_METADATA_BYTES = 65_536
 const MAX_MUTATIONS_PER_MINUTE = 30
 
+export type MessagePatchPlacement =
+    | { kind: 'end' }
+    | { kind: 'utf16-offset'; offset: number }
+    | { kind: 'replace-own-inlay'; inlayId: string }
+
+export type RestrictedMessagePatch =
+    | { op: 'setPluginMetadata'; key: string; value: PluginJsonValue }
+    | {
+        op: 'attachInlay'
+        inlayId: string
+        presentation: 'inline'
+        placement: MessagePatchPlacement
+        metadata?: PluginJsonValue
+    }
+    | { op: 'detachOwnInlay'; inlayId: string }
+
 export interface MessagePatchInput {
     target: MessageRef
     expectedRevision: string
-    patch: { op: 'setPluginMetadata'; key: string; value: PluginJsonValue }
+    patch: RestrictedMessagePatch
     idempotencyKey: string
     persist: 'immediate'
 }
@@ -64,6 +80,74 @@ const requiredString = (value: unknown, label: string) => {
     return value as string
 }
 
+const inlayId = (value: unknown, label: string) => {
+    const id = requiredString(value, label)
+    assertUtf8Limit(id, 4_096, label)
+    return id
+}
+
+const normalizePlacement = (raw: unknown): MessagePatchPlacement => {
+    if (raw === undefined) return { kind: 'end' }
+    const placement = ownObject(raw, ['kind', 'offset', 'inlayId'], 'Inlay placement')
+    if (placement.kind === 'end') {
+        ownObject(raw, ['kind'], 'Inlay placement')
+        return { kind: 'end' }
+    }
+    if (placement.kind === 'utf16-offset') {
+        ownObject(raw, ['kind', 'offset'], 'Inlay placement')
+        if (!Number.isSafeInteger(placement.offset) || (placement.offset as number) < 0) {
+            invalid('Inlay UTF-16 offset must be a non-negative safe integer')
+        }
+        return { kind: 'utf16-offset', offset: placement.offset as number }
+    }
+    if (placement.kind === 'replace-own-inlay') {
+        ownObject(raw, ['kind', 'inlayId'], 'Inlay placement')
+        return { kind: 'replace-own-inlay', inlayId: inlayId(placement.inlayId, 'replacement inlayId') }
+    }
+    return invalid('Unsupported Inlay placement')
+}
+
+const normalizePatch = (raw: unknown): RestrictedMessagePatch => {
+    const value = ownObject(
+        raw,
+        ['op', 'key', 'value', 'inlayId', 'presentation', 'placement', 'metadata'],
+        'message patch operation',
+    )
+    if (value.op === 'setPluginMetadata') {
+        const patch = ownObject(raw, ['op', 'key', 'value'], 'message patch operation')
+        const key = requiredString(patch.key, 'metadata key')
+        const json = JSON.parse(validateJsonLimits(patch.value, {
+            maxDepth: 32, maxBytes: MAX_METADATA_BYTES,
+        })) as PluginJsonValue
+        return { op: 'setPluginMetadata', key, value: json }
+    }
+    if (value.op === 'attachInlay') {
+        const patch = ownObject(
+            raw,
+            ['op', 'inlayId', 'presentation', 'placement', 'metadata'],
+            'message patch operation',
+        )
+        if (patch.presentation !== 'inline') invalid('Only inline Inlay presentation is supported')
+        const metadata = patch.metadata === undefined
+            ? undefined
+            : JSON.parse(validateJsonLimits(patch.metadata, {
+                maxDepth: 32, maxBytes: MAX_METADATA_BYTES,
+            })) as PluginJsonValue
+        return {
+            op: 'attachInlay',
+            inlayId: inlayId(patch.inlayId, 'inlayId'),
+            presentation: 'inline',
+            placement: normalizePlacement(patch.placement),
+            ...(metadata === undefined ? {} : { metadata }),
+        }
+    }
+    if (value.op === 'detachOwnInlay') {
+        const patch = ownObject(raw, ['op', 'inlayId'], 'message patch operation')
+        return { op: 'detachOwnInlay', inlayId: inlayId(patch.inlayId, 'inlayId') }
+    }
+    return invalid('Unsupported restricted patch')
+}
+
 const normalize = (raw: unknown): MessagePatchInput => {
     const input = ownObject(raw, ['target', 'expectedRevision', 'patch', 'idempotencyKey', 'persist'], 'message patch')
     const targetValue = ownObject(input.target, ['characterId', 'conversationId', 'messageId'], 'message target')
@@ -75,12 +159,7 @@ const normalize = (raw: unknown): MessagePatchInput => {
     if (target.messageId.startsWith('legacy-message:')) {
         throw new PluginApiError('CONFLICT', 'Stable messageId is required', { retryable: true })
     }
-    const patchValue = ownObject(input.patch, ['op', 'key', 'value'], 'message patch operation')
-    if (patchValue.op !== 'setPluginMetadata') invalid('Unsupported restricted patch')
-    const key = requiredString(patchValue.key, 'metadata key')
-    const value = JSON.parse(validateJsonLimits(patchValue.value, {
-        maxDepth: 32, maxBytes: MAX_METADATA_BYTES,
-    })) as PluginJsonValue
+    const patch = normalizePatch(input.patch)
     const expectedRevision = requiredString(input.expectedRevision, 'expectedRevision')
     const idempotencyKey = requiredString(input.idempotencyKey, 'idempotencyKey')
     assertUtf8Limit(idempotencyKey, 256, 'idempotencyKey')
@@ -88,7 +167,7 @@ const normalize = (raw: unknown): MessagePatchInput => {
     return {
         target,
         expectedRevision,
-        patch: { op: 'setPluginMetadata', key, value },
+        patch,
         idempotencyKey,
         persist: 'immediate',
     }
@@ -160,13 +239,18 @@ export class MessagePatchService {
         this.ensureActive()
         const input = normalize(rawInput)
         this.ensureCurrent(input.target)
-        try {
-            await this.options.requirePermission(this.context, 'chatWrite')
-        } catch (error) {
-            this.rejectAfterBoundary(error, input.target, 'Message patch permission check')
+        const permissions: PluginPermissionId[] = input.patch.op === 'setPluginMetadata'
+            ? ['chatWrite']
+            : ['chatWrite', 'inlayWrite']
+        for (const permission of permissions) {
+            try {
+                await this.options.requirePermission(this.context, permission)
+            } catch (error) {
+                this.rejectAfterBoundary(error, input.target, 'Message patch permission check')
+            }
+            this.ensureActive()
+            this.ensureCurrent(input.target)
         }
-        this.ensureActive()
-        this.ensureCurrent(input.target)
         let argumentDigest: string
         try {
             argumentDigest = await (this.options.digest ?? canonicalArgumentsDigest)(input)

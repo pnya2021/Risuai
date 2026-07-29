@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import { IdempotencyLedger } from './idempotency'
 import { PluginApiError } from './errors'
+import type { PluginExecutionContext, PluginPermissionId } from './permissions'
 import {
     MessageMutationRateLimiter,
     MessagePatchService,
@@ -29,7 +30,10 @@ describe('V3 current-message metadata patch', () => {
                 commitId: 'commit-1',
             })),
         }
-        const requirePermission = vi.fn(async () => undefined)
+        const requirePermission = vi.fn(async (
+            _context: PluginExecutionContext,
+            _permission: PluginPermissionId,
+        ) => undefined)
         const service = new MessagePatchService(context, adapter, { requirePermission })
 
         await expect(service.patchMessage({
@@ -67,7 +71,10 @@ describe('V3 current-message metadata patch', () => {
 
     const serviceHarness = (options: {
         adapter?: Partial<MessagePatchHostAdapter>
-        requirePermission?: () => Promise<void>
+        requirePermission?: (
+            context: PluginExecutionContext,
+            permission: PluginPermissionId,
+        ) => Promise<void>
         now?: () => number
         digest?: (value: unknown) => Promise<string>
         signal?: AbortSignal
@@ -109,6 +116,94 @@ describe('V3 current-message metadata patch', () => {
         release()
         await expect(Promise.all([first, joined])).resolves.toEqual([result, result])
         expect(state.adapter.patchCurrentMessage).toHaveBeenCalledTimes(1)
+    })
+
+    it('normalizes own Inlay attach, replacement, and detach with the matching permission', async () => {
+        const requirePermission = vi.fn(async (
+            _context: PluginExecutionContext,
+            _permission: PluginPermissionId,
+        ) => undefined)
+        const state = serviceHarness({ requirePermission })
+
+        await state.service.patchMessage(input({
+            patch: {
+                op: 'attachInlay',
+                inlayId: 'inlay-new',
+                presentation: 'inline',
+                metadata: { slot: 1 },
+            },
+            idempotencyKey: 'attach-1',
+        } as never))
+        await state.service.patchMessage(input({
+            patch: {
+                op: 'attachInlay',
+                inlayId: 'inlay-replacement',
+                presentation: 'inline',
+                placement: { kind: 'replace-own-inlay', inlayId: 'inlay-old' },
+            },
+            idempotencyKey: 'replace-1',
+        } as never))
+        await state.service.patchMessage(input({
+            patch: { op: 'detachOwnInlay', inlayId: 'inlay-old' },
+            idempotencyKey: 'detach-1',
+        } as never))
+
+        expect(requirePermission.mock.calls.map(([, permission]) => permission)).toEqual([
+            'chatWrite', 'inlayWrite',
+            'chatWrite', 'inlayWrite',
+            'chatWrite', 'inlayWrite',
+        ])
+        expect(state.adapter.patchCurrentMessage).toHaveBeenNthCalledWith(1, expect.objectContaining({
+            input: expect.objectContaining({
+                patch: {
+                    op: 'attachInlay',
+                    inlayId: 'inlay-new',
+                    presentation: 'inline',
+                    placement: { kind: 'end' },
+                    metadata: { slot: 1 },
+                },
+            }),
+        }))
+        expect(state.adapter.patchCurrentMessage).toHaveBeenNthCalledWith(2, expect.objectContaining({
+            input: expect.objectContaining({
+                patch: {
+                    op: 'attachInlay',
+                    inlayId: 'inlay-replacement',
+                    presentation: 'inline',
+                    placement: { kind: 'replace-own-inlay', inlayId: 'inlay-old' },
+                },
+            }),
+        }))
+        expect(state.adapter.patchCurrentMessage).toHaveBeenNthCalledWith(3, expect.objectContaining({
+            input: expect.objectContaining({
+                patch: { op: 'detachOwnInlay', inlayId: 'inlay-old' },
+            }),
+        }))
+    })
+
+    it.each([
+        ['non-inline presentation', {
+            op: 'attachInlay', inlayId: 'inlay-new', presentation: 'styled',
+        }],
+        ['invalid UTF-16 offset', {
+            op: 'attachInlay', inlayId: 'inlay-new', presentation: 'inline',
+            placement: { kind: 'utf16-offset', offset: -1 },
+        }],
+        ['empty replacement target', {
+            op: 'attachInlay', inlayId: 'inlay-new', presentation: 'inline',
+            placement: { kind: 'replace-own-inlay', inlayId: '' },
+        }],
+        ['extraneous detach metadata', {
+            op: 'detachOwnInlay', inlayId: 'inlay-old', metadata: { hidden: true },
+        }],
+    ])('rejects %s before any permission or adapter call', async (_label, patch) => {
+        const requirePermission = vi.fn(async () => undefined)
+        const state = serviceHarness({ requirePermission })
+
+        await expect(state.service.patchMessage(input({ patch } as never)))
+            .rejects.toMatchObject({ code: 'INVALID_ARGUMENT' })
+        expect(requirePermission).not.toHaveBeenCalled()
+        expect(state.adapter.patchCurrentMessage).not.toHaveBeenCalled()
     })
 
     it('rejects non-current targets before prompting and rechecks after permission awaits', async () => {

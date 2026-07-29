@@ -1414,14 +1414,33 @@ type MessageCommittedEvent = {
     }
 );
 
-interface CurrentMessageMetadataPatchInput {
-    target: MessageRef;
-    expectedRevision: Revision;
-    patch: {
+type MessagePatchPlacement =
+    | { kind: 'end' }
+    | { kind: 'utf16-offset'; offset: number }
+    | { kind: 'replace-own-inlay'; inlayId: string };
+
+type RestrictedMessagePatch =
+    | {
         op: 'setPluginMetadata';
         key: string;
         value: PluginJsonValue;
+    }
+    | {
+        op: 'attachInlay';
+        inlayId: string;
+        presentation: 'inline';
+        placement?: MessagePatchPlacement;
+        metadata?: PluginJsonValue;
+    }
+    | {
+        op: 'detachOwnInlay';
+        inlayId: string;
     };
+
+interface MessagePatchInput {
+    target: MessageRef;
+    expectedRevision: Revision;
+    patch: RestrictedMessagePatch;
     idempotencyKey: string;
     persist: 'immediate';
 }
@@ -2500,8 +2519,8 @@ interface RisuaiPluginAPI {
         maxTotalUtf16?: number;
     }): Promise<{ items: MessageSnapshot[]; truncatedBefore: boolean }>;
 
-    /** Atomically checkpoints caller-owned metadata on one current committed message. */
-    patchMessage(input: CurrentMessageMetadataPatchInput): Promise<MessagePatchResult>;
+    /** Atomically patches caller-owned metadata or an owned Inlay reference on one current committed message. */
+    patchMessage(input: MessagePatchInput): Promise<MessagePatchResult>;
 
     /** Creates an owned Inlay and atomically attaches it to one current committed message. */
     attachGeneratedInlayToMessage(
