@@ -54,6 +54,34 @@ const ownedAsset = async (
     }] as const
 }
 
+const ownedAtomicAsset = async (idempotencyKey: string) => {
+    const encoded = new TextEncoder().encode(JSON.stringify([
+        'plugin-a', 'inlay.atomic-attach.v1', idempotencyKey,
+    ]))
+    const id = `inlay_${hex(await crypto.subtle.digest('SHA-256', encoded))}`
+    return [id, {
+        name: `${id}.png`,
+        type: 'image',
+        data: new Blob([Uint8Array.of(1)], { type: 'image/png' }),
+        ext: 'png',
+        lifecycle: {
+            version: 1,
+            ownerPrincipalId: 'plugin-a',
+            operation: 'inlay.atomic-attach.v1',
+            idempotencyKey,
+            argumentDigest: 'a'.repeat(64),
+            revision: `sha256:${'b'.repeat(64)}`,
+            context: {
+                kind: 'message',
+                characterId: 'character-1',
+                conversationId: 'conversation-1',
+                messageId: 'message-1',
+            },
+            inputRevision: 'sha256:before',
+        },
+    }] as const
+}
+
 const harness = (options: { chat?: any; character?: any } = {}) => {
     const chat: any = options.chat ?? {
         id: 'conversation-1', name: 'Chat', note: '', localLore: [],
@@ -273,6 +301,33 @@ describe('RisuAI current-message metadata persistence', () => {
         expect(state.chat.message[0].data).toBe('AB')
         expect(result.message.callerPluginState.attachments).toEqual([])
         expect(state.inlayAssets.has(oldId)).toBe(true)
+    })
+
+    it('detaches an owned Inlay originally created by atomic attach', async () => {
+        const [oldId, oldRecord] = await ownedAtomicAsset('atomic-slot')
+        const state = harness({ chat: {
+            id: 'conversation-1', message: [{
+                role: 'char', data: `A{{inlay::${oldId}}}B`, chatId: 'message-1', time: 1,
+                pluginMessageState: { 'plugin-a': {
+                    metadata: {},
+                    attachments: [{ inlayId: oldId, presentation: 'inline' }],
+                } },
+            }],
+        } })
+        state.inlayAssets.set(oldId, oldRecord)
+        state.dependencies.createRevision.mockImplementation(async (value: any) =>
+            value.data.includes(oldId) ? 'sha256:old' : 'sha256:detached')
+
+        await expect(state.adapter.patchCurrentMessage({
+            ...request,
+            input: {
+                ...request.input,
+                expectedRevision: 'sha256:old',
+                patch: { op: 'detachOwnInlay', inlayId: oldId },
+                idempotencyKey: 'detach-atomic-1',
+            },
+        } as never)).resolves.toMatchObject({ changed: true })
+        expect(state.chat.message[0].data).toBe('AB')
     })
 
     it('restores raw marker, caller state, and receipt when replacement persistence fails', async () => {

@@ -225,8 +225,12 @@ const ownedInlayFailure = () => new PluginApiError(
     'Inlay is not owned by the current plugin',
 )
 
-const deterministicInlayId = async (principalId: string, idempotencyKey: string) => {
-    const bytes = encoder.encode(JSON.stringify([principalId, 'inlay.create.v1', idempotencyKey]))
+const deterministicInlayId = async (
+    principalId: string,
+    operation: 'inlay.create.v1' | 'inlay.atomic-attach.v1',
+    idempotencyKey: string,
+) => {
+    const bytes = encoder.encode(JSON.stringify([principalId, operation, idempotencyKey]))
     const digest = await crypto.subtle.digest('SHA-256', bytes)
     return `inlay_${[...new Uint8Array(digest)]
         .map((byte) => byte.toString(16).padStart(2, '0')).join('')}`
@@ -237,6 +241,7 @@ const assertOwnedInlay = async (
     request: PreparedMessagePatch,
     baseline: SourceBaseline,
     inlayId: string,
+    allowAtomicMessageLifecycle: boolean,
 ) => {
     let record: unknown
     try {
@@ -250,22 +255,34 @@ const assertOwnedInlay = async (
         ? record.lifecycle
         : undefined
     const context = lifecycle && plainRecord(lifecycle.context) ? lifecycle.context : undefined
+    const validCreateContext = lifecycle?.operation === 'inlay.create.v1'
+        && context?.kind === 'character'
+        && context.characterId === request.input.target.characterId
+    const validAtomicContext = allowAtomicMessageLifecycle
+        && lifecycle?.operation === 'inlay.atomic-attach.v1'
+        && context?.kind === 'message'
+        && context.characterId === request.input.target.characterId
+        && context.conversationId === request.input.target.conversationId
+        && context.messageId === request.input.target.messageId
+        && nonEmpty(lifecycle.inputRevision)
     if (!lifecycle
         || lifecycle.version !== 1
         || lifecycle.ownerPrincipalId !== request.principalId
-        || lifecycle.operation !== 'inlay.create.v1'
         || !nonEmpty(lifecycle.idempotencyKey)
         || encoder.encode(lifecycle.idempotencyKey).byteLength > 256
         || typeof lifecycle.argumentDigest !== 'string'
         || !/^[0-9a-f]{64}$/.test(lifecycle.argumentDigest)
         || typeof lifecycle.revision !== 'string'
         || !/^sha256:[0-9a-f]{64}$/.test(lifecycle.revision)
-        || !context
-        || context.kind !== 'character'
-        || context.characterId !== request.input.target.characterId) throw ownedInlayFailure()
+        || (!validCreateContext && !validAtomicContext)) throw ownedInlayFailure()
+    const operation = validCreateContext ? 'inlay.create.v1' : 'inlay.atomic-attach.v1'
     let expectedId: string
     try {
-        expectedId = await deterministicInlayId(request.principalId, lifecycle.idempotencyKey)
+        expectedId = await deterministicInlayId(
+            request.principalId,
+            operation,
+            lifecycle.idempotencyKey,
+        )
     } catch (error) {
         throw classifyBoundaryError(dependencies, request, error, 'Inlay ownership', baseline)
     }
@@ -619,6 +636,18 @@ export function createRisuMessagePatchAdapter(
                             ? [patch.placement.inlayId] : []),
                     ]
                     : []
+            const ownershipChecks = patch.op === 'detachOwnInlay'
+                ? [{ id: patch.inlayId, allowAtomicMessageLifecycle: true }]
+                : patch.op === 'attachInlay'
+                    ? [
+                        { id: patch.inlayId, allowAtomicMessageLifecycle: false },
+                        ...(patch.placement.kind === 'replace-own-inlay'
+                            ? [{
+                                id: patch.placement.inlayId,
+                                allowAtomicMessageLifecycle: true,
+                            }] : []),
+                    ]
+                    : []
             if (patch.op === 'attachInlay'
                 && patch.placement.kind === 'replace-own-inlay'
                 && patch.inlayId === patch.placement.inlayId) {
@@ -733,8 +762,14 @@ export function createRisuMessagePatchAdapter(
                 throw classifyBoundaryError(dependencies, request, error, 'Message revision', baseline)
             }
             ensureBoundary(dependencies, request, baseline)
-            for (const id of new Set(mutationInlayIds)) {
-                await assertOwnedInlay(dependencies, request, baseline, id)
+            for (const check of ownershipChecks) {
+                await assertOwnedInlay(
+                    dependencies,
+                    request,
+                    baseline,
+                    check.id,
+                    check.allowAtomicMessageLifecycle,
+                )
             }
             ensureBoundary(dependencies, request, baseline)
 
