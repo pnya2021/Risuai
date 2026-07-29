@@ -2,7 +2,7 @@ import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { describe, expect, it } from 'vitest'
 
-const source = (path: string) => readFileSync(resolve(process.cwd(), path), 'utf8')
+const source = (path: string) => readFileSync(resolve(process.cwd(), path), 'utf8').replace(/\r\n?/gu, '\n')
 
 describe('Risu native plugin transport contracts', () => {
     it('uses Tauri camelCase command arguments and rejects pre-aborted requests before invoke', () => {
