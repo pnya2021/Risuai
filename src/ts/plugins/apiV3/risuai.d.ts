@@ -1435,6 +1435,11 @@ type RestrictedMessagePatch =
     | {
         op: 'detachOwnInlay';
         inlayId: string;
+    }
+    | {
+        op: 'setOwnInlayMetadata';
+        inlayId: string;
+        value: PluginJsonValue;
     };
 
 interface MessagePatchInput {

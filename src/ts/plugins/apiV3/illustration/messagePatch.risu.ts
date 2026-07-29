@@ -320,9 +320,11 @@ const managedAttachment = (
     if (matches.length !== 1 || matches[0].attachment.presentation !== 'inline') {
         throw conflict('Caller-owned Inlay attachment is ambiguous')
     }
-    const marker = projectLogicalContent(data, recognized).markers.find((candidate) => candidate.id === inlayId)
-    if (!marker) throw conflict('Caller-owned Inlay marker is missing')
-    return { ...matches[0], marker }
+    const markers = projectLogicalContent(data, recognized).markers
+        .filter((candidate) => candidate.id === inlayId)
+    if (markers.length === 0) throw conflict('Caller-owned Inlay marker is missing')
+    if (markers.length !== 1) throw conflict('Caller-owned Inlay marker is ambiguous')
+    return { ...matches[0], marker: markers[0] }
 }
 
 const attachedDescriptor = (patch: Extract<RestrictedMessagePatch, { op: 'attachInlay' }>) => ({
@@ -628,6 +630,7 @@ export function createRisuMessagePatchAdapter(
 
             const patch = request.input.patch
             const mutationInlayIds = patch.op === 'detachOwnInlay'
+                || patch.op === 'setOwnInlayMetadata'
                 ? [patch.inlayId]
                 : patch.op === 'attachInlay'
                     ? [
@@ -637,6 +640,7 @@ export function createRisuMessagePatchAdapter(
                     ]
                     : []
             const ownershipChecks = patch.op === 'detachOwnInlay'
+                || patch.op === 'setOwnInlayMetadata'
                 ? [{ id: patch.inlayId, allowAtomicMessageLifecycle: true }]
                 : patch.op === 'attachInlay'
                     ? [
@@ -719,6 +723,25 @@ export function createRisuMessagePatchAdapter(
                         + nextData.slice(insertionOffset)
                 }
                 changed = true
+            } else if (patch.op === 'setOwnInlayMetadata') {
+                const existing = managedAttachment(
+                    nextData,
+                    recognized,
+                    attachments,
+                    patch.inlayId,
+                )
+                const descriptor = cloneJson(existing.attachment)
+                const previousValue = Object.hasOwn(descriptor, 'metadata')
+                    ? canonicalJson(descriptor.metadata)
+                    : undefined
+                Object.defineProperty(descriptor, 'metadata', {
+                    value: cloneJson(patch.value),
+                    enumerable: true,
+                    configurable: true,
+                    writable: true,
+                })
+                attachments.splice(existing.index, 1, descriptor)
+                changed = previousValue !== canonicalJson(patch.value)
             } else {
                 const existing = managedAttachment(
                     nextData,

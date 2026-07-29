@@ -118,7 +118,7 @@ describe('V3 current-message metadata patch', () => {
         expect(state.adapter.patchCurrentMessage).toHaveBeenCalledTimes(1)
     })
 
-    it('normalizes own Inlay attach, replacement, and detach with the matching permission', async () => {
+    it('normalizes own Inlay attach, replacement, metadata, and detach with the matching permission', async () => {
         const requirePermission = vi.fn(async (
             _context: PluginExecutionContext,
             _permission: PluginPermissionId,
@@ -144,11 +144,20 @@ describe('V3 current-message metadata patch', () => {
             idempotencyKey: 'replace-1',
         } as never))
         await state.service.patchMessage(input({
+            patch: {
+                op: 'setOwnInlayMetadata',
+                inlayId: 'inlay-old',
+                value: { locked: true },
+            },
+            idempotencyKey: 'metadata-1',
+        } as never))
+        await state.service.patchMessage(input({
             patch: { op: 'detachOwnInlay', inlayId: 'inlay-old' },
             idempotencyKey: 'detach-1',
         } as never))
 
         expect(requirePermission.mock.calls.map(([, permission]) => permission)).toEqual([
+            'chatWrite', 'inlayWrite',
             'chatWrite', 'inlayWrite',
             'chatWrite', 'inlayWrite',
             'chatWrite', 'inlayWrite',
@@ -176,6 +185,15 @@ describe('V3 current-message metadata patch', () => {
         }))
         expect(state.adapter.patchCurrentMessage).toHaveBeenNthCalledWith(3, expect.objectContaining({
             input: expect.objectContaining({
+                patch: {
+                    op: 'setOwnInlayMetadata',
+                    inlayId: 'inlay-old',
+                    value: { locked: true },
+                },
+            }),
+        }))
+        expect(state.adapter.patchCurrentMessage).toHaveBeenNthCalledWith(4, expect.objectContaining({
+            input: expect.objectContaining({
                 patch: { op: 'detachOwnInlay', inlayId: 'inlay-old' },
             }),
         }))
@@ -195,6 +213,9 @@ describe('V3 current-message metadata patch', () => {
         }],
         ['extraneous detach metadata', {
             op: 'detachOwnInlay', inlayId: 'inlay-old', metadata: { hidden: true },
+        }],
+        ['missing own Inlay metadata value', {
+            op: 'setOwnInlayMetadata', inlayId: 'inlay-old', metadata: { locked: true },
         }],
     ])('rejects %s before any permission or adapter call', async (_label, patch) => {
         const requirePermission = vi.fn(async () => undefined)

@@ -26,6 +26,7 @@ export type RestrictedMessagePatch =
         metadata?: PluginJsonValue
     }
     | { op: 'detachOwnInlay'; inlayId: string }
+    | { op: 'setOwnInlayMetadata'; inlayId: string; value: PluginJsonValue }
 
 export interface MessagePatchInput {
     target: MessageRef
@@ -144,6 +145,17 @@ const normalizePatch = (raw: unknown): RestrictedMessagePatch => {
     if (value.op === 'detachOwnInlay') {
         const patch = ownObject(raw, ['op', 'inlayId'], 'message patch operation')
         return { op: 'detachOwnInlay', inlayId: inlayId(patch.inlayId, 'inlayId') }
+    }
+    if (value.op === 'setOwnInlayMetadata') {
+        const patch = ownObject(raw, ['op', 'inlayId', 'value'], 'message patch operation')
+        const json = JSON.parse(validateJsonLimits(patch.value, {
+            maxDepth: 32, maxBytes: MAX_METADATA_BYTES,
+        })) as PluginJsonValue
+        return {
+            op: 'setOwnInlayMetadata',
+            inlayId: inlayId(patch.inlayId, 'inlayId'),
+            value: json,
+        }
     }
     return invalid('Unsupported restricted patch')
 }

@@ -330,6 +330,99 @@ describe('RisuAI current-message metadata persistence', () => {
         expect(state.chat.message[0].data).toBe('AB')
     })
 
+    it('replaces full metadata on one atomically-created own attachment without moving its marker', async () => {
+        const [inlayId, record] = await ownedAtomicAsset('atomic-lock')
+        const state = harness({ chat: {
+            id: 'conversation-1', message: [{
+                role: 'char', data: `A{{inlay::${inlayId}}}B`, chatId: 'message-1', time: 1,
+                pluginMessageState: { 'plugin-a': {
+                    metadata: {},
+                    attachments: [{
+                        inlayId,
+                        presentation: 'inline',
+                        metadata: { locked: false, remove: true },
+                    }],
+                } },
+            }],
+        } })
+        state.inlayAssets.set(inlayId, record)
+        state.dependencies.createRevision.mockImplementation(async (value: any) =>
+            value.pluginMessageState?.['plugin-a']?.attachments?.[0]?.metadata?.locked === true
+                ? 'sha256:locked'
+                : 'sha256:unlocked')
+        const patch: Parameters<typeof state.adapter.patchCurrentMessage>[0] = {
+            ...request,
+            input: {
+                ...request.input,
+                expectedRevision: 'sha256:unlocked',
+                patch: { op: 'setOwnInlayMetadata', inlayId, value: { locked: true, source: 'automatic' } },
+                idempotencyKey: 'lock-atomic-1',
+            },
+        }
+
+        const result = await state.adapter.patchCurrentMessage(patch)
+
+        expect(result).toMatchObject({
+            changed: true,
+            message: { revision: 'sha256:locked', callerPluginState: { attachments: [{
+                inlayId,
+                presentation: 'inline',
+                utf16Offset: 1,
+                metadata: { locked: true, source: 'automatic' },
+            }] } },
+        })
+        expect(state.chat.message[0].data).toBe(`A{{inlay::${inlayId}}}B`)
+        expect(state.chat.message[0].pluginMessageState['plugin-a'].attachments).toEqual([{
+            inlayId,
+            presentation: 'inline',
+            metadata: { locked: true, source: 'automatic' },
+        }])
+
+        await expect(state.adapter.patchCurrentMessage({
+            ...patch,
+            argumentDigest: 'b'.repeat(64),
+            input: {
+                ...patch.input,
+                expectedRevision: 'sha256:locked',
+                idempotencyKey: 'lock-atomic-2',
+            },
+        })).resolves.toMatchObject({ changed: false, message: { revision: 'sha256:locked' } })
+    })
+
+    it('rejects duplicate raw markers for one metadata attachment', async () => {
+        const [inlayId, record] = await ownedAtomicAsset('metadata-duplicate-marker')
+        const state = harness({ chat: {
+            id: 'conversation-1', message: [{
+                role: 'char',
+                data: `A{{inlay::${inlayId}}}B{{inlay::${inlayId}}}C`,
+                chatId: 'message-1', time: 1,
+                pluginMessageState: { 'plugin-a': {
+                    metadata: {},
+                    attachments: [{
+                        inlayId,
+                        presentation: 'inline',
+                        metadata: { locked: false },
+                    }],
+                } },
+            }],
+        } })
+        state.inlayAssets.set(inlayId, record)
+        state.dependencies.createRevision.mockResolvedValue('sha256:duplicate-marker')
+
+        await expect(state.adapter.patchCurrentMessage({
+            ...request,
+            input: {
+                ...request.input,
+                expectedRevision: 'sha256:duplicate-marker',
+                patch: { op: 'setOwnInlayMetadata', inlayId, value: { locked: true } },
+                idempotencyKey: 'metadata-duplicate-marker-1',
+            },
+        } as never)).rejects.toMatchObject({ code: 'CONFLICT' })
+        expect(state.chat.message[0].pluginMessageState['plugin-a'].attachments[0].metadata)
+            .toEqual({ locked: false })
+        expect(state.dependencies.waitForMessagePersistence).not.toHaveBeenCalled()
+    })
+
     it('restores raw marker, caller state, and receipt when replacement persistence fails', async () => {
         const [oldId, oldRecord] = await ownedAsset('rollback-old')
         const [newId, newRecord] = await ownedAsset('rollback-new')
