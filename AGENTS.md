@@ -1,3 +1,11 @@
+## Pnya downstream checkout
+
+- Before changing this downstream checkout, read the repository-root `PNYA.md`.
+- Keep local `main` as a fast-forward-only mirror of official `origin/main`; downstream work belongs on branches based on `pnya/main`.
+- Treat `pnya/main` as the verified rolling baseline. Use scoped `feat/*`, `fix/*`, or `sync/*` branches and advance it only after the checks in `PNYA.md` pass.
+- Never push to official `origin`, and do not rebase or force-push a published `pnya/main`.
+- Do not merge the preserved Task7/archive branches listed in `PNYA.md` unless the user explicitly reopens that scope.
+
 ## Project Overview
 
 Risuai is a cross-platform AI chatting application built with:
