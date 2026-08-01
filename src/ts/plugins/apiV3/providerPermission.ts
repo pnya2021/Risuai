@@ -1,4 +1,4 @@
-export type ProviderResult = { success: boolean; content: string }
+export type ProviderResult = { success: boolean; content: string | ReadableStream<string> }
 
 export async function invokePermissionCheckedProvider<T>(
     requestPermission: () => Promise<boolean>,

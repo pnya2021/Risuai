@@ -675,9 +675,144 @@ await (async function() {
         return val;
     }
 
-    function send(payload) {
+    function collectTransferables(obj, transferables = []) {
+        if (!obj || typeof obj !== 'object') return transferables;
+
+        if (obj instanceof ArrayBuffer ||
+            obj instanceof MessagePort ||
+            obj instanceof ImageBitmap ||
+            (typeof OffscreenCanvas !== 'undefined' && obj instanceof OffscreenCanvas)) {
+            transferables.push(obj);
+        }
+        else if (ArrayBuffer.isView(obj) && obj.buffer instanceof ArrayBuffer) {
+            transferables.push(obj.buffer);
+        }
+        else if (Array.isArray(obj)) {
+            obj.forEach(item => collectTransferables(item, transferables));
+        }
+        else if (obj.constructor === Object) {
+            Object.values(obj).forEach(value => collectTransferables(value, transferables));
+        }
+
+        return transferables;
+    }
+
+    function replaceStreamsWithPorts(obj) {
+        const ports = [];
+        const cleanups = [];
+        if (!obj || typeof obj !== 'object') return { result: obj, ports, cleanups };
+
+        function replace(val) {
+            if (!(val instanceof ReadableStream)) return val;
+
+            const ch = new MessageChannel();
+            ports.push(ch.port2);
+
+            const reader = val.getReader();
+            let credits = 0;
+            let reading = false;
+            let finished = false;
+
+            function finish() {
+                finished = true;
+                ch.port1.onmessage = null;
+                ch.port1.close();
+            }
+
+            cleanups.push(() => {
+                reader.cancel().catch(() => {});
+                finish();
+            });
+
+            async function pump() {
+                if (reading || finished) return;
+                reading = true;
+                try {
+                    while (credits > 0 && !finished) {
+                        credits--;
+                        const { done, value } = await reader.read();
+                        if (finished) return;
+                        if (done) { ch.port1.postMessage({ done: true }); finish(); return; }
+                        ch.port1.postMessage({ done: false, value });
+                    }
+                } catch (e) {
+                    try { ch.port1.postMessage({ done: true, error: e.message }); } catch(_) {}
+                    finish();
+                } finally {
+                    reading = false;
+                }
+            }
+
+            ch.port1.onmessage = (e) => {
+                if (e.data?.cancel) {
+                    reader.cancel();
+                    finish();
+                } else if (e.data?.pull) {
+                    credits++;
+                    pump();
+                }
+            };
+
+            return { __type: 'STREAM_PORT', portIndex: ports.length - 1 };
+        }
+
+        if (obj instanceof ReadableStream) return { result: replace(obj), ports, cleanups };
+        if (obj.constructor === Object) {
+            const out = {};
+            for (const k of Object.keys(obj)) out[k] = replace(obj[k]);
+            return { result: out, ports, cleanups };
+        }
+
+        return { result: obj, ports, cleanups };
+    }
+
+    function reconstructStreamsFromPorts(obj, ports) {
+        if (!obj || typeof obj !== 'object') return obj;
+
+        function reconstruct(val) {
+            if (!val || val.__type !== 'STREAM_PORT' || typeof val.portIndex !== 'number') return val;
+
+            const port = ports[val.portIndex];
+            if (!port) throw new Error('Stream port at index ' + val.portIndex + ' not received');
+
+            return new ReadableStream({
+                start(controller) {
+                    port.onmessage = (e) => {
+                        if (e.data.done) {
+                            if (e.data.error) controller.error(new Error(e.data.error));
+                            else controller.close();
+                            port.onmessage = null;
+                            port.close();
+                        } else {
+                            controller.enqueue(e.data.value);
+                        }
+                    };
+                },
+                pull() {
+                    port.postMessage({ pull: true });
+                },
+                cancel() {
+                    port.postMessage({ cancel: true });
+                    port.onmessage = null;
+                    port.close();
+                }
+            });
+        }
+
+        if (obj.__type === 'STREAM_PORT') return reconstruct(obj);
+        if (obj.constructor === Object) {
+            const out = {};
+            for (const k of Object.keys(obj)) out[k] = reconstruct(obj[k]);
+            return out;
+        }
+
+        return obj;
+    }
+
+    function send(payload, transferables = []) {
         const prepared = rpcPrepareMessage(payload);
-        window.parent.postMessage(prepared.message, '*', prepared.transferables);
+        const allTransferables = [...new Set([...transferables, ...prepared.transferables])];
+        window.parent.postMessage(prepared.message, '*', allTransferables);
     }
 
     function sendRequest(type, payload) {
@@ -772,7 +907,13 @@ await (async function() {
             const req = pendingRequests.get(data.reqId);
             if (req) {
                 if (data.error) req.reject(deserializePluginError(data.error));
-                else req.resolve(deserializeResult(data.result));
+                else {
+                    try {
+                        req.resolve(deserializeResult(reconstructStreamsFromPorts(data.result, event.ports)));
+                    } catch (e) {
+                        req.reject(e);
+                    }
+                }
                 pendingRequests.delete(data.reqId);
             }
         }
@@ -814,6 +955,15 @@ await (async function() {
             const fn = callbackRegistry.get(data.id);
             const response = { type: 'CALLBACK_RETURN', reqId: data.reqId };
             const usedAbortIds = [];
+            let transferables = [];
+            let streamCleanups = [];
+
+            const rollbackStreams = () => {
+                for (const cleanup of streamCleanups) {
+                    try { cleanup(); } catch(_) {}
+                }
+                streamCleanups = [];
+            };
 
             try {
                 if (!fn) throw makePluginError('NOT_FOUND', 'Callback not found or released');
@@ -829,7 +979,13 @@ await (async function() {
                 });
                 const result = await fn(...deserializedArgs);
                 response.result = result;
+                const { result: streamResult, ports: streamPorts, cleanups } = replaceStreamsWithPorts(response.result);
+                response.result = streamResult;
+                streamCleanups = cleanups;
+                transferables = streamPorts;
             } catch (e) {
+                rollbackStreams();
+                delete response.result;
                 response.error = serializePluginError(e);
             }
             // Clean up abort controllers after callback completes
@@ -837,9 +993,12 @@ await (async function() {
                 abortControllers.delete(id);
             }
             try {
-                send(response);
+                send(response, transferables);
             } catch {
-                send({ type: 'CALLBACK_RETURN', reqId: data.reqId, error: serializePluginError(undefined) });
+                rollbackStreams();
+                try {
+                    send({ type: 'CALLBACK_RETURN', reqId: data.reqId, error: serializePluginError(undefined) });
+                } catch { /* parent may already be gone */ }
             }
         }
 
@@ -942,6 +1101,9 @@ export class SandboxHost {
     private terminated = false;
     private runGeneration = 0;
 
+    // Streams bridged over MessagePort need explicit teardown when the iframe ends.
+    private activeStreamCleanups = new Set<() => void>();
+
     constructor(
         apiFactory: any,
         private readonly authorizeRequest: () => boolean = () => true,
@@ -981,28 +1143,33 @@ export class SandboxHost {
         });
     }
 
-    private postToGuest(message: RpcMessage | (RpcMessage & Record<string, unknown>)) {
+    private postToGuest(
+        message: RpcMessage | (RpcMessage & Record<string, unknown>),
+        transferables: Transferable[] = [],
+    ) {
         const target = this.iframe?.contentWindow;
         if (!target) throw new PluginApiError('ABORTED', 'Plugin sandbox terminated');
         const prepared = prepareRpcMessage(message);
+        const allTransferables = [...new Set([...transferables, ...prepared.transferables])];
         console.log('[V3 RPC]', {
             direction: 'host-to-guest',
             type: rpcLogType(message.type),
-            transferCount: prepared.transferables.length,
+            transferCount: allTransferables.length,
         });
-        target.postMessage(prepared.message, '*', prepared.transferables);
+        target.postMessage(prepared.message, '*', allTransferables);
     }
 
     private isCurrentRun(runGeneration: number) {
         return !this.terminated && this.runGeneration === runGeneration;
     }
 
-    private postResponse(response: RpcMessage, runGeneration: number) {
-        if (!this.isCurrentRun(runGeneration)) return;
+    private postResponse(response: RpcMessage, runGeneration: number, transferables: Transferable[] = []) {
+        if (!this.isCurrentRun(runGeneration)) return false;
         try {
-            this.postToGuest(response);
+            this.postToGuest(response, transferables);
+            return true;
         } catch {
-            if (!this.isCurrentRun(runGeneration)) return;
+            if (!this.isCurrentRun(runGeneration)) return false;
             try {
                 this.postToGuest({
                     type: response.type,
@@ -1012,6 +1179,7 @@ export class SandboxHost {
             } catch {
                 console.error('[V3 RPC] postMessage failed', { type: response.type });
             }
+            return false;
         }
     }
 
@@ -1046,8 +1214,7 @@ export class SandboxHost {
         }
 
         if(
-            val instanceof ReadableStream
-            || val instanceof WritableStream
+            val instanceof WritableStream
             || val instanceof TransformStream
         ) {
             return {
@@ -1174,6 +1341,145 @@ export class SandboxHost {
         });
     }
 
+    private replaceStreamsWithPorts(obj: any): { result: any, ports: MessagePort[], cleanups: (() => void)[] } {
+        const ports: MessagePort[] = [];
+        const cleanups: (() => void)[] = [];
+        if (!obj || typeof obj !== 'object') return { result: obj, ports, cleanups };
+
+        const replace = (val: any): any => {
+            if (!(val instanceof ReadableStream)) return val;
+
+            const ch = new MessageChannel();
+            ports.push(ch.port2);
+
+            const reader = val.getReader();
+            let credits = 0;
+            let reading = false;
+            let finished = false;
+
+            const finish = () => {
+                finished = true;
+                ch.port1.onmessage = null;
+                ch.port1.close();
+                this.activeStreamCleanups.delete(cleanup);
+            };
+
+            const cleanup = () => {
+                reader.cancel().catch(() => {});
+                finish();
+            };
+            this.activeStreamCleanups.add(cleanup);
+            cleanups.push(cleanup);
+
+            const pump = async () => {
+                if (reading || finished) return;
+                reading = true;
+                try {
+                    while (credits > 0 && !finished) {
+                        credits--;
+                        const { done, value } = await reader.read();
+                        if (finished) return;
+                        if (done) { ch.port1.postMessage({ done: true }); finish(); return; }
+                        ch.port1.postMessage({ done: false, value });
+                    }
+                } catch (e: any) {
+                    try { ch.port1.postMessage({ done: true, error: e.message }); } catch(_) {}
+                    finish();
+                } finally {
+                    reading = false;
+                }
+            };
+
+            ch.port1.onmessage = (e: MessageEvent) => {
+                if (e.data?.cancel) {
+                    reader.cancel();
+                    finish();
+                } else if (e.data?.pull) {
+                    credits++;
+                    pump();
+                }
+            };
+
+            return { __type: 'STREAM_PORT', portIndex: ports.length - 1 };
+        };
+
+        if (obj instanceof ReadableStream) return { result: replace(obj), ports, cleanups };
+        if (obj.constructor === Object) {
+            const out: any = {};
+            for (const k of Object.keys(obj)) out[k] = replace(obj[k]);
+            return { result: out, ports, cleanups };
+        }
+
+        return { result: obj, ports, cleanups };
+    }
+
+    private reconstructStreamsFromPorts(obj: any, ports: readonly MessagePort[]): any {
+        if (!obj || typeof obj !== 'object') return obj;
+
+        const reconstruct = (val: any): any => {
+            if (val?.__type !== 'STREAM_PORT' || typeof val.portIndex !== 'number') return val;
+
+            const port = ports[val.portIndex];
+            if (!port) throw new Error(`Stream port at index ${val.portIndex} not received`);
+
+            const cleanups = this.activeStreamCleanups;
+            let cleanup: (() => void) | null = null;
+            const unregister = () => {
+                if (cleanup) {
+                    cleanups.delete(cleanup);
+                    cleanup = null;
+                }
+            };
+
+            return new ReadableStream({
+                start(controller) {
+                    port.onmessage = (e: MessageEvent) => {
+                        if (e.data.done) {
+                            if (e.data.error) controller.error(new Error(e.data.error));
+                            else controller.close();
+                            port.onmessage = null;
+                            port.close();
+                            unregister();
+                        } else {
+                            controller.enqueue(e.data.value);
+                        }
+                    };
+                    cleanup = () => {
+                        controller.error(new Error('Sandbox terminated'));
+                        port.onmessage = null;
+                        port.close();
+                    };
+                    cleanups.add(cleanup);
+                },
+                pull() {
+                    port.postMessage({ pull: true });
+                },
+                cancel() {
+                    port.postMessage({ cancel: true });
+                    port.onmessage = null;
+                    port.close();
+                    unregister();
+                }
+            });
+        };
+
+        if (obj.__type === 'STREAM_PORT') return reconstruct(obj);
+        if (obj.constructor === Object) {
+            const out: any = {};
+            for (const k of Object.keys(obj)) out[k] = reconstruct(obj[k]);
+            return out;
+        }
+
+        return obj;
+    }
+
+    private closeActiveStreams() {
+        for (const cleanup of [...this.activeStreamCleanups]) {
+            try { cleanup(); } catch(_) {}
+        }
+        this.activeStreamCleanups.clear();
+    }
+
     public run(container: HTMLElement|HTMLIFrameElement, userCode: string) {
         if(container instanceof HTMLIFrameElement) {
             this.iframe = container;
@@ -1239,7 +1545,13 @@ export class SandboxHost {
                         return
                     }
                     if (data.error) req.reject(deserializePluginApiError(data.error));
-                    else req.resolve(data.result);
+                    else {
+                        try {
+                            req.resolve(this.reconstructStreamsFromPorts(data.result, event.ports));
+                        } catch (error) {
+                            req.reject(error);
+                        }
+                    }
                 }
                 return;
             }
@@ -1263,6 +1575,15 @@ export class SandboxHost {
             if (data.type === 'CALL_ROOT' || data.type === 'CALL_INSTANCE') {
                 const response: RpcMessage = { type: 'RESPONSE', reqId: data.reqId };
                 const usedAbortIds: string[] = [];
+                let transferables: Transferable[] = [];
+                let streamCleanups: (() => void)[] = [];
+
+                const rollbackStreams = () => {
+                    for (const cleanup of streamCleanups) {
+                        try { cleanup(); } catch(_) {}
+                    }
+                    streamCleanups = [];
+                };
 
                 try {
 
@@ -1288,8 +1609,14 @@ export class SandboxHost {
                     }
 
                     response.result = this.serialize(result, runGeneration);
+                    const { result: streamResult, ports: streamPorts, cleanups } = this.replaceStreamsWithPorts(response.result);
+                    response.result = streamResult;
+                    streamCleanups = cleanups;
+                    transferables = streamPorts;
 
                 } catch (err: any) {
+                    rollbackStreams();
+                    delete response.result;
                     if (!this.isCurrentRun(runGeneration)) return;
                     if (!this.isAuthorized()) {
                         this.terminateUnauthorized()
@@ -1300,7 +1627,9 @@ export class SandboxHost {
                     for (const id of usedAbortIds) this.abortControllers.delete(id);
                 }
 
-                if (this.isCurrentRun(runGeneration)) this.postResponse(response, runGeneration);
+                if (this.isCurrentRun(runGeneration) && !this.postResponse(response, runGeneration, transferables)) {
+                    rollbackStreams();
+                }
             }
         };
 
@@ -1364,6 +1693,7 @@ export class SandboxHost {
         if (this.messageHandler) window.removeEventListener('message', this.messageHandler);
         this.messageHandler = undefined;
         this.iframe?.remove();
+        this.closeActiveStreams();
         this.instanceRegistry.clear();
         this.pendingCallbacks.clear();
         this.pendingExecutions.clear();

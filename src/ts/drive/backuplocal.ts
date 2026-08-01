@@ -9,7 +9,7 @@ import { relaunch } from "@tauri-apps/plugin-process";
 import { decryptBuffer, encryptBuffer, sleep } from "../util";
 import { hubURL } from "../characterCards";
 import { language } from "src/lang";
-import { getColdStorageItem, listColdDataKeys, setColdStorageItem } from "../process/coldstorage.svelte";
+import { collectColdStorageBackupPayloads, confirmIncompleteColdStorageOperation, getColdStorageBackupKey, getColdStorageItem, isColdStorageBackupData, listColdDataKeys, setColdStorageItem } from "../process/coldstorage.svelte";
 import { DBState } from "../stores.svelte";
 import { runSuspendedPluginRuntimeMutation } from "../plugins/plugins.svelte";
 import { databasePersistenceCoordinator } from "../storage/databasePersistenceCoordinator";
@@ -21,23 +21,15 @@ function getBasename(data:string){
     return lasts
 }
 
-function getColdStorageBackupKey(name: string): string | null {
-    const match = name.match(/^(?:coldstorage[/_])?([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\.json$/)
-    return match?.[1] ?? null
-}
-
-function isColdStorageBackupData(data: unknown): boolean {
-    if (Array.isArray(data)) {
-        return true
-    }
-
-    return !!data
-        && typeof data === 'object'
-        && ('character' in data || 'message' in data)
-}
-
 export async function SaveLocalBackup(){
     alertWait("Saving local backup...")
+    const db = getDatabase()
+    const coldStoragePayloads = await collectColdStorageBackupPayloads(db)
+    const unavailableColdStorageKeys = [...coldStoragePayloads.missingKeys, ...coldStoragePayloads.invalidKeys]
+    if(!await confirmIncompleteColdStorageOperation(db, unavailableColdStorageKeys, 'backup')){
+        return
+    }
+
     const writer = new LocalWriter()
     const r = await writer.init()
     if(!r){
@@ -45,7 +37,6 @@ export async function SaveLocalBackup(){
         return
     }
 
-    const db = getDatabase()
     const assetMap = new Map<string, { charName: string, assetName: string }>()
     if (db.characters) {
         for (const char of db.characters) {
@@ -162,21 +153,11 @@ export async function SaveLocalBackup(){
         }
     }
 
-    if(!forageStorage.isAccount){
-        //save coldstorages
-        const coldKeys = await listColdDataKeys()
-        for(let i=0;i<coldKeys.length;i++){
-            const key = coldKeys[i]
-            let message = `Saving local Backup Cold data... (${i + 1} / ${coldKeys.length})`
-            alertWait(message)
-            const data = await getColdStorageItem(key)
-            if(data){
-                const encoded = new TextEncoder().encode(JSON.stringify(data))
-                await writer.writeBackup(`coldstorage_${key}.json`, encoded)
-            } else {
-                missingAssets.push(`coldstorage_${key}.json`)
-            }
-        }
+    for(let i=0;i<coldStoragePayloads.payloads.length;i++){
+        const payload = coldStoragePayloads.payloads[i]
+        let message = `Saving local Backup Cold data... (${i + 1} / ${coldStoragePayloads.payloads.length})`
+        alertWait(message)
+        await writer.writeBackup(payload.backupName, payload.encoded)
     }
 
     const dbWithoutAccount = { ...db, account: undefined }
@@ -237,6 +218,13 @@ export async function SavePartialLocalBackup(){
     }
     
     alertWait("Saving partial local backup...")
+    const db = getDatabase()
+    const coldStoragePayloads = await collectColdStorageBackupPayloads(db)
+    const unavailableColdStorageKeys = [...coldStoragePayloads.missingKeys, ...coldStoragePayloads.invalidKeys]
+    if(!await confirmIncompleteColdStorageOperation(db, unavailableColdStorageKeys, 'backup')){
+        return
+    }
+
     const writer = new LocalWriter()
     const r = await writer.init()
     if(!r){
@@ -244,7 +232,6 @@ export async function SavePartialLocalBackup(){
         return
     }
 
-    const db = getDatabase()
     const assetMap = new Map<string, { charName: string, assetName: string }>()
     
     // Only collect main profile images for both characters and groups
@@ -386,21 +373,11 @@ export async function SavePartialLocalBackup(){
         }
     }
 
-    if(!forageStorage.isAccount){
-        //save coldstorages
-        const coldKeys = await listColdDataKeys()
-        for(let i=0;i<coldKeys.length;i++){
-            const key = coldKeys[i]
-            let message = `Saving partial local Backup Cold data... (${i + 1} / ${coldKeys.length})`
-            alertWait(message)
-            const data = await getColdStorageItem(key)
-            if(data){
-                const encoded = new TextEncoder().encode(JSON.stringify(data))
-                await writer.writeBackup(`coldstorage_${key}.json`, encoded)
-            } else {
-                missingAssets.push(`coldstorage_${key}.json`)
-            }
-        }
+    for(let i=0;i<coldStoragePayloads.payloads.length;i++){
+        const payload = coldStoragePayloads.payloads[i]
+        let message = `Saving partial local Backup Cold data... (${i + 1} / ${coldStoragePayloads.payloads.length})`
+        alertWait(message)
+        await writer.writeBackup(payload.backupName, payload.encoded)
     }
 
     const dbWithoutAccount = { ...db, account: undefined }
@@ -451,6 +428,7 @@ export function LoadLocalBackup(){
                 const entries: Array<{ name: string; data: Uint8Array }> = []
                 let bytesRead = 0;
                 let remainingBuffer = new Uint8Array();
+                const restoredColdStorageKeys = new Set<string>();
 
                 while (true) {
                     const { done, value } = await reader.read();
@@ -512,22 +490,28 @@ export function LoadLocalBackup(){
                     }
                     restoredDatabase = await decodeRisuSave(bytes)
                 }
+                if (!restoredDatabase) {
+                    alertError('Failed, Is file corrupted?')
+                    return
+                }
 
-                await runSuspendedPluginRuntimeMutation(async ({ markIrreversibleMutation, replaceLiveDatabase }) =>
+                const restoreAccepted = await runSuspendedPluginRuntimeMutation(async ({ markIrreversibleMutation, replaceLiveDatabase }) =>
                     databasePersistenceCoordinator.runExclusiveMutation(async () => {
                     for (const { name, data } of entries) {
                         if (name === 'encryption.risudat' || name === 'database.risudat') continue
                         const coldStorageKey = getColdStorageBackupKey(name)
                         let handledAsColdStorage = false
-                        if (coldStorageKey && forageStorage.isAccount) {
+                        if (coldStorageKey) {
                             handledAsColdStorage = true
-                        } else if (coldStorageKey) {
                             try {
                                 const jsonData = JSON.parse(new TextDecoder().decode(data))
                                 if (isColdStorageBackupData(jsonData)) {
                                     markIrreversibleMutation()
-                                    await setColdStorageItem(coldStorageKey, jsonData)
-                                    handledAsColdStorage = true
+                                    if(await setColdStorageItem(coldStorageKey, jsonData)){
+                                        restoredColdStorageKeys.add(coldStorageKey)
+                                    } else {
+                                        console.error(`Failed to restore cold storage item ${coldStorageKey}`)
+                                    }
                                 } else {
                                     console.warn(`Skipping invalid cold storage backup item ${name}`)
                                 }
@@ -544,20 +528,26 @@ export function LoadLocalBackup(){
                         if (forageStorage.isAccount) await sleep(1000);
                     }
 
-                    if (restoredDatabase) {
-                        await replaceLiveDatabase(restoredDatabase)
-                        await persistRestoredDatabaseUnderLease(getDatabase({ snapshot: true }))
+                    const missingColdStorageKeys:string[] = []
+                    for(const key of await listColdDataKeys(restoredDatabase)){
+                        if(restoredColdStorageKeys.has(key)) continue
+                        const existingColdStorage = await getColdStorageItem(key)
+                        if(!isColdStorageBackupData(existingColdStorage)) missingColdStorageKeys.push(key)
                     }
+                    if(!await confirmIncompleteColdStorageOperation(restoredDatabase, missingColdStorageKeys, 'restore')){
+                        return false
+                    }
+
+                    await replaceLiveDatabase(restoredDatabase)
+                    await persistRestoredDatabaseUnderLease(getDatabase({ snapshot: true }))
+                    return true
                 }))
 
-                if (restoredDatabase) {
-                    requiresFullEncoderReload.state = true;
-                    alertStore.set({ type: "wait", msg: "Success, Refreshing your app." });
-                    if (isTauri) await relaunch();
-                    else location.search = '';
-                } else {
-                    alertNormal('Success');
-                }
+                if (!restoreAccepted) return
+                requiresFullEncoderReload.state = true;
+                alertStore.set({ type: "wait", msg: "Success, Refreshing your app." });
+                if (isTauri) await relaunch();
+                else location.search = '';
             } catch (error) {
                 console.error(error);
                 alertError('Failed, Is file corrupted?')

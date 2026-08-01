@@ -28,11 +28,15 @@ import { normalizePluginDatabaseState } from '../plugins/pluginDatabaseNormaliza
 import { retirePluginPrincipals } from '../plugins/pluginRetirement';
 import { withAuthorizedPluginMutationLock } from '../plugins/pluginMutationCoordinator';
 import { normalizeContextRecordIds } from './contextRecordIds';
+import { setDatabaseLite as setDatabaseStateLite } from './databaseState.svelte';
+
+export { onDatabaseUpdate } from './databaseState.svelte';
 
 //APP_VERSION_POINT is to locate the app version in the database file for version bumping
-export let appVer = "2026.6.214" //<APP_VERSION_POINT>
+export let appVer = "2026.6.215" //<APP_VERSION_POINT>
 export let webAppSubVer = ''
 
+export type StreamingDisplayOptimizationMode = 'off'|'balanced'|'strong'
 
 export function setDatabase(data:Database){
     if(checkNullish(data.characters)){
@@ -395,6 +399,7 @@ export function setDatabase(data:Database){
     data.animationSpeed ??= 0.4
     data.colorScheme ??= safeStructuredClone(defaultColorScheme)
     data.colorSchemeName ??= 'default'
+    data.customColorScheme ??= safeStructuredClone(data.colorSchemeName === 'custom' ? data.colorScheme : defaultColorScheme)
     data.NAIsettings.starter ??= ""
     data.hypaModel ??= 'MiniLM'
     data.mancerHeader ??= ''
@@ -697,6 +702,8 @@ export function setDatabase(data:Database){
     data.newMessageButtonStyle ??= 'bottom-center'
     data.chatLoadInitialPages = normalizeChatLoadPages(data.chatLoadInitialPages, DEFAULT_CHAT_LOAD_INITIAL_PAGES)
     data.chatLoadAdditionalPages = normalizeChatLoadPages(data.chatLoadAdditionalPages, DEFAULT_CHAT_LOAD_ADDITIONAL_PAGES)
+    data.streamingDisplayOptimizationMode ??= (data as {largeChatPerformanceMode?: StreamingDisplayOptimizationMode}).largeChatPerformanceMode ?? 'off'
+    delete (data as {largeChatPerformanceMode?: unknown}).largeChatPerformanceMode
     data.echoMessage ??= "Echo Message"
     data.echoDelay ??= 0
     if(!isNodeServer && !isTauri){
@@ -717,15 +724,24 @@ export function setDatabase(data:Database){
     data.moveInsteadOfCopyOnCMPConvert ??= false
     data.skipSavingAssetsOnWebSync ??= true
     data.coldstorage ??= data?.plugins?.length === 0
+    for(const char of data.characters){
+        for(const chat of char.chats ?? []){
+            chat.isStreaming = false
+            chat.activeStreamingDisplayOptimizationMode = undefined
+        }
+    }
     changeLanguage(data.language)
     setDatabaseLite(data)
     return { ...pluginStateNormalization, ...contextIdNormalization }
 }
 
 export function setDatabaseLite(data:Database){
+    if(data === DBState.db){
+        return { pluginStateChanged: false, contextIdsChanged: false }
+    }
     const pluginStateNormalization = normalizePluginDatabaseState(data)
     const contextIdNormalization = normalizeContextRecordIds(data)
-    DBState.db = data
+    setDatabaseStateLite(data)
     return { ...pluginStateNormalization, ...contextIdNormalization }
 }
 
@@ -747,7 +763,6 @@ export async function setDatabaseLive(
         setDatabase(data)
     })
 }
-
 interface getDatabaseOptions{
     snapshot?:boolean
 }
@@ -1007,6 +1022,7 @@ export interface Database{
     hideRealm:boolean
     colorScheme:ColorScheme
     colorSchemeName:string
+    customColorScheme:ColorScheme
     promptTemplate?:PromptItem[]
     forceProxyAsOpenAI?:boolean
     hypaModel:HypaModel
@@ -1298,6 +1314,7 @@ export interface Database{
     newMessageButtonStyle?: string
     chatLoadInitialPages?: number
     chatLoadAdditionalPages?: number
+    streamingDisplayOptimizationMode?: StreamingDisplayOptimizationMode
     pluginDevelopMode?: boolean
     echoMessage?:string
     echoDelay?:number
@@ -1868,6 +1885,7 @@ export interface Chat{
     lastMemory?:string
     suggestMessages?:string[]
     isStreaming?:boolean
+    activeStreamingDisplayOptimizationMode?:StreamingDisplayOptimizationMode
     scriptstate?:{[key:string]:string|number|boolean}
     modules?:string[]
     id?:string

@@ -9,6 +9,7 @@ vi.stubGlobal('ImageBitmap', class ImageBitmap {})
 type PostedMessage = {
   message: any
   transferCount: number
+  transferables: Transferable[]
 }
 
 const cleanups: Array<() => void> = []
@@ -57,6 +58,7 @@ function createHarness(
         ? structuredClone(message, { transfer })
         : message,
       transferCount: transfer.length,
+      transferables: [...transfer],
     })
   }) as typeof contentWindow.postMessage)
 
@@ -488,6 +490,39 @@ describe('SandboxHost callback and teardown lifecycle', () => {
 
     expect((host as any).instanceRegistry.size).toBe(0)
     expect(posted.filter((entry) => entry.message.type === 'RESPONSE' && entry.message.reqId === 'late-result')).toHaveLength(0)
+  })
+
+  it('orders bridged stream ports before unrelated MessagePort transferables', async () => {
+    const bridgeChannel = new MessageChannel()
+    const unrelatedChannel = new MessageChannel()
+    const originalMessagePort = globalThis.MessagePort
+    vi.stubGlobal('MessagePort', unrelatedChannel.port1.constructor)
+    const { host, iframe, posted } = createHarness({})
+
+    ;(host as any).postToGuest({
+      type: 'RESPONSE',
+      reqId: 'mixed-transferables',
+      result: {
+        unrelatedPort: unrelatedChannel.port1,
+        stream: { __type: 'STREAM_PORT', portIndex: 0 },
+      },
+    }, [bridgeChannel.port1])
+
+    const response = await postedMessage(posted, 'RESPONSE', 'mixed-transferables')
+    expect(response.transferables).toHaveLength(2)
+    expect(response.transferables.map((port) => port === bridgeChannel.port1)).toEqual([true, false])
+    expect(response.transferables.map((port) => port === unrelatedChannel.port1)).toEqual([false, true])
+
+    const parsed = new DOMParser().parseFromString(iframe.srcdoc, 'text/html')
+    const guestScript = parsed.querySelector('script')?.textContent ?? ''
+    expect(guestScript).toContain('[...transferables, ...prepared.transferables]')
+
+    bridgeChannel.port1.close()
+    bridgeChannel.port2.close()
+    unrelatedChannel.port1.close()
+    unrelatedChannel.port2.close()
+    if (originalMessagePort === undefined) Reflect.deleteProperty(globalThis, 'MessagePort')
+    else vi.stubGlobal('MessagePort', originalMessagePort)
   })
 
   it('removes listeners, aborts controllers, and rejects all pending host promises on terminate', async () => {

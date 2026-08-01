@@ -796,7 +796,7 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
         deletePluginSecret: (id: string) => secretService.deletePluginSecret(id),
         getChar: oldApis.getChar,
         setChar: oldApis.setChar,
-        addProvider: (name: string, func: (arg: PluginV2ProviderArgument, abortSignal?: AbortSignal) => Promise<{ success: boolean, content: string }>, options?: PluginV3ProviderOptions) => {
+        addProvider: (name: string, func: (arg: PluginV2ProviderArgument, abortSignal?: AbortSignal) => Promise<{ success: boolean, content: string | ReadableStream<string> }>, options?: PluginV3ProviderOptions) => {
             console.warn(`[WARN] addProvider is a powerful API that can potentially be unsafe if used incorrectly. addProvider's functionality might be limited or changed in future updates to ensure security. please use other APIs if possible.`);
             const providerCallback = async (arg: PluginV2ProviderArgument, abortSignal?: AbortSignal) => {
                 return invokePermissionCheckedProvider(
@@ -872,6 +872,12 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
             addPluginUnloadCallback(context.instanceId, () => oldApis.removeRisuReplacer(name, func as any))
         },
         removeRisuReplacer: oldApis.removeRisuReplacer,
+        addRisuChatListener: async (mode:'output', func:Function) => {
+            if (!canRegisterResource()) return
+            oldApis.addRisuChatListener(mode, func as any);
+            addPluginUnloadCallback(context.instanceId, () => oldApis.removeRisuChatListener(mode, func as any));
+        },
+        removeRisuChatListener: oldApis.removeRisuChatListener,
         setDatabaseLite: (newDb: any) => applyProgrammaticDatabaseMutation(newDb, 'lite', canRegisterResource, isExecutionCurrent),
         setDatabase: (newDb: any) => applyProgrammaticDatabaseMutation(newDb, 'approved', canRegisterResource, isExecutionCurrent),
         loadPlugins: async () => {
@@ -935,6 +941,7 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
             }
             const db = DBState.db
             db.colorSchemeName = 'custom'
+            db.customColorScheme = scheme
             db.colorScheme = scheme
             updateColorScheme()
         },

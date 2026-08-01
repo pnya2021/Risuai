@@ -14,7 +14,7 @@ import { appDataDir, join } from "@tauri-apps/api/path";
 import { get } from "svelte/store";
 import { open } from '@tauri-apps/plugin-shell'
 import streamSaver from 'streamsaver';
-import { type Database, defaultSdDataFunc, getDatabase, appVer, getCurrentCharacter, type character, type groupChat } from "./storage/database.svelte";
+import { setDatabase, type Database, defaultSdDataFunc, getDatabase, appVer, getCurrentCharacter, onDatabaseUpdate, type character, type groupChat } from "./storage/database.svelte";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { checkRisuUpdate } from "./update";
 import { MobileGUI, botMakerMode, selectedCharID, loadedStore, DBState, LoadingStatusState, selIdState, ReloadGUIPointer, bodyIntercepterStore } from "./stores.svelte";
@@ -368,20 +368,34 @@ export async function saveDb() {
         }
     }
 
-    const changeTracker: toSaveType = {
+    const createChangeTracker = (): toSaveType => ({
         character: [],
-        chat: [],
         botPreset: false,
         modules: false,
         loadouts: false,
         plugins: false,
         pluginCustomStorage: false
+    })
+    const cloneChangeTracker = (tracker: toSaveType): toSaveType => ({
+        ...tracker,
+        character: [...tracker.character]
+    })
+    const mergeChangeTrackers = (target: toSaveType, source: toSaveType) => {
+        for (const characterId of source.character) {
+            if (!target.character.includes(characterId)) {
+                target.character.push(characterId)
+            }
+        }
+        target.botPreset ||= source.botPreset
+        target.modules ||= source.modules
+        target.loadouts ||= source.loadouts
+        target.plugins ||= source.plugins
+        target.pluginCustomStorage ||= source.pluginCustomStorage
     }
+    let changeTracker = createChangeTracker()
+    let savetrys = 0
 
     let encoder = new RisuSaveEncoder()
-    await encoder.init(getDatabase(), {
-        compression: forageStorage.isAccount
-    })
 
     $effect.root(() => {
 
@@ -390,7 +404,7 @@ export async function saveDb() {
         const debounceTime = 500; // 500 milliseconds
         let saveTimeout: ReturnType<typeof setTimeout> | null = null;
 
-        selectedCharID.subscribe((v) => {
+        const unsubscribeSel = selectedCharID.subscribe((v) => {
             selIdState = v
         })
 
@@ -403,63 +417,89 @@ export async function saveDb() {
             }, debounceTime);
         }
 
-        $effect(() => {
-            DBState.db.botPresetsId
-            DBState.db.botPresets.length
-            changeTracker.botPreset = true
-            saveTimeoutExecute()
-        })
-        $effect(() => {
-            $state.snapshot(DBState.db.modules)
-            changeTracker.modules = true
-            saveTimeoutExecute()
-        })
-        $effect(() => {
-            $state.snapshot(DBState.db.loadouts)
-            changeTracker.loadouts = true
-            saveTimeoutExecute()
-        })
-        $effect(() => {
-            $state.snapshot(DBState.db.plugins)
-            changeTracker.plugins = true
-            saveTimeoutExecute()
-        })
-        $effect(() => {
-            $state.snapshot(DBState.db.pluginCustomStorage)
-            changeTracker.pluginCustomStorage = true
-            saveTimeoutExecute()
-        })
-        $effect(() => {
-            for (const key in DBState.db) {
-                if (
-                    key !== 'characters' && key !== 'botPresets' && key !== 'modules' &&
-                    key !== 'loadouts' && key !== 'plugins' && key !== 'pluginCustomStorage'
-                ) {
-                    $state.snapshot(DBState.db[key])
-                }
+        const unsubscribeDb = onDatabaseUpdate((info) => {
+            if (info.path.length === 0) {
+                requiresFullEncoderReload.state = true
+                savetrys = 0
+                saveTimeoutExecute()
+                return
             }
-            if (DBState?.db?.characters?.[selIdState]) {
-                for (const key in DBState.db.characters[selIdState]) {
-                    if (key !== 'chats') {
-                        $state.snapshot(DBState.db.characters[selIdState][key])
+
+            const rootKey = info.path[0]
+
+            if (rootKey === 'botPresets' || rootKey === 'botPresetsId') {
+                changeTracker.botPreset = true
+                saveTimeoutExecute()
+                return
+            }
+
+            if (rootKey === 'modules') {
+                changeTracker.modules = true
+                saveTimeoutExecute()
+                return
+            }
+
+            if (rootKey === 'loadouts' || rootKey === 'plugins' || rootKey === 'pluginCustomStorage') {
+                changeTracker[rootKey] = true
+                saveTimeoutExecute()
+                return
+            }
+
+            if (rootKey === 'characters') {
+                const affectedCharacters: Database['characters'] = []
+
+                if (info.path.length === 1) {
+                    const oldCharacters = info.oldValue as Database['characters'] | undefined
+                    const newCharacters = info.value as Database['characters'] | undefined
+                    affectedCharacters.push(...(oldCharacters ?? []), ...(newCharacters ?? []))
+                }
+                else if (typeof info.path[1] === 'number') {
+                    if (info.path.length === 2) {
+                        const oldChar = info.oldValue as Database['characters'][number] | undefined
+                        if (oldChar) {
+                            affectedCharacters.push(oldChar)
+                        }
+                    }
+                    const char = DBState.db.characters[info.path[1]]
+                    if (char) {
+                        affectedCharacters.push(char)
                     }
                 }
-                $state.snapshot(DBState.db.characters[selIdState].chats)
-                if (changeTracker.character[0] !== DBState.db.characters[selIdState]?.chaId) {
-                    changeTracker.character.unshift(DBState.db.characters[selIdState]?.chaId)
+
+                for (const char of affectedCharacters) {
+                    if (!changeTracker.character.includes(char.chaId)) {
+                        changeTracker.character.unshift(char.chaId)
+                    }
                 }
-                if (
-                    changeTracker.chat[0]?.[0] !== DBState.db.characters[selIdState]?.chaId ||
-                    changeTracker.chat[0]?.[1] !== DBState.db.characters[selIdState]?.chats[DBState.db.characters[selIdState]?.chatPage].id
-                ) {
-                    changeTracker.chat.unshift([DBState.db.characters[selIdState]?.chaId, DBState.db.characters[selIdState]?.chats[DBState.db.characters[selIdState]?.chatPage].id])
-                }
+                saveTimeoutExecute()
+                return
+            }
+
+            const char = DBState.db.characters[selIdState]
+            if (char && !changeTracker.character.includes(char.chaId)) {
+                changeTracker.character.unshift(char.chaId)
             }
             saveTimeoutExecute()
         })
+        // Persist bootstrap mutations emitted before the database listener existed.
+        saveTimeoutExecute()
+
+        return () => {
+            unsubscribeSel()
+            unsubscribeDb()
+        }
     })
 
-    let savetrys = 0
+    try {
+        await encoder.init(getDatabase(), {
+            compression: forageStorage.isAccount
+        })
+    } catch (error) {
+        requiresFullEncoderReload.state = true
+        changed = true
+        console.error(error)
+    }
+
     let lastDbData = new Uint8Array(0)
     await sleep(1000)
     while (true) {
@@ -468,30 +508,42 @@ export async function saveDb() {
             continue
         }
 
+        if (gotChannel) {
+            // Data is saved in another tab.
+            await sleep(1000)
+            continue
+        }
+
         saving.state = true
         changed = false
+        const pendingSave = cloneChangeTracker(changeTracker)
+        changeTracker = createChangeTracker()
+        const toSave = cloneChangeTracker(pendingSave)
         let persistenceBatch: MessagePersistenceBatch | undefined
         try {
-            let toSave = safeStructuredClone(changeTracker)
-            changeTracker.character = changeTracker.character.length === 0 ? [] : [changeTracker.character[0]]
-            changeTracker.chat = changeTracker.chat.length === 0 ? [] : [changeTracker.chat[0]]
-            changeTracker.botPreset = false
-            changeTracker.modules = false
-            if (gotChannel) {
-                //Data is saved in other tab
-                if (messagePersistenceWaiter.hasPending()) changed = true
-                await sleep(1000)
-                continue
+            const hasPersistenceWaiters = messagePersistenceWaiter.hasPending()
+            const db = hasPersistenceWaiters ? getDatabase({ snapshot: true }) : getDatabase()
+
+            if (requiresFullEncoderReload.state) {
+                requiresFullEncoderReload.state = false
+                encoder = new RisuSaveEncoder()
+                try {
+                    await encoder.init(db, {
+                        compression: forageStorage.isAccount,
+                        skipRemoteSavingOnCharacters: false
+                    })
+                } catch (error) {
+                    requiresFullEncoderReload.state = true
+                    throw error
+                }
             }
+
             if (channel) {
                 channel.postMessage(sessionID)
             }
-            const hasPersistenceWaiters = messagePersistenceWaiter.hasPending()
-            let db = hasPersistenceWaiters ? getDatabase({ snapshot: true }) : getDatabase()
+
             if (!db.characters) {
-                if (hasPersistenceWaiters) changed = true
-                await sleep(1000)
-                continue
+                throw new Error('Database has no character list')
             }
 
             if (hasPersistenceWaiters) {
@@ -511,13 +563,7 @@ export async function saveDb() {
             await encoder.set(db, toSave)
             const encoded = encoder.encode()
             if (!encoded) {
-                if (persistenceBatch) {
-                    messagePersistenceWaiter.release(persistenceBatch)
-                    persistenceBatch = undefined
-                    changed = true
-                }
-                await sleep(1000)
-                continue
+                throw new Error('Database encoding failed')
             }
             const dbData = new Uint8Array(encoded)
             const write = await databasePersistenceCoordinator.runNormalWrite(persistenceGeneration, async () => {
@@ -537,6 +583,7 @@ export async function saveDb() {
                     persistenceBatch = undefined
                 }
                 requiresFullEncoderReload.state = true
+                mergeChangeTrackers(changeTracker, pendingSave)
                 changed = true
             } else {
                 if (persistenceBatch) {
@@ -554,12 +601,15 @@ export async function saveDb() {
                 messagePersistenceWaiter.fail(persistenceBatch, error)
                 persistenceBatch = undefined
             }
+            mergeChangeTrackers(changeTracker, pendingSave)
             savetrys += 1
             if (savetrys > 4) {
                 alertError(error)
             }
             else {
                 console.error(error)
+                await sleep(1000)
+                changed = true
             }
         }
 
@@ -994,7 +1044,7 @@ export async function getUncleanables(db: Database, uptype: 'basename' | 'pure' 
         for(let cha of db.characters){
             if(cha?.coldstorage){
                 const coldData = await getColdStorageItem(cha.coldstorage!)
-                if(coldData.character && coldData.character.chaId === cha.chaId){
+                if(coldData?.character && coldData.character.chaId === cha.chaId){
                     cha = coldData.character
                 }
             }
