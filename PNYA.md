@@ -63,6 +63,7 @@ Never infer complete compatibility from ancestry, a focused test, `pnpm check`, 
 These branches are retained for recovery or later decisions and are not part of the supported `pnya/main` baseline:
 
 - `feat/plugin-v3-cache-point`
+- `feature/issue-1511-create-inlay`
 - `fix/task7-persistence-final-review`
 - `fix/task7-runtime-final-review`
 - `archive/v3-illustration-host-overbuilt-task7-20260720`
