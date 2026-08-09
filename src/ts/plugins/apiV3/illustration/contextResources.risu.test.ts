@@ -362,6 +362,63 @@ describe('bounded Risu thumbnails', () => {
         expect(parseImageDimensions(data, 'image/webp')).toEqual({ width: 640, height: 360 })
     })
 
+    it('sniffs WebP bytes before bounded thumbnail decoding when the asset is declared as PNG', async () => {
+        const hadCreateImageBitmap = 'createImageBitmap' in globalThis
+        const previousCreateImageBitmap = globalThis.createImageBitmap
+        const hadOffscreenCanvas = 'OffscreenCanvas' in globalThis
+        const previousOffscreenCanvas = globalThis.OffscreenCanvas
+        const data = new Uint8Array(30)
+        data.set(new TextEncoder().encode('RIFF'), 0)
+        data.set(new TextEncoder().encode('WEBP'), 8)
+        data.set(new TextEncoder().encode('VP8 '), 12)
+        data.set([0x9d, 0x01, 0x2a], 23)
+        data.set([0x80, 0x02], 26)
+        data.set([0x68, 0x01], 28)
+        const createImageBitmap = vi.fn(async (
+            blob: Blob,
+            options: { resizeWidth: number; resizeHeight: number; resizeQuality: string },
+        ) => {
+            expect(blob.type).toBe('image/webp')
+            return {
+                width: options.resizeWidth,
+                height: options.resizeHeight,
+                close: vi.fn(),
+            }
+        })
+        vi.stubGlobal('createImageBitmap', createImageBitmap)
+        vi.stubGlobal('OffscreenCanvas', class {
+            constructor(readonly width: number, readonly height: number) {}
+
+            getContext() {
+                return { drawImage: vi.fn() }
+            }
+
+            convertToBlob() {
+                return Promise.resolve(new Blob([new Uint8Array([1])], { type: 'image/webp' }))
+            }
+        })
+
+        try {
+            const adapter = createRisuContextResourceAdapter(dependencies({ createThumbnail: undefined }))
+            const source = (await adapter.getState()).characters[0].assets[0]
+            expect(source).toMatchObject({ extension: 'png', mediaType: 'image/png' })
+
+            await expect(adapter.createThumbnail(source, data, {
+                longEdge: 512, maxPixels: 262_144, maxOutputBytes: 1_048_576,
+            })).resolves.toMatchObject({ mediaType: 'image/webp', width: 512, height: 288 })
+            expect(createImageBitmap).toHaveBeenCalledWith(expect.any(Blob), {
+                resizeWidth: 512,
+                resizeHeight: 288,
+                resizeQuality: 'high',
+            })
+        } finally {
+            if (hadCreateImageBitmap) vi.stubGlobal('createImageBitmap', previousCreateImageBitmap)
+            else Reflect.deleteProperty(globalThis, 'createImageBitmap')
+            if (hadOffscreenCanvas) vi.stubGlobal('OffscreenCanvas', previousOffscreenCanvas)
+            else Reflect.deleteProperty(globalThis, 'OffscreenCanvas')
+        }
+    })
+
     it('decodes only a bounded resize target and enforces the exact output limits', async () => {
         const decode = vi.fn(async (_data, options: { width: number; height: number }) => ({
             drawable: { bounded: true },

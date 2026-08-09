@@ -1,4 +1,5 @@
 import { PluginApiError } from './errors'
+import { sniffContextAssetMediaType } from './contextResources'
 import type {
     BoundedThumbnailResult,
     CharacterTextSection,
@@ -271,7 +272,10 @@ export function createRisuContextResourceAdapter(
         },
         async createThumbnail(source, data, constraints) {
             if (dependencies.createThumbnail) return dependencies.createThumbnail(source, data, constraints)
-            const mediaType = source.mediaType ?? mediaTypeOf(source.extension) ?? 'application/octet-stream'
+            const mediaType = sniffContextAssetMediaType(data)
+                ?? source.mediaType
+                ?? mediaTypeOf(source.extension)
+                ?? 'application/octet-stream'
             return createBoundedContextThumbnail(data, mediaType, constraints)
         },
     }
