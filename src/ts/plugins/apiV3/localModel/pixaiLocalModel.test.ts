@@ -293,7 +293,12 @@ describe("Risu PixaiLocalModel facade", () => {
         })
         expect(h.readContextAsset).toHaveBeenCalledWith(
             `ctxasset_${"a".repeat(64)}`,
-            { ifRevision: assetRevision, variant: "original", maxBytes: 33_554_432 },
+            {
+                ifRevision: assetRevision,
+                variant: "original",
+                maxBytes: 33_554_432,
+                signal: expect.any(AbortSignal),
+            },
         )
         vi.mocked(h.readContextAsset).mockResolvedValueOnce({
             data: png.slice(),

@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { CursorRegistry } from './cursorRegistry'
 import { PluginApiError } from './errors'
+import { ContextAssetReadCoordinator } from './contextAssetReadCoordinator'
 import {
     ContextResourceService,
     assertContextSnapshotLimits,
@@ -13,6 +14,45 @@ import {
 import { resolveModuleActivations } from './moduleActivation'
 
 const encoder = new TextEncoder()
+
+const deferred = <T>() => {
+    let resolve!: (value: T) => void
+    let reject!: (reason?: unknown) => void
+    const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+        resolve = resolvePromise
+        reject = rejectPromise
+    })
+    return { promise, resolve, reject }
+}
+
+const waitFor = async (predicate: () => boolean) => {
+    for (let attempt = 0; attempt < 100; attempt++) {
+        if (predicate()) return
+        await new Promise((resolve) => setTimeout(resolve, 0))
+    }
+    throw new Error('Timed out waiting for test condition')
+}
+
+const occupyAllReadPermits = async (coordinator: ContextAssetReadCoordinator, principalId: string) => {
+    const gates = Array.from({ length: 4 }, () => deferred<void>())
+    let started = 0
+    const promises = gates.map((gate) => coordinator.schedule({
+        owner: { principalId, instanceId: 'permit-blocker' },
+        lane: 'digest',
+        run: async () => {
+            started += 1
+            return gate.promise
+        },
+    }))
+    await waitFor(() => started === 4)
+    return {
+        releaseOne: () => gates.shift()?.resolve(),
+        releaseAll: async () => {
+            for (const gate of gates.splice(0)) gate.resolve()
+            await Promise.all(promises)
+        },
+    }
+}
 
 const pluginContext = (principalId = '11111111-1111-4111-8111-111111111111') => ({
     principalId,
@@ -130,14 +170,17 @@ function harness(options: {
     onPermission?: (permission: 'contextAssets' | 'installedModulesRead') => void | Promise<void>
     cloneStateReads?: boolean
     afterStateRead?: (call: number) => void
+    readAsset?: ContextResourceAdapter['readAsset']
+    readCoordinator?: ContextAssetReadCoordinator
+    instanceId?: string
 } = {}) {
     let state = options.state ?? makeState()
     const bytes = defaultBytes()
-    const reads = vi.fn(async (source: ContextAssetSource) => {
+    const reads = vi.fn(options.readAsset ?? (async (source: ContextAssetSource) => {
         const value = bytes.get(source.storageKey)
         if (!value) throw new PluginApiError('NOT_FOUND', 'Asset missing')
         return value.slice()
-    })
+    }))
     let stateReadCount = 0
     const getState = vi.fn(async () => {
         const result = options.cloneStateReads ? structuredClone(state) : state
@@ -161,6 +204,7 @@ function harness(options: {
     const service = new ContextResourceService(
         {
             ...pluginContext(options.principalId ?? crypto.randomUUID()),
+            ...(options.instanceId ? { instanceId: options.instanceId } : {}),
             ...(options.abortController ? { signal: options.abortController.signal } : {}),
         },
         adapter,
@@ -175,7 +219,7 @@ function harness(options: {
                 }
             },
             cursorRegistry: options.cursorRegistry ?? new CursorRegistry({ now: options.now }),
-            now: options.now,
+            readCoordinator: options.readCoordinator,
         },
     )
     return {
@@ -553,12 +597,346 @@ describe('opaque context assets', () => {
         expect(createCursor.mock.calls[1]?.[4]).toEqual({ offset: 4 })
     })
 
+    it('preserves a 100-item page order while no more than four digest reads are active', async () => {
+        const state = makeState()
+        state.characters[0].assets = Array.from({ length: 100 }, (_, index) => asset(
+            `ordered-${index}`,
+            `ordered-${index}`,
+            'additional',
+        ))
+        let active = 0
+        let maximumActive = 0
+        const h = harness({
+            state,
+            readCoordinator: new ContextAssetReadCoordinator(),
+            readAsset: async (source) => {
+                active += 1
+                maximumActive = Math.max(maximumActive, active)
+                try {
+                    await new Promise((resolve) => setTimeout(resolve, 0))
+                    return encoder.encode(source.identity)
+                } finally {
+                    active -= 1
+                }
+            },
+        })
+
+        const result = await h.service.listContextAssets({ moduleScope: 'none', limit: 100 })
+
+        expect(maximumActive).toBe(4)
+        expect(result.assets.map((reference) => reference.name)).toEqual(
+            Array.from({ length: 100 }, (_, index) => `ordered-${index}.png`),
+        )
+    })
+
+    it('shares one digest attempt between lists while isolating waiter cancellation', async () => {
+        const gate = deferred<Uint8Array>()
+        const h = harness({
+            readCoordinator: new ContextAssetReadCoordinator(),
+            readAsset: async () => gate.promise,
+        })
+        const cancelled = new AbortController()
+        const surviving = new AbortController()
+
+        const first = h.service.listContextAssets({
+            moduleScope: 'none', include: ['portrait'], signal: cancelled.signal,
+        })
+        const second = h.service.listContextAssets({
+            moduleScope: 'none', include: ['portrait'], signal: surviving.signal,
+        })
+        await waitFor(() => h.reads.mock.calls.length > 0)
+        cancelled.abort()
+        gate.resolve(encoder.encode('shared portrait bytes'))
+
+        await expect(first).rejects.toMatchObject({ code: 'ABORTED' })
+        await expect(second).resolves.toMatchObject({ assets: [expect.objectContaining({ name: 'portrait.png' })] })
+        expect(h.reads).toHaveBeenCalledOnce()
+    })
+
+    it('admits at most 128 joined waiters behind one physical digest attempt', async () => {
+        let gate = deferred<Uint8Array>()
+        const h = harness({
+            readCoordinator: new ContextAssetReadCoordinator(),
+            readAsset: async () => gate.promise,
+        })
+        const first = h.service.listContextAssets({ moduleScope: 'none', include: ['portrait'] })
+        await waitFor(() => h.reads.mock.calls.length === 1)
+        const controllers = Array.from({ length: 129 }, () => new AbortController())
+        const joined = controllers.map((controller) => h.service.listContextAssets({
+            moduleScope: 'none', include: ['portrait'], signal: controller.signal,
+        }))
+        const settlements = Promise.allSettled([first, ...joined])
+        const overflow = await Promise.race([
+            joined[128].then(
+                () => ({ code: 'NO_ERROR' }),
+                (error: PluginApiError) => ({ code: error.code, retryable: error.retryable }),
+            ),
+            new Promise<{ code: string }>((resolve) => setTimeout(() => resolve({ code: 'PENDING' }), 50)),
+        ])
+
+        for (const controller of controllers) controller.abort()
+        gate.resolve(encoder.encode('shared bounded bytes'))
+        await settlements
+
+        expect(overflow).toEqual({ code: 'RESOURCE_LIMIT', retryable: true })
+        expect(h.reads).toHaveBeenCalledOnce()
+
+        gate = deferred<Uint8Array>()
+        h.state.characters[0].assets[0].storageRevision = 'storage:alice-portrait:2'
+        const nextOwner = h.service.listContextAssets({ moduleScope: 'none', include: ['portrait'] })
+        await waitFor(() => h.reads.mock.calls.length === 2)
+        const nextController = new AbortController()
+        const reused = h.service.listContextAssets({
+            moduleScope: 'none', include: ['portrait'], signal: nextController.signal,
+        })
+        const reusedOutcome = reused.catch((error: PluginApiError) => error)
+        const admission = await Promise.race([
+            reused.then(() => 'SETTLED', (error: PluginApiError) => error.code),
+            new Promise<'PENDING'>((resolve) => setTimeout(() => resolve('PENDING'), 25)),
+        ])
+        expect(admission).toBe('PENDING')
+
+        nextController.abort()
+        gate.resolve(encoder.encode('next bounded bytes'))
+        await expect(nextOwner).resolves.toBeDefined()
+        await expect(reusedOutcome).resolves.toMatchObject({ code: 'ABORTED' })
+    })
+
+    it('shares joined waiter admission across service instances for one principal', async () => {
+        const principalId = '14141414-1414-4414-8414-141414141414'
+        const coordinator = new ContextAssetReadCoordinator()
+        const gate = deferred<Uint8Array>()
+        const firstService = harness({
+            principalId,
+            instanceId: 'joined-instance-one',
+            readCoordinator: coordinator,
+            readAsset: async () => gate.promise,
+        })
+        const secondService = harness({
+            principalId,
+            instanceId: 'joined-instance-two',
+            readCoordinator: coordinator,
+            readAsset: async () => gate.promise,
+        })
+        const owners = [
+            firstService.service.listContextAssets({ moduleScope: 'none', include: ['portrait'] }),
+            secondService.service.listContextAssets({ moduleScope: 'none', include: ['portrait'] }),
+        ]
+        await waitFor(() => firstService.reads.mock.calls.length + secondService.reads.mock.calls.length === 2)
+        const firstControllers = Array.from({ length: 64 }, () => new AbortController())
+        const secondControllers = Array.from({ length: 65 }, () => new AbortController())
+        const firstJoined = firstControllers.map((controller) => firstService.service.listContextAssets({
+            moduleScope: 'none', include: ['portrait'], signal: controller.signal,
+        }))
+        const secondJoined = secondControllers.map((controller) => secondService.service.listContextAssets({
+            moduleScope: 'none', include: ['portrait'], signal: controller.signal,
+        }))
+        const settlements = Promise.allSettled([...owners, ...firstJoined, ...secondJoined])
+        const overflow = await Promise.race([
+            secondJoined[64].then(
+                () => ({ code: 'NO_ERROR' }),
+                (error: PluginApiError) => ({ code: error.code, retryable: error.retryable }),
+            ),
+            new Promise<{ code: string }>((resolve) => setTimeout(() => resolve({ code: 'PENDING' }), 50)),
+        ])
+
+        for (const controller of [...firstControllers, ...secondControllers]) controller.abort()
+        gate.resolve(encoder.encode('shared principal bytes'))
+        await settlements
+
+        expect(overflow).toEqual({ code: 'RESOURCE_LIMIT', retryable: true })
+        expect(firstService.reads.mock.calls.length + secondService.reads.mock.calls.length).toBe(2)
+    })
+
+    it('moves a shared digest attempt to a surviving waiter when cancelled permit validation hangs', async () => {
+        const principalId = '12121212-1212-4212-8212-121212121212'
+        const coordinator = new ContextAssetReadCoordinator()
+        const occupied = await occupyAllReadPermits(coordinator, principalId)
+        const permissionGate = deferred<void>()
+        const dataGate = deferred<Uint8Array>()
+        let contextPermissionCalls = 0
+        const h = harness({
+            principalId,
+            readCoordinator: coordinator,
+            readAsset: async () => dataGate.promise,
+            onPermission: async (permission) => {
+                if (permission !== 'contextAssets') return
+                contextPermissionCalls += 1
+                if (contextPermissionCalls === 3) await permissionGate.promise
+            },
+        })
+        const cancelled = new AbortController()
+        const survivor = new AbortController()
+        const first = h.service.listContextAssets({
+            moduleScope: 'none', include: ['portrait'], signal: cancelled.signal,
+        })
+        const firstOutcome = first.catch((error) => error)
+        const second = h.service.listContextAssets({
+            moduleScope: 'none', include: ['portrait'], signal: survivor.signal,
+        })
+        await waitFor(() => contextPermissionCalls === 2)
+        await new Promise((resolve) => setTimeout(resolve, 0))
+        occupied.releaseOne()
+        await waitFor(() => contextPermissionCalls === 3)
+        cancelled.abort()
+        const survivorReachedStorage = await Promise.race([
+            vi.waitFor(() => expect(h.reads).toHaveBeenCalledOnce()).then(() => true),
+            new Promise<false>((resolve) => setTimeout(() => resolve(false), 50)),
+        ])
+
+        permissionGate.resolve()
+        await waitFor(() => h.reads.mock.calls.length === 1)
+        dataGate.resolve(encoder.encode('surviving waiter bytes'))
+        await expect(firstOutcome).resolves.toMatchObject({ code: 'ABORTED' })
+        await expect(second).resolves.toMatchObject({ assets: [expect.objectContaining({ name: 'portrait.png' })] })
+        await occupied.releaseAll()
+
+        expect(survivorReachedStorage).toBe(true)
+    })
+
+    it('retains the physical permit through final publication reauthorization', async () => {
+        const principalId = '13131313-1313-4313-8313-131313131313'
+        const coordinator = new ContextAssetReadCoordinator()
+        const publicationGate = deferred<void>()
+        let trackExplicitRead = false
+        let explicitReadFinished = false
+        let publicationEntered = false
+        const h = harness({
+            principalId,
+            readCoordinator: coordinator,
+            readAsset: async (source) => {
+                if (trackExplicitRead) explicitReadFinished = true
+                return encoder.encode(source.identity)
+            },
+            onPermission: async () => {
+                if (!trackExplicitRead || !explicitReadFinished) return
+                publicationEntered = true
+                await publicationGate.promise
+            },
+        })
+        const listed = await h.service.listContextAssets({ moduleScope: 'none', include: ['portrait'] })
+        const blockers = Array.from({ length: 3 }, () => deferred<void>())
+        const blockerPromises = blockers.map((gate) => coordinator.schedule({
+            owner: { principalId, instanceId: 'publication-blocker' },
+            lane: 'digest',
+            run: async () => gate.promise,
+        }))
+        await new Promise((resolve) => setTimeout(resolve, 0))
+        trackExplicitRead = true
+        const pending = h.service.readContextAsset(listed.assets[0].assetId)
+        await waitFor(() => publicationEntered)
+        let probeStarted = false
+        const probe = coordinator.schedule({
+            owner: { principalId, instanceId: 'publication-probe' },
+            lane: 'digest',
+            run: async () => { probeStarted = true },
+        })
+        await new Promise((resolve) => setTimeout(resolve, 0))
+        const startedBeforePublication = probeStarted
+
+        publicationGate.resolve()
+        await pending
+        await probe
+        for (const blocker of blockers) blocker.resolve()
+        await Promise.all(blockerPromises)
+
+        expect(startedBeforePublication).toBe(false)
+    })
+
+    it('stops launching digest workers on cancellation and suppresses active late state writes', async () => {
+        const state = makeState()
+        state.characters[0].assets = Array.from({ length: 10 }, (_, index) => asset(
+            `cancel-${index}`,
+            `cancel-${index}`,
+            'additional',
+        ))
+        const gates: Array<ReturnType<typeof deferred<Uint8Array>>> = []
+        let completeImmediately = false
+        const h = harness({
+            state,
+            readCoordinator: new ContextAssetReadCoordinator(),
+            readAsset: async (source) => {
+                if (completeImmediately) return encoder.encode(source.identity)
+                const gate = deferred<Uint8Array>()
+                gates.push(gate)
+                return gate.promise
+            },
+        })
+        const controller = new AbortController()
+        const pending = h.service.listContextAssets({
+            moduleScope: 'none', limit: 10, signal: controller.signal,
+        })
+        const rejection = pending.catch((error) => error)
+
+        await waitFor(() => gates.length >= 4)
+        controller.abort()
+        await Promise.resolve()
+        const launchedAtAbort = h.reads.mock.calls.length
+        completeImmediately = true
+        for (const gate of gates) gate.resolve(encoder.encode('late bytes'))
+
+        await expect(rejection).resolves.toMatchObject({ code: 'ABORTED' })
+        expect(launchedAtAbort).toBe(4)
+        expect(h.reads).toHaveBeenCalledTimes(4)
+
+        const relisted = await h.service.listContextAssets({ moduleScope: 'none', limit: 10 })
+        expect(relisted.assets).toHaveLength(10)
+        expect(h.reads).toHaveBeenCalledTimes(14)
+    })
+
     it('requires contextAssets and independently requires installedModulesRead for installed module assets', async () => {
         const missingContext = harness({ grants: ['installedModulesRead'] })
         expect(await errorCode(missingContext.service.listContextAssets({ moduleScope: 'installed' }))).toBe('PERMISSION_DENIED')
         const missingInstalled = harness({ grants: ['contextAssets'] })
         expect(await errorCode(missingInstalled.service.listContextAssets({ moduleScope: 'installed' }))).toBe('PERMISSION_DENIED')
         await expect(missingInstalled.service.listContextAssets({ moduleScope: 'active' })).resolves.toBeDefined()
+    })
+
+    it('rechecks list permission after a queued digest permit and before storage', async () => {
+        const principalId = '10101010-1010-4010-8010-101010101010'
+        const coordinator = new ContextAssetReadCoordinator()
+        const occupied = await occupyAllReadPermits(coordinator, principalId)
+        let permissionAllowed = true
+        const h = harness({
+            principalId,
+            readCoordinator: coordinator,
+            onPermission: () => {
+                if (!permissionAllowed) throw new PluginApiError('PERMISSION_DENIED', 'Permission was revoked')
+            },
+        })
+        const pending = h.service.listContextAssets({ moduleScope: 'none', include: ['portrait'] })
+        await waitFor(() => h.permissionCalls.length === 1)
+        permissionAllowed = false
+        occupied.releaseOne()
+
+        await expect(pending).rejects.toMatchObject({ code: 'PERMISSION_DENIED' })
+        expect(h.reads).not.toHaveBeenCalled()
+        await occupied.releaseAll()
+    })
+
+    it('rechecks read selectors after a queued permit and before storage', async () => {
+        const principalId = '20202020-2020-4020-8020-202020202020'
+        const coordinator = new ContextAssetReadCoordinator()
+        const h = harness({ principalId, readCoordinator: coordinator })
+        const listed = await h.service.listContextAssets({ moduleScope: 'none', include: ['portrait'] })
+        const reference = listed.assets[0]
+        h.reads.mockClear()
+        const occupied = await occupyAllReadPermits(coordinator, principalId)
+        const schedule = vi.spyOn(coordinator, 'schedule')
+        const pending = h.service.readContextAsset(reference.assetId)
+        let settled = false
+        void pending.then(() => { settled = true }, () => { settled = true })
+        await waitFor(() => schedule.mock.calls.length === 1 || settled)
+        if (schedule.mock.calls.length === 0) {
+            await occupied.releaseAll()
+            expect(schedule).toHaveBeenCalledOnce()
+        }
+        h.state.current!.characterId = 'char-2'
+        occupied.releaseOne()
+
+        await expect(pending).rejects.toMatchObject({ code: expect.stringMatching(/CONFLICT|PERMISSION_DENIED/) })
+        expect(h.reads).not.toHaveBeenCalled()
+        await occupied.releaseAll()
     })
 
     it('fails closed when an active module deactivates while its asset metadata is being digested', async () => {
@@ -571,7 +949,7 @@ describe('opaque context assets', () => {
 
         await expect(h.service.listContextAssets({ moduleScope: 'active', include: ['module'] }))
             .rejects.toMatchObject({ code: 'CONFLICT' })
-        expect(h.permissionCalls).toEqual(['contextAssets'])
+        expect(h.permissionCalls).toEqual(['contextAssets', 'contextAssets', 'contextAssets'])
     })
 
     it('does not treat an installed asset as active when a persona module reuses its module ID', async () => {
@@ -626,6 +1004,63 @@ describe('opaque context assets', () => {
         expect(await errorCode(h.service.readContextAsset(reference.assetId))).toBe('PERMISSION_DENIED')
     })
 
+    it('rechecks contextAssets permission after an active read and before publication', async () => {
+        let permissionAllowed = true
+        const h = harness({
+            readCoordinator: new ContextAssetReadCoordinator(),
+            onPermission: () => {
+                if (!permissionAllowed) throw new PluginApiError('PERMISSION_DENIED', 'Permission was revoked')
+            },
+        })
+        const listed = await h.service.listContextAssets({ moduleScope: 'none', include: ['portrait'] })
+        const gate = deferred<Uint8Array>()
+        h.reads.mockImplementationOnce(async () => gate.promise)
+        const pending = h.service.readContextAsset(listed.assets[0].assetId)
+        await waitFor(() => h.reads.mock.calls.length >= 2)
+        permissionAllowed = false
+        gate.resolve(h.bytes.get('alice-portrait')!.slice())
+
+        await expect(pending).rejects.toMatchObject({ code: 'PERMISSION_DENIED' })
+    })
+
+    it.each([
+        'selector',
+        'storage revision',
+        'source identity',
+        'origin',
+        'module membership',
+    ])('fails closed when active-read %s changes before publication', async (change) => {
+        const state = makeState()
+        const h = harness({ state, readCoordinator: new ContextAssetReadCoordinator() })
+        const moduleAsset = change === 'module membership'
+        const listed = await h.service.listContextAssets(moduleAsset
+            ? { moduleScope: 'active', include: ['module'] }
+            : { moduleScope: 'none', include: ['portrait'] })
+        const reference = listed.assets[0]
+        const storageKey = moduleAsset ? 'module-ref' : 'alice-portrait'
+        const gate = deferred<Uint8Array>()
+        h.reads.mockImplementationOnce(async () => gate.promise)
+        const pending = h.service.readContextAsset(reference.assetId)
+        await waitFor(() => h.reads.mock.calls.length >= 2)
+
+        if (change === 'selector') state.current!.characterId = 'char-2'
+        if (change === 'storage revision') state.characters[0].assets[0].storageRevision = 'storage:changed'
+        if (change === 'source identity') state.characters[0].assets[0].identity = 'replacement-identity'
+        if (change === 'origin') {
+            const moved = state.characters[0].assets.shift()!
+            state.characters[1].assets.push(moved)
+        }
+        if (change === 'module membership') {
+            state.activeModules = []
+            state.installedModules = state.installedModules.filter((module) => module.id !== 'module-active')
+        }
+        gate.resolve(h.bytes.get(storageKey)!.slice())
+
+        await expect(pending).rejects.toMatchObject({
+            code: expect.stringMatching(/CONFLICT|PERMISSION_DENIED|NOT_FOUND/),
+        })
+    })
+
     it('returns ABORTED instead of bytes when the plugin instance unloads during a read', async () => {
         const abortController = new AbortController()
         const h = harness({ abortController })
@@ -671,7 +1106,7 @@ describe('opaque context assets', () => {
         const active = harness({ state, principalId, grants: ['contextAssets'] })
         await expect(active.service.readContextAsset(reference.assetId, { ifRevision: reference.revision }))
             .resolves.toMatchObject({ revision: reference.revision })
-        expect(active.permissionCalls).toEqual(['contextAssets'])
+        expect(active.permissionCalls).toEqual(['contextAssets', 'contextAssets', 'contextAssets'])
 
         state.activeModules = []
         let installedPermissionCalls = 0
@@ -692,24 +1127,21 @@ describe('opaque context assets', () => {
         await expect(inactive.service.readContextAsset(reference.assetId, { ifRevision: reference.revision }))
             .rejects.toMatchObject({ code: 'NOT_FOUND' })
         expect(installedPermissionCalls).toBe(2)
-        expect(inactive.reads).toHaveBeenCalledOnce()
+        expect(inactive.reads).not.toHaveBeenCalled()
     })
 
-    it('enforces maxBytes and the 60/61 per-minute read boundary', async () => {
-        let now = 10_000
-        const h = harness({ now: () => now })
+    it('enforces maxBytes while allowing more than 60 sequential reads', async () => {
+        const h = harness()
         const listed = await h.service.listContextAssets({ moduleScope: 'none', include: ['portrait'] })
         const reference = listed.assets[0]
         await expect(h.service.readContextAsset(reference.assetId, { maxBytes: 33_554_432 })).resolves.toBeDefined()
         expect(await errorCode(h.service.readContextAsset(reference.assetId, { maxBytes: 33_554_433 }))).toBe('RESOURCE_LIMIT')
         expect(await errorCode(h.service.readContextAsset(reference.assetId, { maxBytes: 1 }))).toBe('RESOURCE_LIMIT')
 
-        now += 60_001
-        for (let index = 0; index < 60; index++) {
+        for (let index = 0; index < 65; index++) {
             await h.service.readContextAsset(reference.assetId)
         }
-        const limited = h.service.readContextAsset(reference.assetId)
-        await expect(limited).rejects.toMatchObject({ code: 'RESOURCE_LIMIT', retryable: true })
+        expect(h.reads).toHaveBeenCalledTimes(67)
     })
 
     it('rejects malformed and oversized asset handles before touching host state or asset storage', async () => {
@@ -725,7 +1157,7 @@ describe('opaque context assets', () => {
         expect(h.reads).toHaveBeenCalledTimes(assetReads)
     })
 
-    it('rejects an unissued handle without enumerating unrelated asset metadata', async () => {
+    it('cold-scans only authorized assets without enumerating unrelated asset metadata', async () => {
         const state = makeState()
         Object.defineProperty(state.characters[2], 'assets', {
             enumerable: true,
@@ -735,24 +1167,17 @@ describe('opaque context assets', () => {
 
         await expect(h.service.readContextAsset(`ctxasset_${'0'.repeat(64)}`))
             .rejects.toMatchObject({ code: 'NOT_FOUND' })
-        expect(h.reads).not.toHaveBeenCalled()
+        expect(h.reads.mock.calls.length).toBeGreaterThan(0)
+        expect(h.reads.mock.calls.every(([source]) => source.storageKey !== 'other-portrait')).toBe(true)
     })
 
-    it('charges syntactically valid unknown handles after context preflight and before asset scanning at 60/61', async () => {
-        const h = harness({ now: () => 20_000 })
+    it('allows repeated syntactically valid unknown handles without a completed-read quota', async () => {
+        const h = harness()
         const unknownHandle = `ctxasset_${'0'.repeat(64)}`
-        for (let index = 0; index < 60; index++) {
+        for (let index = 0; index < 65; index++) {
             expect(await errorCode(h.service.readContextAsset(unknownHandle))).toBe('NOT_FOUND')
         }
-        expect(h.reads).not.toHaveBeenCalled()
-        const stateCalls = h.getState.mock.calls.length
-        const assetReads = h.reads.mock.calls.length
-        await expect(h.service.readContextAsset(unknownHandle)).rejects.toMatchObject({
-            code: 'RESOURCE_LIMIT',
-            retryable: true,
-        })
-        expect(h.getState).toHaveBeenCalledTimes(stateCalls + 1)
-        expect(h.reads).toHaveBeenCalledTimes(assetReads)
+        expect(h.reads.mock.calls.length).toBeGreaterThan(0)
     })
 
     it('recovers a persisted handle from its revision without reading unrelated asset bytes', async () => {
@@ -773,24 +1198,124 @@ describe('opaque context assets', () => {
         expect(unknown.reads).not.toHaveBeenCalled()
     })
 
-    it('charges stale handles after context preflight and before asset scanning at 60/61', async () => {
+    it('bounds digest and issued-handle metadata at 8192 while cold-resolving evicted handles', async () => {
         const state = makeState()
-        const h = harness({ state, now: () => 30_000 })
+        state.characters[0].assets = Array.from({ length: 8_194 }, (_, index) => asset(
+            `lru-${index}`,
+            `lru-${index}`,
+            'additional',
+        ))
+        const h = harness({
+            state,
+            readCoordinator: new ContextAssetReadCoordinator(),
+            readAsset: async (source) => encoder.encode(source.identity),
+        })
+        const references: Array<{ assetId: string; revision: string }> = []
+        let cursor: string | undefined
+        do {
+            const page = await h.service.listContextAssets({ moduleScope: 'none', limit: 100, cursor })
+            references.push(...page.assets.map(({ assetId, revision }) => ({ assetId, revision })))
+            cursor = page.nextCursor
+        } while (cursor)
+        expect(references).toHaveLength(8_194)
+        h.reads.mockClear()
+
+        await expect(h.service.readContextAsset(references[0].assetId, {
+            ifRevision: references[0].revision,
+        })).resolves.toMatchObject({ revision: references[0].revision })
+        expect(h.reads).toHaveBeenCalledOnce()
+
+        await expect(h.service.readContextAsset(references[1].assetId)).resolves.toMatchObject({
+            revision: references[1].revision,
+        })
+        expect(h.reads).toHaveBeenCalledTimes(3)
+    }, 60_000)
+
+    it('rejects known and returned sources over 32 MiB before digest cache or handle publication', async () => {
+        const state = makeState()
+        state.characters[0].assets = [asset('oversized', 'oversized', 'additional', {
+            byteLength: 33_554_433,
+        })]
+        let returnOversized = false
+        const h = harness({
+            state,
+            readCoordinator: new ContextAssetReadCoordinator(),
+            readAsset: async () => returnOversized
+                ? new Uint8Array(33_554_433)
+                : encoder.encode('bounded bytes'),
+        })
+
+        await expect(h.service.listContextAssets({ moduleScope: 'none' }))
+            .rejects.toMatchObject({ code: 'RESOURCE_LIMIT' })
+        expect(h.reads).not.toHaveBeenCalled()
+
+        delete state.characters[0].assets[0].byteLength
+        returnOversized = true
+        await expect(h.service.listContextAssets({ moduleScope: 'none' }))
+            .rejects.toMatchObject({ code: 'RESOURCE_LIMIT' })
+        expect(h.reads).toHaveBeenCalledOnce()
+
+        returnOversized = false
+        await expect(h.service.listContextAssets({ moduleScope: 'none' }))
+            .resolves.toMatchObject({ assets: [expect.objectContaining({ byteLength: 13 })] })
+        expect(h.reads).toHaveBeenCalledTimes(2)
+    })
+
+    it('dispose is idempotent, cancels queued work, and rejects future calls', async () => {
+        const principalId = '30303030-3030-4030-8030-303030303030'
+        const coordinator = new ContextAssetReadCoordinator()
+        const h = harness({ principalId, readCoordinator: coordinator })
+        const listed = await h.service.listContextAssets({ moduleScope: 'none', include: ['portrait'] })
+        h.reads.mockClear()
+        const occupied = await occupyAllReadPermits(coordinator, principalId)
+        const schedule = vi.spyOn(coordinator, 'schedule')
+        const queued = h.service.readContextAsset(listed.assets[0].assetId)
+        let settled = false
+        void queued.then(() => { settled = true }, () => { settled = true })
+        await waitFor(() => schedule.mock.calls.length === 1 || settled)
+        if (schedule.mock.calls.length === 0) {
+            await occupied.releaseAll()
+            expect(schedule).toHaveBeenCalledOnce()
+        }
+
+        h.service.dispose()
+        h.service.dispose()
+
+        await expect(queued).rejects.toMatchObject({ code: 'ABORTED' })
+        await expect(h.service.listContextAssets({ moduleScope: 'none' }))
+            .rejects.toMatchObject({ code: 'ABORTED' })
+        expect(h.reads).not.toHaveBeenCalled()
+        await occupied.releaseAll()
+    })
+
+    it('dispose suppresses an active uncancellable completion and cannot be repopulated late', async () => {
+        const h = harness({ readCoordinator: new ContextAssetReadCoordinator() })
+        const listed = await h.service.listContextAssets({ moduleScope: 'none', include: ['portrait'] })
+        const gate = deferred<Uint8Array>()
+        h.reads.mockImplementationOnce(async () => gate.promise)
+        const pending = h.service.readContextAsset(listed.assets[0].assetId)
+        await waitFor(() => h.reads.mock.calls.length >= 2)
+
+        h.service.dispose()
+        await expect(pending).rejects.toMatchObject({ code: 'ABORTED' })
+        gate.resolve(h.bytes.get('alice-portrait')!.slice())
+        await Promise.resolve()
+        await expect(h.service.readContextAsset(listed.assets[0].assetId))
+            .rejects.toMatchObject({ code: 'ABORTED' })
+        expect(h.reads).toHaveBeenCalledTimes(2)
+    })
+
+    it('allows repeated stale-handle checks without a completed-read quota', async () => {
+        const state = makeState()
+        const h = harness({ state })
         const listed = await h.service.listContextAssets({ moduleScope: 'none', include: ['portrait'] })
         const reference = listed.assets[0]
         h.bytes.set('alice-portrait', encoder.encode('replacement portrait bytes'))
         state.characters[0].assets[0].storageRevision = 'storage:alice-portrait:2'
-        for (let index = 0; index < 60; index++) {
+        for (let index = 0; index < 65; index++) {
             expect(await errorCode(h.service.readContextAsset(reference.assetId))).toBe('CONFLICT')
         }
-        const stateCalls = h.getState.mock.calls.length
-        const assetReads = h.reads.mock.calls.length
-        await expect(h.service.readContextAsset(reference.assetId)).rejects.toMatchObject({
-            code: 'RESOURCE_LIMIT',
-            retryable: true,
-        })
-        expect(h.getState).toHaveBeenCalledTimes(stateCalls + 1)
-        expect(h.reads).toHaveBeenCalledTimes(assetReads)
+        expect(h.reads).toHaveBeenCalledTimes(66)
     })
 
     it.each([
@@ -830,7 +1355,7 @@ describe('opaque context assets', () => {
             longEdge: 512,
             maxPixels: 262_144,
             maxOutputBytes: 1_048_576,
-        })
+        }, expect.any(AbortSignal))
     })
 })
 

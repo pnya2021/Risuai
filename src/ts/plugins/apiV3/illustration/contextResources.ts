@@ -3,6 +3,10 @@ import { PluginApiError } from './errors'
 import { createRevision, validateJsonLimits } from './revision'
 import type { PluginExecutionContext } from './permissions'
 import type { ModuleActivationReason } from './moduleActivation'
+import {
+    ContextAssetReadCoordinator,
+    contextAssetReadCoordinator,
+} from './contextAssetReadCoordinator'
 
 export type CharacterId = string
 export type ConversationId = string
@@ -82,11 +86,12 @@ export interface BoundedThumbnailResult {
 
 export interface ContextResourceAdapter {
     getState(): Promise<ContextHostState>
-    readAsset(source: ContextAssetSource): Promise<Uint8Array>
+    readAsset(source: ContextAssetSource, signal?: AbortSignal): Promise<Uint8Array>
     createThumbnail(
         source: ContextAssetSource,
         data: Uint8Array,
         constraints: { longEdge: number; maxPixels: number; maxOutputBytes: number },
+        signal?: AbortSignal,
     ): Promise<BoundedThumbnailResult>
 }
 
@@ -154,6 +159,14 @@ export interface ContextAssetListOptions {
     mediaTypes?: string[]
     cursor?: string
     limit?: number
+    signal?: AbortSignal
+}
+
+export interface ContextAssetReadOptions {
+    ifRevision?: Revision
+    variant?: 'original' | 'thumbnail'
+    maxBytes?: number
+    signal?: AbortSignal
 }
 
 export interface ContextModuleListOptions {
@@ -167,8 +180,7 @@ export interface ContextModuleListOptions {
 export interface ContextResourceServiceDependencies {
     requirePermission(permission: 'contextAssets' | 'installedModulesRead'): Promise<void>
     cursorRegistry?: CursorRegistry
-    now?: () => number
-    readRateLimiter?: ContextAssetReadRateLimiter
+    readCoordinator?: ContextAssetReadCoordinator
 }
 
 const MAX_SNAPSHOT_JSON_BYTES = 2_097_152
@@ -179,7 +191,6 @@ const MAX_PAGE_SIZE = 100
 const MAX_ACTIVE_MODULES = 100
 const DEFAULT_ASSET_READ_BYTES = 16_777_216
 const MAX_ASSET_READ_BYTES = 33_554_432
-const ASSET_READS_PER_MINUTE = 60
 const THUMBNAIL_LONG_EDGE = 512
 const MAX_THUMBNAIL_PIXELS = 262_144
 const MAX_THUMBNAIL_OUTPUT_BYTES = 1_048_576
@@ -187,12 +198,14 @@ const CONTEXT_ASSET_ID_LENGTH = 'ctxasset_'.length + 64
 const REVISION_LENGTH = 'sha256:'.length + 64
 const CONTEXT_ASSET_ID_PATTERN = /^ctxasset_[0-9a-f]{64}$/
 const REVISION_PATTERN = /^sha256:[0-9a-f]{64}$/
+const MAX_LIST_DIGEST_WORKERS = 4
+const MAX_DIGEST_RECORDS = 8_192
+const MAX_ISSUED_HANDLES = 8_192
+const MAX_JOINED_DIGEST_WAITERS = 128
+
+const joinedDigestWaitersByPrincipal = new Map<string, number>()
 
 const textEncoder = new TextEncoder()
-
-function assertNotAborted(context: PluginExecutionContext) {
-    if (context.signal.aborted) throw new PluginApiError('ABORTED', 'Plugin instance is no longer active')
-}
 
 function enumerableDataValues(value: object): unknown[] {
     if (Array.isArray(value)) {
@@ -351,41 +364,56 @@ interface IssuedAssetHandle {
     origin: ContextAssetRef['origin']
 }
 
-export class ContextAssetReadRateLimiter {
-    private reads = new Map<string, number[]>()
-
-    constructor(private readonly now: () => number = Date.now) {}
-
-    consume(principalId: string) {
-        const now = this.now()
-        const cutoff = now - 60_000
-        const retained = (this.reads.get(principalId) ?? []).filter((value) => value > cutoff)
-        if (retained.length >= ASSET_READS_PER_MINUTE) {
-            const retryAfterMs = Math.max(1, retained[0] + 60_000 - now)
-            this.reads.set(principalId, retained)
-            throw new PluginApiError('RESOURCE_LIMIT', 'Context asset read rate exceeded', {
-                retryable: true,
-                retryAfterMs,
-            })
-        }
-        retained.push(now)
-        this.reads.set(principalId, retained)
-    }
-
-    clearPrincipal(principalId: string) {
-        this.reads.delete(principalId)
-    }
+interface DigestWaiter {
+    signal?: AbortSignal
+    abortListener?: () => void
+    validateBeforeRead(): Promise<ContextAssetSource>
+    joined: boolean
+    released: boolean
 }
 
-const sharedReadRateLimiter = new ContextAssetReadRateLimiter()
+interface DigestAttempt {
+    key: string
+    generation: number
+    controller: AbortController
+    waiters: Set<DigestWaiter>
+    promise: Promise<AssetDigestRecord>
+    settled: boolean
+}
+
+const abortedError = () => new PluginApiError('ABORTED', 'Context asset operation was cancelled')
+
+const sourceLimitError = () => new PluginApiError('RESOURCE_LIMIT', 'Context asset exceeds the hard read limit')
+
+const digestWaiterLimitError = () => new PluginApiError(
+    'RESOURCE_LIMIT',
+    'Context asset read queue is full',
+    { retryable: true },
+)
+
+function lruGet<K, V>(map: Map<K, V>, key: K): V | undefined {
+    const value = map.get(key)
+    if (value === undefined) return undefined
+    map.delete(key)
+    map.set(key, value)
+    return value
+}
+
+function lruSet<K, V>(map: Map<K, V>, key: K, value: V, maximum: number) {
+    map.delete(key)
+    map.set(key, value)
+    while (map.size > maximum) map.delete(map.keys().next().value!)
+}
 
 export class ContextResourceService {
     private readonly cursorRegistry: CursorRegistry
-    private readonly now: () => number
-    private readonly readRateLimiter: ContextAssetReadRateLimiter
+    private readonly readCoordinator: ContextAssetReadCoordinator
     private readonly digestCache = new Map<string, AssetDigestRecord>()
     private readonly issuedHandles = new Map<string, IssuedAssetHandle>()
+    private readonly digestAttempts = new Map<string, DigestAttempt>()
     private readonly abortCleanup: () => void
+    private disposed = false
+    private generation = 0
 
     constructor(
         private readonly context: PluginExecutionContext,
@@ -393,17 +421,56 @@ export class ContextResourceService {
         private readonly dependencies: ContextResourceServiceDependencies,
     ) {
         this.cursorRegistry = dependencies.cursorRegistry ?? illustrationCursorRegistry
-        this.now = dependencies.now ?? Date.now
-        this.readRateLimiter = dependencies.readRateLimiter
-            ?? (dependencies.now ? new ContextAssetReadRateLimiter(dependencies.now) : sharedReadRateLimiter)
-        this.abortCleanup = () => this.cursorRegistry.clearInstance(context.principalId, context.instanceId)
+        this.readCoordinator = dependencies.readCoordinator ?? contextAssetReadCoordinator
+        this.abortCleanup = () => this.dispose()
         context.signal.addEventListener('abort', this.abortCleanup, { once: true })
+        if (context.signal.aborted) this.dispose()
     }
 
-    private async state() {
-        assertNotAborted(this.context)
+    dispose() {
+        if (this.disposed) return
+        this.disposed = true
+        this.generation += 1
+        this.context.signal.removeEventListener('abort', this.abortCleanup)
+        for (const attempt of this.digestAttempts.values()) {
+            for (const waiter of attempt.waiters) this.releaseJoinedDigestWaiter(waiter)
+            attempt.controller.abort()
+        }
+        this.digestAttempts.clear()
+        this.digestCache.clear()
+        this.issuedHandles.clear()
+        this.cursorRegistry.clearInstance(this.context.principalId, this.context.instanceId)
+        this.readCoordinator.cancelInstance({
+            principalId: this.context.principalId,
+            instanceId: this.context.instanceId,
+        })
+    }
+
+    private assertActive(generation = this.generation, signal?: AbortSignal) {
+        if (this.disposed || generation !== this.generation || this.context.signal.aborted || signal?.aborted) {
+            throw abortedError()
+        }
+    }
+
+    private async fenced<T>(promise: Promise<T>, generation: number, signal?: AbortSignal) {
+        this.assertActive(generation, signal)
+        const value = await promise
+        this.assertActive(generation, signal)
+        return value
+    }
+
+    private async permission(
+        permission: 'contextAssets' | 'installedModulesRead',
+        generation: number,
+        signal?: AbortSignal,
+    ) {
+        await this.fenced(this.dependencies.requirePermission(permission), generation, signal)
+    }
+
+    private async state(generation = this.generation, signal?: AbortSignal) {
+        this.assertActive(generation, signal)
         const state = await this.adapter.getState()
-        assertNotAborted(this.context)
+        this.assertActive(generation, signal)
         return state
     }
 
@@ -729,28 +796,186 @@ export class ContextResourceService {
         return source.storageRevision ?? source.storageKey
     }
 
-    private async assetDigest(source: ContextAssetSource, force = false) {
-        const storageRevision = this.storageRevision(source)
-        const cached = this.digestCache.get(source.storageKey)
-        if (!force && cached?.storageRevision === storageRevision) return cached
-        const data = await this.adapter.readAsset(source)
-        if (!(data instanceof Uint8Array)) {
-            throw new PluginApiError('INTERNAL', 'Asset backend returned invalid binary data')
-        }
-        const record: AssetDigestRecord = {
-            storageRevision,
-            revision: await digestBytes(data),
-            byteLength: data.byteLength,
-            mediaType: inferMediaType(source, data),
-        }
-        this.digestCache.set(source.storageKey, record)
-        return record
+    private digestKey(source: ContextAssetSource) {
+        return JSON.stringify([source.storageKey, this.storageRevision(source)])
     }
 
-    private async assetReference(source: ContextAssetSource, origin: ContextAssetRef['origin']) {
-        const digest = await this.assetDigest(source)
-        const assetId = await this.handleFor(source, origin, digest.revision)
-        this.issuedHandles.set(assetId, { identity: source.identity, origin })
+    private removeDigestWaiter(attempt: DigestAttempt, waiter: DigestWaiter) {
+        if (waiter.signal && waiter.abortListener) {
+            waiter.signal.removeEventListener('abort', waiter.abortListener)
+        }
+        waiter.abortListener = undefined
+        waiter.signal = undefined
+        attempt.waiters.delete(waiter)
+        this.releaseJoinedDigestWaiter(waiter)
+        if (attempt.waiters.size === 0 && !attempt.settled) {
+            if (this.digestAttempts.get(attempt.key) === attempt) this.digestAttempts.delete(attempt.key)
+            attempt.controller.abort()
+        }
+    }
+
+    private releaseJoinedDigestWaiter(waiter: DigestWaiter) {
+        if (!waiter.joined || waiter.released) return
+        waiter.released = true
+        const principalId = this.context.principalId
+        const remaining = (joinedDigestWaitersByPrincipal.get(principalId) ?? 1) - 1
+        if (remaining === 0) joinedDigestWaitersByPrincipal.delete(principalId)
+        else joinedDigestWaitersByPrincipal.set(principalId, remaining)
+    }
+
+    private reserveJoinedDigestWaiter() {
+        const principalId = this.context.principalId
+        const count = joinedDigestWaitersByPrincipal.get(principalId) ?? 0
+        if (count >= MAX_JOINED_DIGEST_WAITERS) throw digestWaiterLimitError()
+        joinedDigestWaitersByPrincipal.set(principalId, count + 1)
+    }
+
+    private async validateDigestWaiter(attempt: DigestAttempt, waiter: DigestWaiter) {
+        if (!attempt.waiters.has(waiter) || waiter.signal?.aborted) throw abortedError()
+        const signal = waiter.signal
+        let abortListener: (() => void) | undefined
+        const aborted = new Promise<never>((_resolve, reject) => {
+            if (!signal) return
+            abortListener = () => reject(abortedError())
+            signal.addEventListener('abort', abortListener, { once: true })
+        })
+        try {
+            const source = await (signal
+                ? Promise.race([waiter.validateBeforeRead(), aborted])
+                : waiter.validateBeforeRead())
+            if (!attempt.waiters.has(waiter) || signal?.aborted) throw abortedError()
+            return source
+        } finally {
+            if (signal && abortListener) signal.removeEventListener('abort', abortListener)
+        }
+    }
+
+    private waitForDigestAttempt(attempt: DigestAttempt, waiter: DigestWaiter) {
+        return new Promise<AssetDigestRecord>((resolve, reject) => {
+            let finished = false
+            const settle = (callback: () => void) => {
+                if (finished) return
+                finished = true
+                this.removeDigestWaiter(attempt, waiter)
+                callback()
+            }
+            waiter.abortListener = () => settle(() => reject(abortedError()))
+            waiter.signal?.addEventListener('abort', waiter.abortListener, { once: true })
+            if (waiter.signal?.aborted) {
+                waiter.abortListener()
+                return
+            }
+            attempt.promise.then(
+                (value) => settle(() => resolve(value)),
+                (error: unknown) => settle(() => reject(error)),
+            )
+        })
+    }
+
+    private async assetDigest(
+        source: ContextAssetSource,
+        validateBeforeRead: () => Promise<ContextAssetSource>,
+        generation: number,
+        signal?: AbortSignal,
+    ) {
+        this.assertActive(generation, signal)
+        if (source.byteLength !== undefined && source.byteLength > MAX_ASSET_READ_BYTES) throw sourceLimitError()
+        const key = this.digestKey(source)
+        const cached = lruGet(this.digestCache, key)
+        if (cached) return cached
+
+        let attempt = this.digestAttempts.get(key)
+        let created = false
+        if (!attempt || attempt.generation !== generation) {
+            created = true
+            attempt = {
+                key,
+                generation,
+                controller: new AbortController(),
+                waiters: new Set(),
+                promise: Promise.resolve(undefined as never),
+                settled: false,
+            }
+            this.digestAttempts.set(key, attempt)
+        }
+        const joined = !created
+        if (joined) this.reserveJoinedDigestWaiter()
+        const waiter: DigestWaiter = {
+            signal,
+            validateBeforeRead,
+            joined,
+            released: false,
+        }
+        attempt.waiters.add(waiter)
+
+        if (created) {
+            const ownedAttempt = attempt
+            const scheduled = this.readCoordinator.schedule({
+                owner: {
+                    principalId: this.context.principalId,
+                    instanceId: this.context.instanceId,
+                },
+                lane: 'digest',
+                signal: ownedAttempt.controller.signal,
+                run: async (physicalSignal) => {
+                    this.assertActive(generation, physicalSignal)
+                    let authorizedSource: ContextAssetSource | undefined
+                    let authorizationError: unknown
+                    const tried = new Set<DigestWaiter>()
+                    while (true) {
+                        const activeWaiter = [...ownedAttempt.waiters]
+                            .find((candidate) => !tried.has(candidate))
+                        if (!activeWaiter) break
+                        tried.add(activeWaiter)
+                        try {
+                            authorizedSource = await this.validateDigestWaiter(ownedAttempt, activeWaiter)
+                            break
+                        } catch (error) {
+                            authorizationError = error
+                        }
+                    }
+                    if (!authorizedSource) throw authorizationError ?? abortedError()
+                    this.assertActive(generation, physicalSignal)
+                    if (authorizedSource.byteLength !== undefined
+                        && authorizedSource.byteLength > MAX_ASSET_READ_BYTES) throw sourceLimitError()
+                    const data = await this.adapter.readAsset(authorizedSource, physicalSignal)
+                    this.assertActive(generation, physicalSignal)
+                    if (!(data instanceof Uint8Array)) {
+                        throw new PluginApiError('INTERNAL', 'Asset backend returned invalid binary data')
+                    }
+                    if (data.byteLength > MAX_ASSET_READ_BYTES) throw sourceLimitError()
+                    const revision = await digestBytes(data)
+                    this.assertActive(generation, physicalSignal)
+                    return {
+                        storageRevision: this.storageRevision(authorizedSource),
+                        revision,
+                        byteLength: data.byteLength,
+                        mediaType: inferMediaType(authorizedSource, data),
+                    }
+                },
+            })
+            ownedAttempt.promise = scheduled.finally(() => {
+                ownedAttempt.settled = true
+                if (this.digestAttempts.get(key) === ownedAttempt) this.digestAttempts.delete(key)
+            })
+        }
+        return this.waitForDigestAttempt(attempt, waiter)
+    }
+
+    private async assetReference(
+        source: ContextAssetSource,
+        origin: ContextAssetRef['origin'],
+        validateCurrentSource: () => Promise<ContextAssetSource>,
+        generation: number,
+        signal?: AbortSignal,
+    ) {
+        const digest = await this.assetDigest(source, validateCurrentSource, generation, signal)
+        const currentSource = await validateCurrentSource()
+        this.assertActive(generation, signal)
+        if (this.digestKey(currentSource) !== this.digestKey(source)) throw this.contextChanged()
+        lruSet(this.digestCache, this.digestKey(source), digest, MAX_DIGEST_RECORDS)
+        const assetId = await this.fenced(this.handleFor(source, origin, digest.revision), generation, signal)
+        lruSet(this.issuedHandles, assetId, { identity: source.identity, origin }, MAX_ISSUED_HANDLES)
         const reference: ContextAssetRef = {
             assetId,
             revision: digest.revision,
@@ -768,14 +993,14 @@ export class ContextResourceService {
         const character = state.characters.find((item) => item.id === characterId)
         if (!character) throw new PluginApiError('NOT_FOUND', 'Character was not found')
         return character.assets.map((source) => ({
-            source,
+            source: { ...source },
             origin: { kind: 'character' as const, characterId },
         }))
     }
 
     private moduleAssets(modules: readonly ContextModuleSource[]) {
         return modules.flatMap((module) => module.assets.map((source) => ({
-            source,
+            source: { ...source },
             origin: { kind: 'module' as const, moduleId: module.id },
         })))
     }
@@ -803,6 +1028,70 @@ export class ContextResourceService {
             && module.assets.some((source) => this.sameAssetSource(source, located.source)))
     }
 
+    private currentListSource(
+        state: ContextHostState,
+        located: { source: ContextAssetSource; origin: ContextAssetRef['origin'] },
+        moduleScope: 'active' | 'installed' | 'none',
+    ) {
+        if (!this.sourceStillAuthorized(state, located, moduleScope)) throw this.contextChanged()
+        const origin = located.origin
+        if (origin.kind === 'character') {
+            return state.characters.find((character) => character.id === origin.characterId)!.assets
+                .find((source) => this.sameAssetSource(source, located.source))!
+        }
+        const modules = moduleScope === 'installed' ? state.installedModules : state.activeModules
+        return modules.find((module) => module.id === origin.moduleId)!.assets
+            .find((source) => this.sameAssetSource(source, located.source))!
+    }
+
+    private async validateListSource(
+        located: { source: ContextAssetSource; origin: ContextAssetRef['origin'] },
+        moduleScope: 'active' | 'installed' | 'none',
+        selectors: { characterId: string; conversationId: string },
+        selectorOptions: { characterId?: CharacterId; conversationId?: ConversationId },
+        generation: number,
+        signal?: AbortSignal,
+    ) {
+        await this.permission('contextAssets', generation, signal)
+        if (moduleScope === 'installed') await this.permission('installedModulesRead', generation, signal)
+        const state = await this.state(generation, signal)
+        const currentSelectors = this.resolveSelectors(state, selectorOptions)
+        if (!this.sameSelectors(selectors, currentSelectors)) throw this.contextChanged()
+        return this.currentListSource(state, located, moduleScope)
+    }
+
+    private async boundedMap<T, U>(
+        values: readonly T[],
+        workerCount: number,
+        generation: number,
+        signal: AbortSignal | undefined,
+        transform: (value: T, index: number) => Promise<U>,
+    ) {
+        const results = new Array<U>(values.length)
+        let nextIndex = 0
+        let stopped = false
+        const worker = async () => {
+            while (!stopped) {
+                this.assertActive(generation, signal)
+                const index = nextIndex
+                if (index >= values.length) return
+                nextIndex += 1
+                try {
+                    results[index] = await transform(values[index], index)
+                } catch (error) {
+                    stopped = true
+                    throw error
+                }
+            }
+        }
+        await Promise.all(Array.from(
+            { length: Math.min(workerCount, values.length) },
+            () => worker(),
+        ))
+        this.assertActive(generation, signal)
+        return results
+    }
+
     private normalizeIncludes(value: ContextAssetRole[] | undefined) {
         const order: ContextAssetRole[] = ['portrait', 'emotion', 'additional', 'module']
         if (value === undefined) return order
@@ -821,6 +1110,9 @@ export class ContextResourceService {
     }
 
     async listContextAssets(options: ContextAssetListOptions = {}) {
+        const generation = this.generation
+        const signal = options.signal
+        this.assertActive(generation, signal)
         const moduleScope = options.moduleScope ?? 'active'
         if (!['active', 'installed', 'none'].includes(moduleScope)) {
             throw new PluginApiError('INVALID_ARGUMENT', 'Invalid module asset scope')
@@ -828,11 +1120,11 @@ export class ContextResourceService {
         const limit = normalizeLimit(options.limit)
         const include = this.normalizeIncludes(options.include)
         const mediaTypes = this.normalizeMediaTypes(options.mediaTypes)
-        const preflight = await this.state()
+        const preflight = await this.state(generation, signal)
         this.current(preflight)
-        await this.dependencies.requirePermission('contextAssets')
-        if (moduleScope === 'installed') await this.dependencies.requirePermission('installedModulesRead')
-        const state = await this.state()
+        await this.permission('contextAssets', generation, signal)
+        if (moduleScope === 'installed') await this.permission('installedModulesRead', generation, signal)
+        const state = await this.state(generation, signal)
         const selectors = this.resolveSelectors(state, options)
         const query = {
             kind: 'assets',
@@ -860,14 +1152,27 @@ export class ContextResourceService {
                 ].filter(({ source }) => include.includes(source.role))
                 const pageSources = sources.slice(offset, offset + pageLimit)
                 authorizedPageSources = pageSources
-                const references = await Promise.all(pageSources
-                    .map(({ source, origin }) => this.assetReference(source, origin)))
+                const references = await this.boundedMap(
+                    pageSources,
+                    MAX_LIST_DIGEST_WORKERS,
+                    generation,
+                    signal,
+                    ({ source, origin }) => this.assetReference(
+                        source,
+                        origin,
+                        () => this.validateListSource(
+                            { source, origin }, moduleScope, selectors, options, generation, signal,
+                        ),
+                        generation,
+                        signal,
+                    ),
+                )
                 const nextOffset = offset + pageSources.length
                 return {
                     items: mediaTypes
                         ? references.filter((reference) => reference.mediaType && mediaTypes.includes(reference.mediaType))
                         : references,
-                    contextRevision: await this.contextRevision(state),
+                    contextRevision: await this.fenced(this.contextRevision(state), generation, signal),
                     ...(nextOffset < sources.length ? { nextOffset } : {}),
                 }
             },
@@ -878,13 +1183,16 @@ export class ContextResourceService {
             ...(page.nextCursor ? { nextCursor: page.nextCursor } : {}),
         }
         try {
-            const fresh = await this.state()
+            await this.permission('contextAssets', generation, signal)
+            if (moduleScope === 'installed') await this.permission('installedModulesRead', generation, signal)
+            const fresh = await this.state(generation, signal)
             const refreshed = this.resolveSelectors(fresh, options)
             if (!this.sameSelectors(selectors, refreshed)
                 || authorizedPageSources.some((source) => !this.sourceStillAuthorized(fresh, source, moduleScope))) {
                 throw this.contextChanged()
             }
             assertContextSnapshotLimits(result)
+            this.assertActive(generation, signal)
             return result
         } catch (error) {
             if (page.nextCursor) this.cursorRegistry.clear(page.nextCursor)
@@ -929,153 +1237,260 @@ export class ContextResourceService {
             : left.moduleId === (right as { kind: 'module'; moduleId: string }).moduleId)
     }
 
-    private async locateAsset(state: ContextHostState, assetId: string, expectedRevision?: Revision) {
-        const issued = this.issuedHandles.get(assetId)
-        if (!issued && !expectedRevision) {
-            throw new PluginApiError('NOT_FOUND', 'Context asset was not found')
+    private authorizedScanAssets(state: ContextHostState) {
+        const authorized = this.authorizedCharacterIds(state)
+        return this.allAssets({
+            ...state,
+            characters: state.characters.filter((character) => authorized.has(character.id)),
+        })
+    }
+
+    private findIssuedAsset(state: ContextHostState, issued: IssuedAssetHandle) {
+        const origin = issued.origin
+        if (origin.kind === 'character') {
+            if (!this.authorizedCharacterIds(state).has(origin.characterId)) {
+                throw new PluginApiError('PERMISSION_DENIED', 'Character asset is outside the current context')
+            }
+            const character = state.characters.find((candidate) => candidate.id === origin.characterId)
+            const source = character?.assets.find((candidate) => candidate.identity === issued.identity)
+            return source ? {
+                source: { ...source },
+                origin: { ...issued.origin },
+                activeModule: false,
+            } : undefined
         }
-        const candidates = this.allAssets(state)
+        const candidate = this.allAssets({ ...state, characters: [] }).find((candidate) =>
+            candidate.source.identity === issued.identity && this.sameOrigin(candidate.origin, issued.origin))
+        return candidate ? {
+            ...candidate,
+            source: { ...candidate.source },
+            origin: { ...candidate.origin },
+        } : undefined
+    }
+
+    private async locateAsset(
+        state: ContextHostState,
+        assetId: string,
+        expectedSelectors: { characterId: string; conversationId: string },
+        expectedRevision: Revision | undefined,
+        generation: number,
+        signal?: AbortSignal,
+    ) {
+        this.assertActive(generation, signal)
+        const issued = lruGet(this.issuedHandles, assetId)
         if (issued) {
-            const candidate = candidates.find((value) => value.source.identity === issued.identity
-                && this.sameOrigin(value.origin, issued.origin))
+            const candidate = this.findIssuedAsset(state, issued)
             if (candidate) return candidate
             throw new PluginApiError('NOT_FOUND', 'Context asset was not found')
         }
+
+        const candidates = this.authorizedScanAssets(state)
         for (const candidate of candidates) {
-            if (await this.handleFor(candidate.source, candidate.origin, expectedRevision) === assetId) {
-                this.issuedHandles.set(assetId, { identity: candidate.source.identity, origin: candidate.origin })
-                return candidate
+            this.assertActive(generation, signal)
+            let revision = expectedRevision
+            if (!revision) {
+                const digest = await this.assetDigest(
+                    candidate.source,
+                    () => this.reauthorizeAssetOrigin(candidate, expectedSelectors, generation, signal),
+                    generation,
+                    signal,
+                )
+                await this.reauthorizeAssetOrigin(candidate, expectedSelectors, generation, signal)
+                this.assertActive(generation, signal)
+                lruSet(this.digestCache, this.digestKey(candidate.source), digest, MAX_DIGEST_RECORDS)
+                revision = digest.revision
+            }
+            if (await this.fenced(this.handleFor(candidate.source, candidate.origin, revision), generation, signal) === assetId) {
+                await this.authorizeAssetOrigin(state, candidate, generation, signal)
+                this.assertActive(generation, signal)
+                lruSet(
+                    this.issuedHandles,
+                    assetId,
+                    { identity: candidate.source.identity, origin: candidate.origin },
+                    MAX_ISSUED_HANDLES,
+                )
+                return {
+                    ...candidate,
+                    source: { ...candidate.source },
+                    origin: { ...candidate.origin },
+                }
             }
         }
         throw new PluginApiError('NOT_FOUND', 'Context asset was not found')
     }
 
-    private async authorizeAssetOrigin(state: ContextHostState, located: LocatedAsset) {
+    private async authorizeAssetOrigin(
+        state: ContextHostState,
+        located: LocatedAsset,
+        generation: number,
+        signal?: AbortSignal,
+    ) {
+        this.assertActive(generation, signal)
         if (located.origin.kind === 'character') {
             if (!this.authorizedCharacterIds(state).has(located.origin.characterId)) {
                 throw new PluginApiError('PERMISSION_DENIED', 'Character asset is outside the current context')
             }
             return
         }
-        if (!located.activeModule) await this.dependencies.requirePermission('installedModulesRead')
+        if (!located.activeModule) await this.permission('installedModulesRead', generation, signal)
     }
 
     private async reauthorizeAssetOrigin(
         located: LocatedAsset,
         expectedSelectors: { characterId: string; conversationId: string },
+        generation: number,
+        signal?: AbortSignal,
     ) {
+        await this.permission('contextAssets', generation, signal)
         let installedModulesAuthorized = false
         while (true) {
-            const state = await this.state()
-            const current = this.allAssets(state).find((candidate) =>
-                candidate.source.identity === located.source.identity
-                && candidate.source.storageKey === located.source.storageKey
-                && this.sameOrigin(candidate.origin, located.origin))
+            const state = await this.state(generation, signal)
+            const current = this.findIssuedAsset(state, {
+                identity: located.source.identity,
+                origin: located.origin,
+            })
             if (!current) throw new PluginApiError('NOT_FOUND', 'Context asset was removed while it was being read')
-            if (current.origin.kind === 'character'
-                && !this.authorizedCharacterIds(state).has(current.origin.characterId)) {
-                throw new PluginApiError('PERMISSION_DENIED', 'Character asset is outside the current context')
-            }
             const actualSelectors = this.resolveSelectors(state, {})
             if (!this.sameSelectors(expectedSelectors, actualSelectors)) throw this.contextChanged()
             if (current.origin.kind === 'module' && !current.activeModule && !installedModulesAuthorized) {
-                await this.dependencies.requirePermission('installedModulesRead')
+                await this.permission('installedModulesRead', generation, signal)
                 installedModulesAuthorized = true
                 continue
             }
-            assertNotAborted(this.context)
+            this.assertActive(generation, signal)
+            if (current.source.storageKey !== located.source.storageKey) {
+                throw new PluginApiError('CONFLICT', 'Context asset source changed while it was being read')
+            }
             if (this.storageRevision(current.source) !== this.storageRevision(located.source)) {
                 throw new PluginApiError('CONFLICT', 'Context asset changed while it was being read')
             }
-            return
+            return current.source
         }
     }
 
     async readContextAsset(
         assetId: string,
-        options: { ifRevision?: Revision; variant?: 'original' | 'thumbnail'; maxBytes?: number } = {},
+        options: ContextAssetReadOptions = {},
     ) {
+        const generation = this.generation
+        const signal = options.signal
+        this.assertActive(generation, signal)
         const variant = options.variant ?? 'original'
         if (variant !== 'original' && variant !== 'thumbnail') {
             throw new PluginApiError('INVALID_ARGUMENT', 'Invalid context asset variant')
         }
         const maxBytes = normalizeAssetReadBytes(options.maxBytes)
         validateAssetReadIdentifiers(assetId, options.ifRevision)
-        const preflight = await this.state()
+        const preflight = await this.state(generation, signal)
         this.current(preflight)
-        await this.dependencies.requirePermission('contextAssets')
-        // Charge every well-formed, permission-bearing attempt before handle or digest scanning.
-        this.readRateLimiter.consume(this.context.principalId)
-        const state = await this.state()
+        await this.permission('contextAssets', generation, signal)
+        const state = await this.state(generation, signal)
         const selectors = this.resolveSelectors(state, {})
-        const located = await this.locateAsset(state, assetId, options.ifRevision)
-        await this.authorizeAssetOrigin(state, located)
-        const cached = this.digestCache.get(located.source.storageKey)
-        if (variant === 'original' && cached && cached.storageRevision === this.storageRevision(located.source)
-            && cached.byteLength > maxBytes) {
+        const located = await this.locateAsset(
+            state, assetId, selectors, options.ifRevision, generation, signal,
+        )
+        await this.authorizeAssetOrigin(state, located, generation, signal)
+        if (located.source.byteLength !== undefined && located.source.byteLength > MAX_ASSET_READ_BYTES) {
+            throw sourceLimitError()
+        }
+        const cached = lruGet(this.digestCache, this.digestKey(located.source))
+        if (variant === 'original' && cached && cached.byteLength > maxBytes) {
             throw new PluginApiError('RESOURCE_LIMIT', 'Context asset exceeds maxBytes')
         }
-        const data = await this.adapter.readAsset(located.source)
-        if (!(data instanceof Uint8Array)) {
-            throw new PluginApiError('INTERNAL', 'Asset backend returned invalid binary data')
-        }
-        if (data.byteLength > MAX_ASSET_READ_BYTES) {
-            throw new PluginApiError('RESOURCE_LIMIT', 'Context asset exceeds the hard read limit')
-        }
-        const digest: AssetDigestRecord = {
-            storageRevision: this.storageRevision(located.source),
-            revision: await digestBytes(data),
-            byteLength: data.byteLength,
-            mediaType: inferMediaType(located.source, data),
-        }
-        this.digestCache.set(located.source.storageKey, digest)
-        const currentHandle = await this.handleFor(located.source, located.origin, digest.revision)
-        if (currentHandle !== assetId) {
-            throw new PluginApiError('CONFLICT', 'Context asset handle is stale', {
-                details: { actualRevision: digest.revision },
-            })
-        }
-        if (options.ifRevision !== undefined && options.ifRevision !== digest.revision) {
-            throw new PluginApiError('CONFLICT', 'Context asset revision changed', {
-                details: { expectedRevision: options.ifRevision, actualRevision: digest.revision },
-            })
-        }
-        if (variant === 'original') {
-            if (data.byteLength > maxBytes) throw new PluginApiError('RESOURCE_LIMIT', 'Context asset exceeds maxBytes')
-            await this.reauthorizeAssetOrigin(located, selectors)
-            return {
-                data: data.slice(),
-                revision: digest.revision,
-                name: located.source.name,
-                mediaType: digest.mediaType,
-            }
-        }
-        if (!digest.mediaType.startsWith('image/')) {
-            throw new PluginApiError('DECODE_FAILED', 'Only image assets can be thumbnailed')
-        }
-        const thumbnail = await this.adapter.createThumbnail(located.source, data, {
-            longEdge: THUMBNAIL_LONG_EDGE,
-            maxPixels: MAX_THUMBNAIL_PIXELS,
-            maxOutputBytes: MAX_THUMBNAIL_OUTPUT_BYTES,
+
+        return this.readCoordinator.schedule({
+            owner: {
+                principalId: this.context.principalId,
+                instanceId: this.context.instanceId,
+            },
+            lane: variant,
+            signal,
+            run: async (physicalSignal) => {
+                const currentSource = await this.reauthorizeAssetOrigin(
+                    located, selectors, generation, physicalSignal,
+                )
+                if (currentSource.byteLength !== undefined && currentSource.byteLength > MAX_ASSET_READ_BYTES) {
+                    throw sourceLimitError()
+                }
+                const data = await this.adapter.readAsset(currentSource, physicalSignal)
+                this.assertActive(generation, physicalSignal)
+                if (!(data instanceof Uint8Array)) {
+                    throw new PluginApiError('INTERNAL', 'Asset backend returned invalid binary data')
+                }
+                if (data.byteLength > MAX_ASSET_READ_BYTES) throw sourceLimitError()
+                if (variant === 'original' && data.byteLength > maxBytes) {
+                    throw new PluginApiError('RESOURCE_LIMIT', 'Context asset exceeds maxBytes')
+                }
+                const revision = await digestBytes(data)
+                this.assertActive(generation, physicalSignal)
+                const digest: AssetDigestRecord = {
+                    storageRevision: this.storageRevision(currentSource),
+                    revision,
+                    byteLength: data.byteLength,
+                    mediaType: inferMediaType(currentSource, data),
+                }
+                let thumbnail: BoundedThumbnailResult | undefined
+                if (variant === 'thumbnail') {
+                    if (!digest.mediaType.startsWith('image/')) {
+                        throw new PluginApiError('DECODE_FAILED', 'Only image assets can be thumbnailed')
+                    }
+                    thumbnail = await this.adapter.createThumbnail(currentSource, data, {
+                        longEdge: THUMBNAIL_LONG_EDGE,
+                        maxPixels: MAX_THUMBNAIL_PIXELS,
+                        maxOutputBytes: MAX_THUMBNAIL_OUTPUT_BYTES,
+                    }, physicalSignal)
+                    this.assertActive(generation, physicalSignal)
+                    if (!(thumbnail.data instanceof Uint8Array)
+                        || !Number.isInteger(thumbnail.width) || thumbnail.width <= 0
+                        || !Number.isInteger(thumbnail.height) || thumbnail.height <= 0
+                        || !Number.isInteger(thumbnail.decodedPixels) || thumbnail.decodedPixels <= 0) {
+                        throw new PluginApiError('DECODE_FAILED', 'Thumbnail backend returned invalid output')
+                    }
+                    if (Math.max(thumbnail.width, thumbnail.height) > THUMBNAIL_LONG_EDGE
+                        || thumbnail.decodedPixels > MAX_THUMBNAIL_PIXELS
+                        || thumbnail.data.byteLength > MAX_THUMBNAIL_OUTPUT_BYTES
+                        || thumbnail.data.byteLength > maxBytes) {
+                        throw new PluginApiError('RESOURCE_LIMIT', 'Thumbnail exceeds the advertised bounds')
+                    }
+                }
+
+                await this.reauthorizeAssetOrigin(located, selectors, generation, physicalSignal)
+                const currentHandle = await this.fenced(
+                    this.handleFor(located.source, located.origin, digest.revision), generation, physicalSignal,
+                )
+                if (currentHandle !== assetId) {
+                    throw new PluginApiError('CONFLICT', 'Context asset handle is stale', {
+                        details: { actualRevision: digest.revision },
+                    })
+                }
+                if (options.ifRevision !== undefined && options.ifRevision !== digest.revision) {
+                    throw new PluginApiError('CONFLICT', 'Context asset revision changed', {
+                        details: { expectedRevision: options.ifRevision, actualRevision: digest.revision },
+                    })
+                }
+                this.assertActive(generation, physicalSignal)
+                lruSet(this.digestCache, this.digestKey(located.source), digest, MAX_DIGEST_RECORDS)
+                lruSet(
+                    this.issuedHandles,
+                    assetId,
+                    { identity: located.source.identity, origin: located.origin },
+                    MAX_ISSUED_HANDLES,
+                )
+                if (variant === 'original') {
+                    return {
+                        data: data.slice(),
+                        revision: digest.revision,
+                        name: located.source.name,
+                        mediaType: digest.mediaType,
+                    }
+                }
+                return {
+                    data: thumbnail!.data.slice(),
+                    revision: digest.revision,
+                    name: located.source.name,
+                    mediaType: normalizedMediaType(thumbnail!.mediaType) ?? 'application/octet-stream',
+                }
+            },
         })
-        if (!(thumbnail.data instanceof Uint8Array)
-            || !Number.isInteger(thumbnail.width) || thumbnail.width <= 0
-            || !Number.isInteger(thumbnail.height) || thumbnail.height <= 0
-            || !Number.isInteger(thumbnail.decodedPixels) || thumbnail.decodedPixels <= 0) {
-            throw new PluginApiError('DECODE_FAILED', 'Thumbnail backend returned invalid output')
-        }
-        if (Math.max(thumbnail.width, thumbnail.height) > THUMBNAIL_LONG_EDGE
-            || thumbnail.decodedPixels > MAX_THUMBNAIL_PIXELS
-            || thumbnail.data.byteLength > MAX_THUMBNAIL_OUTPUT_BYTES
-            || thumbnail.data.byteLength > maxBytes) {
-            throw new PluginApiError('RESOURCE_LIMIT', 'Thumbnail exceeds the advertised bounds')
-        }
-        await this.reauthorizeAssetOrigin(located, selectors)
-        return {
-            data: thumbnail.data.slice(),
-            revision: digest.revision,
-            name: located.source.name,
-            mediaType: normalizedMediaType(thumbnail.mediaType) ?? 'application/octet-stream',
-        }
     }
 }

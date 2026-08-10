@@ -648,6 +648,7 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
             }),
         },
     )
+    addPluginUnloadCallback(context.instanceId, () => contextResources.dispose())
     const inlayLifecycle = new InlayLifecycleService(
         context,
         createRisuInlayLifecycleAdapter({

@@ -6,6 +6,12 @@ import {
     type RisuContextAdapterDependencies,
 } from './contextResources.risu'
 
+const deferred = <T>() => {
+    let resolve!: (value: T) => void
+    const promise = new Promise<T>((resolvePromise) => { resolve = resolvePromise })
+    return { promise, resolve }
+}
+
 const makeLore = (id: string, content: string, mode: 'normal' | 'folder' = 'normal') => ({
     id,
     comment: `${id} comment`,
@@ -290,6 +296,66 @@ describe('Risu context resource adapter', () => {
             longEdge: 512, maxPixels: 262_144, maxOutputBytes: 1_048_576,
         })).resolves.toMatchObject({ data: new Uint8Array([9, 8]) })
         expect(thumbnail).toHaveBeenCalledOnce()
+    })
+
+    it('checks cancellation before and after an uncancellable image read', async () => {
+        const preAborted = new AbortController()
+        preAborted.abort()
+        const preflightRead = vi.fn(async () => new Uint8Array([1]))
+        const preflightAdapter = createRisuContextResourceAdapter(dependencies({ readImage: preflightRead }))
+        const source = (await preflightAdapter.getState()).characters[0].assets[0]
+
+        await expect(preflightAdapter.readAsset(source, preAborted.signal))
+            .rejects.toMatchObject({ code: 'ABORTED' })
+        expect(preflightRead).not.toHaveBeenCalled()
+
+        const gate = deferred<Uint8Array>()
+        const activeRead = vi.fn(async () => gate.promise)
+        const activeAdapter = createRisuContextResourceAdapter(dependencies({ readImage: activeRead }))
+        const active = new AbortController()
+        const pending = activeAdapter.readAsset(source, active.signal)
+        await vi.waitFor(() => expect(activeRead).toHaveBeenCalledOnce())
+        active.abort()
+        gate.resolve(new Uint8Array([9, 8, 7]))
+
+        await expect(pending).rejects.toMatchObject({ code: 'ABORTED' })
+    })
+
+    it('checks cancellation before and after uncancellable thumbnail creation', async () => {
+        const preflightThumbnail = vi.fn(async () => ({
+            data: new Uint8Array([1]), mediaType: 'image/webp', width: 1, height: 1, decodedPixels: 1,
+        }))
+        const preflightAdapter = createRisuContextResourceAdapter(dependencies({
+            createThumbnail: preflightThumbnail,
+        }))
+        const source = (await preflightAdapter.getState()).characters[0].assets[0]
+        const constraints = { longEdge: 512, maxPixels: 262_144, maxOutputBytes: 1_048_576 }
+        const preAborted = new AbortController()
+        preAborted.abort()
+
+        await expect(preflightAdapter.createThumbnail(
+            source, new Uint8Array([1]), constraints, preAborted.signal,
+        )).rejects.toMatchObject({ code: 'ABORTED' })
+        expect(preflightThumbnail).not.toHaveBeenCalled()
+
+        const gate = deferred<{
+            data: Uint8Array
+            mediaType: string
+            width: number
+            height: number
+            decodedPixels: number
+        }>()
+        const thumbnail = vi.fn(async () => gate.promise)
+        const adapter = createRisuContextResourceAdapter(dependencies({ createThumbnail: thumbnail }))
+
+        const active = new AbortController()
+        const pending = adapter.createThumbnail(source, new Uint8Array([1]), constraints, active.signal)
+        await vi.waitFor(() => expect(thumbnail).toHaveBeenCalledOnce())
+        active.abort()
+        gate.resolve({
+            data: new Uint8Array([1]), mediaType: 'image/webp', width: 1, height: 1, decodedPixels: 1,
+        })
+        await expect(pending).rejects.toMatchObject({ code: 'ABORTED' })
     })
 
     it.each([

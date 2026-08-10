@@ -21,6 +21,29 @@ describe('V3 capability discovery', () => {
         expect(Object.values(CAPABILITY_CONTRACT).every((entry) => entry.version === 1)).toBe(true)
         expect(CAPABILITY_CONTRACT['context.assets.v1'].permission).toBe('contextAssets')
         expect(CAPABILITY_CONTRACT['context.assets.v1'].additionalPermissions).toEqual(['installedModulesRead'])
+        expect(CAPABILITY_CONTRACT['context.assets.v1'].limits).toEqual({
+            maxSnapshotJsonBytes: 2_097_152,
+            maxJsonDepth: 32,
+            maxTextFieldUtf8Bytes: 524_288,
+            defaultPageSize: 50,
+            maxPageSize: 100,
+            cursorTtlMs: 300_000,
+            maxActiveCursorsPerPrincipal: 64,
+            maxActiveModules: 100,
+            defaultAssetReadBytes: 16_777_216,
+            maxAssetReadBytes: 33_554_432,
+            assetReadPolicy: 'backpressure',
+            maxConcurrentAssetReadsPerPrincipal: 4,
+            maxConcurrentOriginalAssetReadsPerPrincipal: 1,
+            maxQueuedAssetReadsPerPrincipal: 128,
+            assetReadCancellation: true,
+            thumbnailLongEdge: 512,
+            maxThumbnailPixels: 262_144,
+            maxThumbnailOutputBytes: 1_048_576,
+            maxRpcBinaryValueBytes: 67_108_864,
+            maxRpcAggregateBytes: 134_217_728,
+        })
+        expect(CAPABILITY_CONTRACT['context.assets.v1'].limits).not.toHaveProperty('assetReadsPerMinute')
         expect(CAPABILITY_CONTRACT['inlay.atomic-attach.v1'].additionalPermissions).toEqual(['chatWriteAll', 'inlayWrite'])
         expect(CAPABILITY_CONTRACT['storage.device-cache.v1'].permission).toBeUndefined()
         expect(CAPABILITY_CONTRACT['context.current.v1'].limits).toEqual({
@@ -32,8 +55,8 @@ describe('V3 capability discovery', () => {
         const serialized = JSON.stringify(CAPABILITY_CONTRACT)
         const digest = [...new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(serialized)))]
             .map((value) => value.toString(16).padStart(2, '0')).join('')
-        expect(new TextEncoder().encode(serialized).byteLength).toBe(5195)
-        expect(digest).toBe('bc197fe68ca0129f4ca5351e66b49c46f83bfac17358cb74b0f0d9a3a8512b64')
+        expect(new TextEncoder().encode(serialized).byteLength).toBe(5358)
+        expect(digest).toBe('e6bab29cde36e6feba004263f5499a55ce057288a36465f7089c8f7b7202af97')
     })
 
     it('returns an explicit descriptor for unknown IDs', async () => {

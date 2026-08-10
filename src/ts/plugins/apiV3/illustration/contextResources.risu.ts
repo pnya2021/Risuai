@@ -201,6 +201,10 @@ const normalizeBinary = (value: Uint8Array | ArrayBuffer | ArrayBufferView | nul
     throw new PluginApiError('NOT_FOUND', 'Asset bytes were not found')
 }
 
+const assertNotAborted = (signal?: AbortSignal) => {
+    if (signal?.aborted) throw new PluginApiError('ABORTED', 'Context asset operation was cancelled')
+}
+
 export function createRisuContextResourceAdapter(
     dependencies: RisuContextAdapterDependencies,
 ): ContextResourceAdapter {
@@ -263,20 +267,32 @@ export function createRisuContextResourceAdapter(
                 installedModules,
             }
         },
-        async readAsset(source) {
+        async readAsset(source, signal) {
+            assertNotAborted(signal)
             const storageKey = source.storageKey
             if (!isCanonicalLocalAssetStorageKey(storageKey)) {
                 throw new PluginApiError('NOT_FOUND', 'Asset storage key is unavailable')
             }
-            return normalizeBinary(await dependencies.readImage(storageKey))
+            const value = await dependencies.readImage(storageKey)
+            assertNotAborted(signal)
+            return normalizeBinary(value)
         },
-        async createThumbnail(source, data, constraints) {
-            if (dependencies.createThumbnail) return dependencies.createThumbnail(source, data, constraints)
+        async createThumbnail(source, data, constraints, signal) {
+            assertNotAborted(signal)
+            if (dependencies.createThumbnail) {
+                const result = await dependencies.createThumbnail(source, data, constraints, signal)
+                assertNotAborted(signal)
+                return result
+            }
             const mediaType = sniffContextAssetMediaType(data)
                 ?? source.mediaType
                 ?? mediaTypeOf(source.extension)
                 ?? 'application/octet-stream'
-            return createBoundedContextThumbnail(data, mediaType, constraints)
+            const result = await createBoundedContextThumbnail(
+                data, mediaType, constraints, browserThumbnailEnvironment, signal,
+            )
+            assertNotAborted(signal)
+            return result
         },
     }
 }
@@ -432,16 +448,20 @@ export async function createBoundedContextThumbnail(
     mediaType: string,
     limits: { longEdge: number; maxPixels: number; maxOutputBytes: number },
     environment: BoundedThumbnailEnvironment = browserThumbnailEnvironment,
+    signal?: AbortSignal,
 ): Promise<BoundedThumbnailResult> {
+    assertNotAborted(signal)
     const source = parseImageDimensions(data, mediaType)
     const target = targetDimensions(source.width, source.height, limits)
     let decoded: ThumbnailDecodeResult | undefined
     try {
         decoded = await environment.decode(data, { ...target, mediaType })
+        assertNotAborted(signal)
         if (decoded.width > target.width || decoded.height > target.height) {
             throw new PluginApiError('DECODE_FAILED', 'Image decoder exceeded its bounded target')
         }
         const encoded = await environment.encode(decoded.drawable, decoded.width, decoded.height, limits.maxOutputBytes)
+        assertNotAborted(signal)
         const pixels = encoded.width * encoded.height
         if (!(encoded.data instanceof Uint8Array)
             || encoded.data.byteLength > limits.maxOutputBytes
