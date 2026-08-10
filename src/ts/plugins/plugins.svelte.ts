@@ -13,7 +13,7 @@ import { loadV3Plugins } from "./apiV3/v3.svelte";
 import { pluginCodeTranspiler } from "./apiV3/transpiler";
 import { invalidatePluginPrincipal, isCanonicalPluginPrincipalId, preparePluginRecord, reconcileProgrammaticPluginRecords, stripPluginPrincipal } from './pluginPrincipal';
 import { pluginDataLifecycle } from './pluginDataLifecycle';
-import { retirePluginPrincipals } from './pluginRetirement';
+import { retirePluginPrincipal, retirePluginPrincipals } from './pluginRetirement';
 import { pluginRuntimeReloadCoordinator, withPluginMutationLock } from './pluginMutationCoordinator';
 import { isCurrentPluginRuntimeRecord, PluginRuntimeReplacementTransaction, reloadPluginRuntime, runAuthorizedPluginRuntimeMutation, runCoordinatedPersistedRuntimeMutation, runCoordinatedPluginRuntimeMutation, suspendPluginRuntime } from './pluginRuntimeReplacement';
 import { createPluginDatabaseBoundary } from './pluginDatabaseBoundary';
@@ -586,7 +586,7 @@ export async function removeInstalledPlugin(principalId: string) {
     const removed = await withPluginMutationLock(async () => {
         const plugin = (DBState.db.plugins ?? []).find((entry) => entry.principalId === principalId)
         if (!plugin) return false
-        await pluginDataLifecycle.retirePrincipal(principalId, {
+        await retirePluginPrincipal(principalId, {
             invalidate: () => invalidatePluginPrincipal(principalId),
             remove: () => {
                 const plugins = DBState.db.plugins ?? []

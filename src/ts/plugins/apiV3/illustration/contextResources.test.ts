@@ -748,6 +748,68 @@ describe('opaque context assets', () => {
         expect(firstService.reads.mock.calls.length + secondService.reads.mock.calls.length).toBe(2)
     })
 
+    it('shares exactly 128 logical queue slots between digest joiners and unrelated reads', async () => {
+        const principalId = '15151515-1515-4515-8515-151515151515'
+        const coordinator = new ContextAssetReadCoordinator()
+        const h = harness({ principalId, readCoordinator: coordinator })
+        const listed = await h.service.listContextAssets({ moduleScope: 'none', include: ['portrait'] })
+        const reference = listed.assets[0]
+        h.reads.mockClear()
+        h.state.characters[0].assets[0].storageRevision = 'storage:alice-portrait:2'
+        const occupied = await occupyAllReadPermits(coordinator, principalId)
+        const schedule = vi.spyOn(coordinator, 'schedule')
+        const ownerController = new AbortController()
+        const sharedOwner = h.service.listContextAssets({
+            moduleScope: 'none', include: ['portrait'], signal: ownerController.signal,
+        })
+        await waitFor(() => schedule.mock.calls.length === 1)
+
+        const stateReadsBeforeJoin = h.getState.mock.calls.length
+        const joinControllers = Array.from({ length: 64 }, () => new AbortController())
+        const joiners = joinControllers.map((controller) => h.service.listContextAssets({
+            moduleScope: 'none', include: ['portrait'], signal: controller.signal,
+        }))
+        await waitFor(() => h.getState.mock.calls.length >= stateReadsBeforeJoin + 128)
+        await new Promise((resolve) => setTimeout(resolve, 0))
+
+        const readControllers = Array.from({ length: 64 }, () => new AbortController())
+        const unrelated = readControllers.slice(0, 63).map((controller) => h.service.readContextAsset(
+            reference.assetId,
+            { ifRevision: reference.revision, signal: controller.signal },
+        ))
+        await waitFor(() => schedule.mock.calls.length === 64)
+        const overflow = h.service.readContextAsset(reference.assetId, {
+            ifRevision: reference.revision,
+            signal: readControllers[63].signal,
+        })
+        const settlements = Promise.allSettled([sharedOwner, ...joiners, ...unrelated, overflow])
+        const overflowResult = await Promise.race([
+            overflow.then(
+                () => ({ code: 'NO_ERROR' }),
+                (error: PluginApiError) => ({ code: error.code, retryable: error.retryable }),
+            ),
+            new Promise<{ code: string }>((resolve) => setTimeout(() => resolve({ code: 'PENDING' }), 50)),
+        ])
+
+        expect(overflowResult).toEqual({ code: 'RESOURCE_LIMIT', retryable: true })
+
+        ownerController.abort()
+        for (const controller of [...joinControllers, ...readControllers]) controller.abort()
+        await settlements
+
+        let reusableStarted = false
+        const reusable = coordinator.schedule({
+            owner: { principalId, instanceId: 'capacity-reuse' },
+            lane: 'digest',
+            run: async () => { reusableStarted = true },
+        })
+        occupied.releaseOne()
+        await reusable
+        await occupied.releaseAll()
+        expect(reusableStarted).toBe(true)
+        expect(h.reads).not.toHaveBeenCalled()
+    })
+
     it('moves a shared digest attempt to a surviving waiter when cancelled permit validation hangs', async () => {
         const principalId = '12121212-1212-4212-8212-121212121212'
         const coordinator = new ContextAssetReadCoordinator()
@@ -890,6 +952,75 @@ describe('opaque context assets', () => {
         const missingInstalled = harness({ grants: ['contextAssets'] })
         expect(await errorCode(missingInstalled.service.listContextAssets({ moduleScope: 'installed' }))).toBe('PERMISSION_DENIED')
         await expect(missingInstalled.service.listContextAssets({ moduleScope: 'active' })).resolves.toBeDefined()
+    })
+
+    it('requires contextAssets again after installed permission resolves before list storage', async () => {
+        const state = makeState()
+        state.activeModules = []
+        state.installedModules = [state.installedModules[1]]
+        const installedGate = deferred<void>()
+        let installedCalls = 0
+        let contextAllowed = true
+        const h = harness({
+            state,
+            readCoordinator: new ContextAssetReadCoordinator(),
+            onPermission: async (permission) => {
+                if (permission === 'contextAssets' && !contextAllowed) {
+                    throw new PluginApiError('PERMISSION_DENIED', 'Context asset permission was revoked')
+                }
+                if (permission === 'installedModulesRead') {
+                    installedCalls += 1
+                    if (installedCalls === 2) await installedGate.promise
+                }
+            },
+        })
+        const pending = h.service.listContextAssets({ moduleScope: 'installed', include: ['module'] })
+        const outcome = pending.catch((error) => error)
+        await waitFor(() => installedCalls === 2)
+
+        contextAllowed = false
+        installedGate.resolve()
+
+        await expect(outcome).resolves.toMatchObject({ code: 'PERMISSION_DENIED' })
+        expect(h.reads).not.toHaveBeenCalled()
+    })
+
+    it('requires contextAssets again after installed permission resolves before explicit storage', async () => {
+        const state = makeState()
+        state.installedModules = [state.activeModules[0]]
+        const installedGate = deferred<void>()
+        let trackRead = false
+        let installedCalls = 0
+        let contextAllowed = true
+        const h = harness({
+            state,
+            readCoordinator: new ContextAssetReadCoordinator(),
+            onPermission: async (permission) => {
+                if (!trackRead) return
+                if (permission === 'contextAssets' && !contextAllowed) {
+                    throw new PluginApiError('PERMISSION_DENIED', 'Context asset permission was revoked')
+                }
+                if (permission === 'installedModulesRead') {
+                    installedCalls += 1
+                    if (installedCalls === 2) await installedGate.promise
+                }
+            },
+        })
+        const listed = await h.service.listContextAssets({ moduleScope: 'active', include: ['module'] })
+        const reference = listed.assets[0]
+        h.reads.mockClear()
+        state.activeModules = []
+        trackRead = true
+
+        const pending = h.service.readContextAsset(reference.assetId, { ifRevision: reference.revision })
+        const outcome = pending.catch((error) => error)
+        await waitFor(() => installedCalls === 2)
+
+        contextAllowed = false
+        installedGate.resolve()
+
+        await expect(outcome).resolves.toMatchObject({ code: 'PERMISSION_DENIED' })
+        expect(h.reads).not.toHaveBeenCalled()
     })
 
     it('rechecks list permission after a queued digest permit and before storage', async () => {
@@ -1106,7 +1237,9 @@ describe('opaque context assets', () => {
         const active = harness({ state, principalId, grants: ['contextAssets'] })
         await expect(active.service.readContextAsset(reference.assetId, { ifRevision: reference.revision }))
             .resolves.toMatchObject({ revision: reference.revision })
-        expect(active.permissionCalls).toEqual(['contextAssets', 'contextAssets', 'contextAssets'])
+        expect(active.permissionCalls).toEqual([
+            'contextAssets', 'contextAssets', 'contextAssets', 'contextAssets',
+        ])
 
         state.activeModules = []
         let installedPermissionCalls = 0

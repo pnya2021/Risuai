@@ -7,6 +7,11 @@ export interface ContextAssetReadOwner {
     instanceId: string
 }
 
+export interface ContextAssetLogicalQueueToken {
+    readonly principalId: string
+    readonly instanceId: string
+}
+
 export interface ContextAssetReadRequest<T> {
     owner: ContextAssetReadOwner
     lane: ContextAssetReadLane
@@ -38,6 +43,7 @@ interface PrincipalReadState {
     principalId: string
     queues: Record<ContextAssetReadLane, ReadJob[]>
     active: Set<ReadJob>
+    logicalQueueTokens: Set<ContextAssetLogicalQueueToken>
     queuedCount: number
     activeCount: number
     activeOriginalCount: number
@@ -70,6 +76,7 @@ export class ContextAssetReadCoordinator {
                 principalId: request.owner.principalId,
                 queues: { thumbnail: [], original: [], digest: [] },
                 active: new Set(),
+                logicalQueueTokens: new Set(),
                 queuedCount: 0,
                 activeCount: 0,
                 activeOriginalCount: 0,
@@ -108,12 +115,46 @@ export class ContextAssetReadCoordinator {
         state.queuedCount += 1
         this.pump(state)
 
-        if (job.state === 'queued' && state.queuedCount > MAX_QUEUED_READS) {
+        if (job.state === 'queued'
+            && state.queuedCount + state.logicalQueueTokens.size > MAX_QUEUED_READS) {
             this.removeQueuedJob(state, job)
             this.settleQueuedJob(state, job, queueLimitError())
         }
 
         return result
+    }
+
+    reserveLogicalQueueSlot(owner: ContextAssetReadOwner): ContextAssetLogicalQueueToken {
+        let state = this.principals.get(owner.principalId)
+        if (state?.retiring) throw abortedError()
+        if (!state) {
+            state = {
+                principalId: owner.principalId,
+                queues: { thumbnail: [], original: [], digest: [] },
+                active: new Set(),
+                logicalQueueTokens: new Set(),
+                queuedCount: 0,
+                activeCount: 0,
+                activeOriginalCount: 0,
+                retiring: false,
+            }
+            this.principals.set(owner.principalId, state)
+        }
+        if (state.queuedCount + state.logicalQueueTokens.size >= MAX_QUEUED_READS) {
+            throw queueLimitError()
+        }
+        const token: ContextAssetLogicalQueueToken = Object.freeze({
+            principalId: owner.principalId,
+            instanceId: owner.instanceId,
+        })
+        state.logicalQueueTokens.add(token)
+        return token
+    }
+
+    releaseLogicalQueueSlot(token: ContextAssetLogicalQueueToken): void {
+        const state = this.principals.get(token.principalId)
+        if (!state || !state.logicalQueueTokens.delete(token)) return
+        this.removeIdleState(state)
     }
 
     cancelInstance(owner: ContextAssetReadOwner): void {
@@ -128,6 +169,9 @@ export class ContextAssetReadCoordinator {
         for (const job of [...state.active]) {
             if (job.instanceId === owner.instanceId) this.cancelJob(state, job)
         }
+        for (const token of [...state.logicalQueueTokens]) {
+            if (token.instanceId === owner.instanceId) this.releaseLogicalQueueSlot(token)
+        }
     }
 
     retirePrincipal(principalId: string): void {
@@ -139,6 +183,7 @@ export class ContextAssetReadCoordinator {
             for (const job of [...state.queues[lane]]) this.cancelJob(state, job)
         }
         for (const job of [...state.active]) this.cancelJob(state, job)
+        for (const token of [...state.logicalQueueTokens]) this.releaseLogicalQueueSlot(token)
         this.removeIdleState(state)
     }
 
@@ -269,6 +314,7 @@ export class ContextAssetReadCoordinator {
         if (
             state.activeCount === 0
             && state.queuedCount === 0
+            && state.logicalQueueTokens.size === 0
             && this.principals.get(state.principalId) === state
         ) this.principals.delete(state.principalId)
     }

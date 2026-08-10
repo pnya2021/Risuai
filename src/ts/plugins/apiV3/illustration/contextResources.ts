@@ -6,6 +6,7 @@ import type { ModuleActivationReason } from './moduleActivation'
 import {
     ContextAssetReadCoordinator,
     contextAssetReadCoordinator,
+    type ContextAssetLogicalQueueToken,
 } from './contextAssetReadCoordinator'
 
 export type CharacterId = string
@@ -201,9 +202,6 @@ const REVISION_PATTERN = /^sha256:[0-9a-f]{64}$/
 const MAX_LIST_DIGEST_WORKERS = 4
 const MAX_DIGEST_RECORDS = 8_192
 const MAX_ISSUED_HANDLES = 8_192
-const MAX_JOINED_DIGEST_WAITERS = 128
-
-const joinedDigestWaitersByPrincipal = new Map<string, number>()
 
 const textEncoder = new TextEncoder()
 
@@ -367,9 +365,8 @@ interface IssuedAssetHandle {
 interface DigestWaiter {
     signal?: AbortSignal
     abortListener?: () => void
-    validateBeforeRead(): Promise<ContextAssetSource>
-    joined: boolean
-    released: boolean
+    validateBeforeRead?: () => Promise<ContextAssetSource>
+    logicalQueueToken?: ContextAssetLogicalQueueToken
 }
 
 interface DigestAttempt {
@@ -384,12 +381,6 @@ interface DigestAttempt {
 const abortedError = () => new PluginApiError('ABORTED', 'Context asset operation was cancelled')
 
 const sourceLimitError = () => new PluginApiError('RESOURCE_LIMIT', 'Context asset exceeds the hard read limit')
-
-const digestWaiterLimitError = () => new PluginApiError(
-    'RESOURCE_LIMIT',
-    'Context asset read queue is full',
-    { retryable: true },
-)
 
 function lruGet<K, V>(map: Map<K, V>, key: K): V | undefined {
     const value = map.get(key)
@@ -432,8 +423,8 @@ export class ContextResourceService {
         this.disposed = true
         this.generation += 1
         this.context.signal.removeEventListener('abort', this.abortCleanup)
-        for (const attempt of this.digestAttempts.values()) {
-            for (const waiter of attempt.waiters) this.releaseJoinedDigestWaiter(waiter)
+        for (const attempt of [...this.digestAttempts.values()]) {
+            for (const waiter of [...attempt.waiters]) this.removeDigestWaiter(attempt, waiter)
             attempt.controller.abort()
         }
         this.digestAttempts.clear()
@@ -806,32 +797,21 @@ export class ContextResourceService {
         }
         waiter.abortListener = undefined
         waiter.signal = undefined
+        waiter.validateBeforeRead = undefined
         attempt.waiters.delete(waiter)
-        this.releaseJoinedDigestWaiter(waiter)
+        if (waiter.logicalQueueToken) {
+            this.readCoordinator.releaseLogicalQueueSlot(waiter.logicalQueueToken)
+            waiter.logicalQueueToken = undefined
+        }
         if (attempt.waiters.size === 0 && !attempt.settled) {
             if (this.digestAttempts.get(attempt.key) === attempt) this.digestAttempts.delete(attempt.key)
             attempt.controller.abort()
         }
     }
 
-    private releaseJoinedDigestWaiter(waiter: DigestWaiter) {
-        if (!waiter.joined || waiter.released) return
-        waiter.released = true
-        const principalId = this.context.principalId
-        const remaining = (joinedDigestWaitersByPrincipal.get(principalId) ?? 1) - 1
-        if (remaining === 0) joinedDigestWaitersByPrincipal.delete(principalId)
-        else joinedDigestWaitersByPrincipal.set(principalId, remaining)
-    }
-
-    private reserveJoinedDigestWaiter() {
-        const principalId = this.context.principalId
-        const count = joinedDigestWaitersByPrincipal.get(principalId) ?? 0
-        if (count >= MAX_JOINED_DIGEST_WAITERS) throw digestWaiterLimitError()
-        joinedDigestWaitersByPrincipal.set(principalId, count + 1)
-    }
-
     private async validateDigestWaiter(attempt: DigestAttempt, waiter: DigestWaiter) {
-        if (!attempt.waiters.has(waiter) || waiter.signal?.aborted) throw abortedError()
+        const validateBeforeRead = waiter.validateBeforeRead
+        if (!attempt.waiters.has(waiter) || waiter.signal?.aborted || !validateBeforeRead) throw abortedError()
         const signal = waiter.signal
         let abortListener: (() => void) | undefined
         const aborted = new Promise<never>((_resolve, reject) => {
@@ -841,8 +821,8 @@ export class ContextResourceService {
         })
         try {
             const source = await (signal
-                ? Promise.race([waiter.validateBeforeRead(), aborted])
-                : waiter.validateBeforeRead())
+                ? Promise.race([validateBeforeRead(), aborted])
+                : validateBeforeRead())
             if (!attempt.waiters.has(waiter) || signal?.aborted) throw abortedError()
             return source
         } finally {
@@ -899,12 +879,16 @@ export class ContextResourceService {
             this.digestAttempts.set(key, attempt)
         }
         const joined = !created
-        if (joined) this.reserveJoinedDigestWaiter()
+        const logicalQueueToken = joined
+            ? this.readCoordinator.reserveLogicalQueueSlot({
+                principalId: this.context.principalId,
+                instanceId: this.context.instanceId,
+            })
+            : undefined
         const waiter: DigestWaiter = {
             signal,
             validateBeforeRead,
-            joined,
-            released: false,
+            logicalQueueToken,
         }
         attempt.waiters.add(waiter)
 
@@ -1053,7 +1037,10 @@ export class ContextResourceService {
         signal?: AbortSignal,
     ) {
         await this.permission('contextAssets', generation, signal)
-        if (moduleScope === 'installed') await this.permission('installedModulesRead', generation, signal)
+        if (moduleScope === 'installed') {
+            await this.permission('installedModulesRead', generation, signal)
+            await this.permission('contextAssets', generation, signal)
+        }
         const state = await this.state(generation, signal)
         const currentSelectors = this.resolveSelectors(state, selectorOptions)
         if (!this.sameSelectors(selectors, currentSelectors)) throw this.contextChanged()
@@ -1123,7 +1110,10 @@ export class ContextResourceService {
         const preflight = await this.state(generation, signal)
         this.current(preflight)
         await this.permission('contextAssets', generation, signal)
-        if (moduleScope === 'installed') await this.permission('installedModulesRead', generation, signal)
+        if (moduleScope === 'installed') {
+            await this.permission('installedModulesRead', generation, signal)
+            await this.permission('contextAssets', generation, signal)
+        }
         const state = await this.state(generation, signal)
         const selectors = this.resolveSelectors(state, options)
         const query = {
@@ -1184,7 +1174,10 @@ export class ContextResourceService {
         }
         try {
             await this.permission('contextAssets', generation, signal)
-            if (moduleScope === 'installed') await this.permission('installedModulesRead', generation, signal)
+            if (moduleScope === 'installed') {
+                await this.permission('installedModulesRead', generation, signal)
+                await this.permission('contextAssets', generation, signal)
+            }
             const fresh = await this.state(generation, signal)
             const refreshed = this.resolveSelectors(fresh, options)
             if (!this.sameSelectors(selectors, refreshed)
@@ -1301,7 +1294,7 @@ export class ContextResourceService {
                 revision = digest.revision
             }
             if (await this.fenced(this.handleFor(candidate.source, candidate.origin, revision), generation, signal) === assetId) {
-                await this.authorizeAssetOrigin(state, candidate, generation, signal)
+                await this.reauthorizeAssetOrigin(candidate, expectedSelectors, generation, signal)
                 this.assertActive(generation, signal)
                 lruSet(
                     this.issuedHandles,
@@ -1332,7 +1325,10 @@ export class ContextResourceService {
             }
             return
         }
-        if (!located.activeModule) await this.permission('installedModulesRead', generation, signal)
+        if (!located.activeModule) {
+            await this.permission('installedModulesRead', generation, signal)
+            await this.permission('contextAssets', generation, signal)
+        }
     }
 
     private async reauthorizeAssetOrigin(
@@ -1341,9 +1337,9 @@ export class ContextResourceService {
         generation: number,
         signal?: AbortSignal,
     ) {
-        await this.permission('contextAssets', generation, signal)
         let installedModulesAuthorized = false
         while (true) {
+            await this.permission('contextAssets', generation, signal)
             const state = await this.state(generation, signal)
             const current = this.findIssuedAsset(state, {
                 identity: located.source.identity,
