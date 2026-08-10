@@ -44,6 +44,10 @@ interface PrincipalReadState {
     retiring: boolean
 }
 
+type PhysicalReadOutcome =
+    | { status: 'fulfilled', value: unknown }
+    | { status: 'rejected', reason: unknown }
+
 const abortedError = () => new PluginApiError('ABORTED', 'Context asset read was cancelled')
 
 const queueLimitError = () => new PluginApiError(
@@ -150,6 +154,10 @@ export class ContextAssetReadCoordinator {
         }
 
         job.controller?.abort()
+        const reject = job.reject
+        job.resolve = undefined
+        job.reject = undefined
+        reject?.(abortedError())
     }
 
     private removeQueuedJob(state: PrincipalReadState, job: ReadJob): void {
@@ -208,16 +216,15 @@ export class ContextAssetReadCoordinator {
             physicalRead = Promise.reject(error)
         }
         physicalRead.then(
-            (value) => this.settleActiveJob(state, job, undefined, value),
-            (error: unknown) => this.settleActiveJob(state, job, error),
+            (value) => this.settleActiveJob(state, job, { status: 'fulfilled', value }),
+            (reason: unknown) => this.settleActiveJob(state, job, { status: 'rejected', reason }),
         )
     }
 
     private settleActiveJob(
         state: PrincipalReadState,
         job: ReadJob,
-        error: unknown,
-        value?: unknown,
+        outcome: PhysicalReadOutcome,
     ): void {
         state.active.delete(job)
         state.activeCount -= 1
@@ -229,10 +236,14 @@ export class ContextAssetReadCoordinator {
         const reject = job.reject
         const cancelled = job.cancelled
         this.releaseJobReferences(job)
-        if (cancelled) reject?.(abortedError())
-        else if (error !== undefined) reject?.(error)
-        else resolve?.(value)
+        if (cancelled) return this.finishPhysicalJob(state)
+        if (outcome.status === 'rejected') reject?.(outcome.reason)
+        else resolve?.(outcome.value)
 
+        this.finishPhysicalJob(state)
+    }
+
+    private finishPhysicalJob(state: PrincipalReadState): void {
         this.pump(state)
         this.removeIdleState(state)
     }

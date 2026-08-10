@@ -37,6 +37,17 @@ describe('context asset read coordinator', () => {
         expect(values).toEqual(Array.from({ length: 65 }, (_, index) => index))
     })
 
+    it('rejects an undefined physical rejection instead of resolving it', async () => {
+        const coordinator = new ContextAssetReadCoordinator()
+        const read = coordinator.schedule({
+            owner: owner(),
+            lane: 'thumbnail',
+            run: () => Promise.reject(undefined),
+        })
+
+        await expect(read).rejects.toBeUndefined()
+    })
+
     it('runs at most four physical reads and at most one explicit original per principal', async () => {
         const coordinator = new ContextAssetReadCoordinator()
         const release = deferred<void>()
@@ -263,16 +274,22 @@ describe('context asset read coordinator', () => {
         }
         const abortController = new AbortController()
         const aborted = schedule('active-aborted', abortController.signal)
+        let promptCancellation: unknown
+        const observedCancellation = aborted.catch((error: unknown) => {
+            promptCancellation = error
+            return 'cancelled'
+        })
         const active = ['active-1', 'active-2', 'active-3'].map((label) => schedule(label))
         const waiting = schedule('waiting')
 
         abortController.abort()
         expect(signals.get('active-aborted')?.aborted).toBe(true)
         await Promise.resolve()
+        expect(promptCancellation).toMatchObject({ code: 'ABORTED' })
         expect(starts).not.toContain('waiting')
 
         gates.get('active-aborted')!.resolve('ignored')
-        await expect(aborted).rejects.toMatchObject({ code: 'ABORTED' })
+        await expect(observedCancellation).resolves.toBe('cancelled')
         await vi.waitFor(() => expect(starts.at(-1)).toBe('waiting'))
 
         for (const label of ['active-1', 'active-2', 'active-3', 'waiting']) gates.get(label)!.resolve(label)
@@ -306,6 +323,11 @@ describe('context asset read coordinator', () => {
         const replacementOwner = owner('principal-a', 'instance-new')
         const otherOwner = owner('principal-b', 'instance-old')
         const oldActive = schedule('old-active', oldOwner)
+        let promptInstanceCancellation: unknown
+        const observedOldActive = oldActive.catch((error: unknown) => {
+            promptInstanceCancellation = error
+            return 'cancelled'
+        })
         const replacements = [
             schedule('replacement-0', replacementOwner),
             schedule('replacement-1', replacementOwner),
@@ -319,10 +341,12 @@ describe('context asset read coordinator', () => {
         expect(signals.get('old-active')?.aborted).toBe(true)
         expect(signals.get('replacement-0')?.aborted).toBe(false)
         expect(signals.get('other-principal')?.aborted).toBe(false)
+        await Promise.resolve()
+        expect(promptInstanceCancellation).toMatchObject({ code: 'ABORTED' })
         await expect(oldQueued).rejects.toMatchObject({ code: 'ABORTED' })
 
         gates.get('old-active')!.resolve('ignored')
-        await expect(oldActive).rejects.toMatchObject({ code: 'ABORTED' })
+        await expect(observedOldActive).resolves.toBe('cancelled')
         await vi.waitFor(() => expect(starts).toContain('replacement-queued'))
 
         for (const label of ['replacement-0', 'replacement-1', 'replacement-2', 'replacement-queued', 'other-principal']) {
