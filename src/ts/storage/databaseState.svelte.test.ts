@@ -2,6 +2,8 @@ import { flushSync } from 'svelte'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { DBState } from '../stores.svelte'
 import { getDatabase, onDatabaseUpdate, setDatabaseLite, type character, type Chat, type Database } from './database.svelte'
+import { createPluginDatabaseBoundary } from '../plugins/pluginDatabaseBoundary'
+import { RisuSaveDecoder, RisuSaveEncoder, type toSaveType } from './risuSave'
 
 vi.mock('../globalApi.svelte', () => ({
     downloadFile: vi.fn(),
@@ -23,6 +25,11 @@ class CustomValue {
 function database(values: Partial<Database> = {}): Database {
     return {
         characters: [],
+        botPresets: [],
+        modules: [],
+        loadouts: [],
+        plugins: [],
+        pluginCustomStorage: {},
         ...values,
     } as Database
 }
@@ -32,6 +39,96 @@ afterEach(() => {
 })
 
 describe('database proxy layering', () => {
+    it('does not reschedule a database save from its own committed snapshot', () => {
+        setDatabaseLite(database({
+            pluginCustomStorage: {
+                pendingSnapshot: 'bootstrap',
+                committedSnapshot: 'bootstrap',
+            },
+        }))
+        const durableCandidates: string[] = []
+        const dispose = $effect.root(() => {
+            $effect(() => {
+                const candidate = DBState.db.pluginCustomStorage.pendingSnapshot
+                durableCandidates.push(candidate)
+                DBState.db.pluginCustomStorage.committedSnapshot = candidate
+            })
+        })
+
+        try {
+            flushSync()
+            durableCandidates.length = 0
+
+            DBState.db.pluginCustomStorage.pendingSnapshot = 'one durable save'
+            flushSync()
+
+            expect(durableCandidates).toEqual(['one durable save'])
+            expect(DBState.db.pluginCustomStorage.committedSnapshot).toBe('one durable save')
+        } finally {
+            dispose()
+        }
+    })
+
+    it('preserves model settings across programmatic database replacement and restore', () => {
+        setDatabaseLite(database({
+            nanogptRequestModel: 'hf:moonshotai/Kimi-K2.5',
+            nanogptRequestModelName: 'Kimi K2.5',
+            nanogptProvider: 'deepinfra',
+        }))
+        const replacement = structuredClone(getDatabase({ snapshot: true }))
+        replacement.username = 'programmatic replacement'
+
+        setDatabaseLite(replacement)
+        const restored = structuredClone(getDatabase({ snapshot: true }))
+        restored.username = 'restored snapshot'
+        setDatabaseLite(restored)
+
+        expect({
+            model: DBState.db.nanogptRequestModel,
+            name: DBState.db.nanogptRequestModelName,
+            provider: DBState.db.nanogptProvider,
+        }).toEqual({
+            model: 'hf:moonshotai/Kimi-K2.5',
+            name: 'Kimi K2.5',
+            provider: 'deepinfra',
+        })
+    })
+
+    it('persists a V2 descriptor-backed write across save and reload', async () => {
+        setDatabaseLite(database({ pluginCustomStorage: { existing: 'kept' } }))
+        const encoder = new RisuSaveEncoder()
+        await encoder.init(getDatabase())
+        const tracker: toSaveType = {
+            character: [],
+            botPreset: false,
+            modules: false,
+            loadouts: false,
+            plugins: false,
+            pluginCustomStorage: false,
+        }
+        const unsubscribe = onDatabaseUpdate((event) => {
+            if (event.path[0] === 'pluginCustomStorage') tracker.pluginCustomStorage = true
+        })
+        const v2Database = createPluginDatabaseBoundary(getDatabase(), ['pluginCustomStorage'])
+
+        try {
+            Object.defineProperty(v2Database, 'pluginCustomStorage', {
+                configurable: true,
+                enumerable: true,
+                writable: true,
+                value: { existing: 'kept', legacyPlugin: { nested: 'descriptor value' } },
+            })
+            await encoder.set(getDatabase(), tracker)
+            const encoded = encoder.encode()
+            expect(encoded).not.toBeNull()
+
+            const reloaded = await new RisuSaveDecoder().decode(new Uint8Array(encoded!))
+            expect(reloaded.pluginCustomStorage.legacyPlugin.nested).toBe('descriptor value')
+        } finally {
+            unsubscribe()
+        }
+    })
+
     it('tracks nested mutations after receiving a plain object', () => {
         setDatabaseLite(database({ pluginCustomStorage: { plugin: { enabled: false } } }))
         const listener = vi.fn()
