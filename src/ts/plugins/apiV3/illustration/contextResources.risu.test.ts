@@ -11,12 +11,21 @@ import {
     type ContextModuleCollectionInput,
 } from './contextResources'
 import { CursorRegistry } from './cursorRegistry'
+import { ContextAssetReadCoordinator } from './contextAssetReadCoordinator'
 import { QueryCaptureCache } from './queryCaptureCache'
 
 const deferred = <T>() => {
     let resolve!: (value: T) => void
     const promise = new Promise<T>((resolvePromise) => { resolve = resolvePromise })
     return { promise, resolve }
+}
+
+const waitFor = async (predicate: () => boolean) => {
+    for (let attempt = 0; attempt < 100; attempt++) {
+        if (predicate()) return
+        await new Promise((resolve) => setTimeout(resolve, 0))
+    }
+    throw new Error('Timed out waiting for test condition')
 }
 
 const makeLore = (id: string, content: string, mode: 'normal' | 'folder' = 'normal') => ({
@@ -439,25 +448,15 @@ describe('Risu context resource adapter', () => {
             .resolves.toMatchObject({ storageKey: 'assets/module-installed.png' })
     })
 
-    it('bounds exact first-capture and final-probe work to selected modules and 2452 selected assets', async () => {
+    it('bounds real-size Host first-capture and final-probe work to selected modules and assets', async () => {
         const counters = {
             fullStateCalls: 0,
             moduleMaterializations: 0,
             moduleSlotVisits: 0,
             cachedModuleEmissions: 0,
             finalModuleEmissions: 0,
-            assetMaterializations: 0,
-            cachedAssetEmissions: 0,
-            finalAssetEmissions: 0,
-            targetedAssetProbes: 0,
-            finalProbePhysicalReads: 0,
-            unselectedStorageReads: 0,
-            maxPhysicalReads: 0,
-            unselectedSourceMaterializations: 0,
-            unselectedMetadataProjections: 0,
-            unselectedDigests: 0,
         }
-        const countedModule = (id: string, assetCount: number, unselected = false) => {
+        const countedModule = (id: string, assetCount: number) => {
             const module = makeModule(id, {
                 assets: Array.from({ length: assetCount }, (_, index) => [
                     `${id}-${index}`, `assets/${id}-${index}.png`, 'png',
@@ -468,7 +467,6 @@ describe('Risu context resource adapter', () => {
                 enumerable: true,
                 get() {
                     counters.moduleMaterializations += 1
-                    if (unselected) counters.unselectedSourceMaterializations += 1
                     return lorebook
                 },
             })
@@ -481,26 +479,15 @@ describe('Risu context resource adapter', () => {
             ccAssets: [],
         })
         const selected = countedModule('selected', 2_450)
-        const unrelated = countedModule('unrelated', 1_553, true)
+        const unrelated = countedModule('unrelated', 1_553)
         const deps = dependencies({
             getDatabase: () => ({ characters: [current], modules: [selected, unrelated] }),
             getCurrentCharacter: () => current,
             getCurrentChat: () => current.chats[0],
             getActiveModulesWithReasons: () => [],
             getAssetStorageRevision: (storageKey) => {
-                if (storageKey.includes('unrelated')) {
-                    counters.unselectedMetadataProjections += 1
-                } else if (storageKey.includes('selected')) {
-                    counters.moduleSlotVisits += 1
-                    counters.assetMaterializations += 1
-                } else {
-                    counters.assetMaterializations += 1
-                }
+                counters.moduleSlotVisits += 1
                 return `revision:${storageKey}:1`
-            },
-            readImage: async (storageKey) => {
-                if (storageKey.includes('unrelated')) counters.unselectedStorageReads += 1
-                return new Uint8Array([1])
             },
         })
         const adapter = createRisuContextResourceAdapter(deps)
@@ -509,78 +496,186 @@ describe('Risu context resource adapter', () => {
             counters.fullStateCalls += 1
             return originalGetState()
         }
-
-        const moduleInput: ContextModuleCollectionInput = {
-            scope: 'installed', characterId: 'char-1', conversationId: 'conversation-1',
-        }
-        const firstModules = await adapter.captureModuleSources!(moduleInput)
-        counters.cachedModuleEmissions = firstModules.modules.length
-        const finalModules = await adapter.captureModuleSources!(moduleInput)
-        counters.finalModuleEmissions = finalModules.modules.slice(0, 1).length
+        const moduleService = new ContextResourceService(
+            {
+                principalId: '11111111-1111-4111-8111-111111111111',
+                instanceId: 'real-size-module-workload',
+                displayName: 'Real-size module workload',
+                signal: new AbortController().signal,
+            },
+            adapter,
+            {
+                requirePermission: async () => undefined,
+                cursorRegistry: new CursorRegistry(),
+                queryCaptureCache: new QueryCaptureCache(),
+            },
+        )
+        const firstModules = await moduleService.listContextModules({
+            scope: 'installed', includeAssetCount: true, captureScope: 'query', limit: 100,
+        })
+        counters.cachedModuleEmissions = firstModules.items.length
+        const finalModules = await moduleService.listContextModules({
+            scope: 'installed', includeAssetCount: true, captureScope: 'query',
+            captureRevision: firstModules.captureRevision, limit: 1,
+        })
+        counters.finalModuleEmissions = finalModules.items.length
         const moduleWork = {
             materializations: counters.moduleMaterializations,
             slotVisits: counters.moduleSlotVisits,
         }
-        counters.moduleMaterializations = 0
-        counters.moduleSlotVisits = 0
-        counters.assetMaterializations = 0
-        counters.unselectedSourceMaterializations = 0
-        counters.unselectedMetadataProjections = 0
-
-        const assetInput: ContextAssetCollectionInput = {
-            characterIds: ['char-1'],
-            conversationId: 'conversation-1',
-            include: ['portrait', 'emotion', 'additional', 'module'],
-            moduleScope: 'installed',
-            moduleIds: ['selected'],
-            mediaTypes: [],
-        }
-        const firstAssets = await adapter.captureAssetSources!(assetInput)
-        counters.cachedAssetEmissions = firstAssets.assets.length
-        const readsBeforeProbe = counters.unselectedStorageReads
-        const finalAssets = await adapter.captureAssetSources!(assetInput)
-        counters.finalAssetEmissions = finalAssets.assets.slice(0, 1).length
-        counters.finalProbePhysicalReads = counters.unselectedStorageReads - readsBeforeProbe
-        const assetMaterializations = counters.assetMaterializations
-        const revalidate = adapter.revalidateAssetSource!.bind(adapter)
-        adapter.revalidateAssetSource = async (probe) => {
-            counters.targetedAssetProbes += 1
-            return revalidate(probe)
-        }
-        await adapter.revalidateAssetSource({ located: firstAssets.assets[0], input: assetInput })
+        moduleService.dispose()
 
         const M = 2
         const S = 4_003
-        const N = 2_452
         expect(counters.fullStateCalls).toBe(0)
         expect(moduleWork.materializations).toBeLessThanOrEqual(2 * M)
         expect(moduleWork.slotVisits).toBeLessThanOrEqual(2 * S)
         expect(counters.cachedModuleEmissions).toBe(M)
         expect(counters.finalModuleEmissions).toBeLessThanOrEqual(1)
-        expect(assetMaterializations).toBeLessThanOrEqual(2 * N)
-        expect(counters.cachedAssetEmissions).toBe(N)
-        expect(counters.finalAssetEmissions).toBeLessThanOrEqual(1)
-        expect(counters.targetedAssetProbes).toBeLessThanOrEqual(2 * N)
-        expect(counters.finalProbePhysicalReads).toBe(0)
-        expect(counters.unselectedStorageReads).toBe(0)
-        expect(counters.maxPhysicalReads).toBeLessThanOrEqual(4)
-        expect(counters.unselectedSourceMaterializations).toBe(0)
-        expect(counters.unselectedMetadataProjections).toBe(0)
-        expect(counters.unselectedDigests).toBe(0)
 
-        counters.assetMaterializations = 0
-        counters.unselectedSourceMaterializations = 0
-        counters.unselectedMetadataProjections = 0
-        const moduleOnlyInput = { ...assetInput, include: ['module' as const] }
-        const firstModuleAssets = await adapter.captureAssetSources!(moduleOnlyInput)
-        const finalModuleAssets = await adapter.captureAssetSources!(moduleOnlyInput)
-        expect(firstModuleAssets.assets).toHaveLength(2_450)
-        expect(finalModuleAssets.assets.slice(0, 1)).toHaveLength(1)
-        expect(counters.assetMaterializations).toBeLessThanOrEqual(2 * 2_450)
-        expect(counters.unselectedSourceMaterializations).toBe(0)
-        expect(counters.unselectedMetadataProjections).toBe(0)
-        expect(counters.unselectedStorageReads).toBe(0)
-    })
+        const runAssetQuery = async (
+            include: Array<'portrait' | 'emotion' | 'additional' | 'module'>,
+            N: number,
+            instanceId: string,
+        ) => {
+            const queryCounters = {
+                fullStateCalls: 0,
+                assetMaterializations: 0,
+                cachedAssetEmissions: 0,
+                finalAssetEmissions: 0,
+                targetedAssetProbes: 0,
+                physicalReads: 0,
+                digests: 0,
+                finalProbePhysicalReads: 0,
+                activeReads: 0,
+                maxPhysicalReads: 0,
+                unselectedSourceMaterializations: 0,
+                unselectedMetadataProjections: 0,
+                unselectedDigests: 0,
+                unselectedStorageReads: 0,
+            }
+            const queryCurrent = makeCharacter({
+                image: 'assets/card-portrait.png',
+                emotionImages: [['card-emotion', 'assets/card-emotion.png']],
+                additionalAssets: [],
+                ccAssets: [],
+            })
+            const queryCountedModule = (id: string, assetCount: number, unselected = false) => {
+                const module = makeModule(id, {
+                    assets: Array.from({ length: assetCount }, (_, index) => [
+                        `${id}-${index}`, `assets/${id}-${index}.png`, 'png',
+                    ]),
+                })
+                const lorebook = module.lorebook
+                Object.defineProperty(module, 'lorebook', {
+                    enumerable: true,
+                    get() {
+                        if (unselected) queryCounters.unselectedSourceMaterializations += 1
+                        return lorebook
+                    },
+                })
+                return module
+            }
+            const querySelected = queryCountedModule('selected', 2_450)
+            const queryUnrelated = queryCountedModule('unrelated', 1_553, true)
+            const queryAdapter = createRisuContextResourceAdapter(dependencies({
+                getDatabase: () => ({
+                    characters: [queryCurrent], modules: [querySelected, queryUnrelated],
+                }),
+                getCurrentCharacter: () => queryCurrent,
+                getCurrentChat: () => queryCurrent.chats[0],
+                getActiveModulesWithReasons: () => [],
+                getAssetStorageRevision: (storageKey) => {
+                    if (storageKey.includes('unrelated')) {
+                        queryCounters.unselectedMetadataProjections += 1
+                    }
+                    return `revision:${storageKey}:1`
+                },
+                readImage: async (storageKey) => {
+                    queryCounters.physicalReads += 1
+                    queryCounters.digests += 1
+                    queryCounters.activeReads += 1
+                    queryCounters.maxPhysicalReads = Math.max(
+                        queryCounters.maxPhysicalReads, queryCounters.activeReads,
+                    )
+                    if (storageKey.includes('unrelated')) {
+                        queryCounters.unselectedDigests += 1
+                        queryCounters.unselectedStorageReads += 1
+                    }
+                    await Promise.resolve()
+                    queryCounters.activeReads -= 1
+                    return new Uint8Array([1])
+                },
+            }))
+            const getState = queryAdapter.getState.bind(queryAdapter)
+            queryAdapter.getState = async () => {
+                queryCounters.fullStateCalls += 1
+                return getState()
+            }
+            const captureAssets = queryAdapter.captureAssetSources!.bind(queryAdapter)
+            let captureCalls = 0
+            queryAdapter.captureAssetSources = async (input) => {
+                const captured = await captureAssets(input)
+                captureCalls += 1
+                queryCounters.assetMaterializations += captured.assets.length
+                if (captureCalls === 1) queryCounters.cachedAssetEmissions = captured.assets.length
+                return captured
+            }
+            const revalidateAsset = queryAdapter.revalidateAssetSource!.bind(queryAdapter)
+            queryAdapter.revalidateAssetSource = async (probe) => {
+                queryCounters.targetedAssetProbes += 1
+                return revalidateAsset(probe)
+            }
+            const service = new ContextResourceService(
+                {
+                    principalId: '11111111-1111-4111-8111-111111111111',
+                    instanceId,
+                    displayName: 'Real-size asset workload',
+                    signal: new AbortController().signal,
+                },
+                queryAdapter,
+                {
+                    requirePermission: async () => undefined,
+                    cursorRegistry: new CursorRegistry(),
+                    queryCaptureCache: new QueryCaptureCache(),
+                    readCoordinator: new ContextAssetReadCoordinator(),
+                },
+            )
+            const first = await service.listContextAssets({
+                moduleScope: 'installed', moduleIds: ['selected'], include,
+                captureScope: 'query', limit: 100,
+            })
+            const readsAfterCapture = queryCounters.physicalReads
+            const digestsAfterCapture = queryCounters.digests
+            const final = await service.listContextAssets({
+                moduleScope: 'installed', moduleIds: ['selected'], include,
+                captureScope: 'query', captureRevision: first.captureRevision, limit: 1,
+            })
+            queryCounters.finalAssetEmissions = final.assets.length
+            queryCounters.finalProbePhysicalReads = queryCounters.physicalReads - readsAfterCapture
+
+            expect(queryCounters.fullStateCalls).toBe(0)
+            expect(captureCalls).toBe(2)
+            expect(queryCounters.assetMaterializations).toBe(2 * N)
+            expect(queryCounters.cachedAssetEmissions).toBe(N)
+            expect(queryCounters.finalAssetEmissions).toBeLessThanOrEqual(1)
+            expect(queryCounters.targetedAssetProbes).toBe(2 * N)
+            expect(readsAfterCapture).toBe(N)
+            expect(digestsAfterCapture).toBe(N)
+            expect(queryCounters.finalProbePhysicalReads).toBe(0)
+            expect(queryCounters.unselectedStorageReads).toBe(0)
+            expect(queryCounters.maxPhysicalReads).toBeLessThanOrEqual(4)
+            expect(queryCounters.unselectedSourceMaterializations).toBe(0)
+            expect(queryCounters.unselectedMetadataProjections).toBe(0)
+            expect(queryCounters.unselectedDigests).toBe(0)
+            service.dispose()
+        }
+
+        await runAssetQuery(
+            ['portrait', 'emotion', 'additional', 'module'], 2_452, 'real-size-card-assets',
+        )
+        await runAssetQuery(['module'], 2_450, 'real-size-module-assets')
+    }, 30_000)
 
     it('uses native captures for Host first pages and metadata-only final probes without full-state calls', async () => {
         let fullStateCalls = 0
@@ -644,6 +739,140 @@ describe('Risu context resource adapter', () => {
         expect(physicalReads).toBe(readsAfterCapture)
         expect(maxPhysicalReads).toBeLessThanOrEqual(4)
         expect(targetedAssetProbes).toBeLessThanOrEqual(2 * readsAfterCapture)
+        service.dispose()
+    })
+
+    it('binds an omitted-selector asset cursor to the context resolved on its first page', async () => {
+        const firstCharacter = makeCharacter()
+        const secondCharacter = makeCharacter({
+            chaId: 'char-2',
+            name: 'Bob',
+            image: 'assets/bob.png',
+            chats: [{ ...makeChat(), id: 'conversation-2' }],
+        })
+        let currentCharacter = firstCharacter
+        const adapter = createRisuContextResourceAdapter(dependencies({
+            getDatabase: () => ({ characters: [firstCharacter, secondCharacter], modules: [] }),
+            getCurrentCharacter: () => currentCharacter,
+            getCurrentChat: () => currentCharacter.chats[0],
+            getActiveModulesWithReasons: () => [],
+        }))
+        const service = new ContextResourceService(
+            {
+                principalId: '11111111-1111-4111-8111-111111111111',
+                instanceId: 'selector-bound-cursor-instance',
+                displayName: 'Selector-bound cursor',
+                signal: new AbortController().signal,
+            },
+            adapter,
+            {
+                requirePermission: async () => undefined,
+                cursorRegistry: new CursorRegistry(),
+                queryCaptureCache: new QueryCaptureCache(),
+            },
+        )
+        const first = await service.listContextAssets({
+            moduleScope: 'none', captureScope: 'query', limit: 1,
+        })
+        expect(first.nextCursor).toBeTypeOf('string')
+
+        currentCharacter = secondCharacter
+        await expect(service.listContextAssets({
+            moduleScope: 'none', captureScope: 'query', cursor: first.nextCursor, limit: 1,
+        })).rejects.toMatchObject({ code: 'INVALID_ARGUMENT', message: 'Invalid or expired cursor' })
+        service.dispose()
+    })
+
+    it.each([
+        ['append', (modules: Record<string, any>[]) => modules.push(makeModule('module-appended'))],
+        ['delete', (modules: Record<string, any>[]) => modules.splice(2, 1)],
+        ['reorder', (modules: Record<string, any>[]) => modules.splice(1, 2, modules[2], modules[1])],
+    ])('rejects an installed-module page when off-page membership changes by %s before publication', async (_change, mutate) => {
+        const character = makeCharacter()
+        const modules = [makeModule('module-first'), makeModule('module-second'), makeModule('module-third')]
+        const publicationGate = deferred<void>()
+        let publicationEntered = false
+        let permissionCalls = 0
+        const service = new ContextResourceService(
+            {
+                principalId: '11111111-1111-4111-8111-111111111111',
+                instanceId: `module-collection-fence-${_change}`,
+                displayName: 'Module collection fence',
+                signal: new AbortController().signal,
+            },
+            createRisuContextResourceAdapter(dependencies({
+                getDatabase: () => ({ characters: [character], modules }),
+                getCurrentCharacter: () => character,
+                getCurrentChat: () => character.chats[0],
+                getActiveModulesWithReasons: () => [],
+            })),
+            {
+                requirePermission: async () => {
+                    permissionCalls += 1
+                    if (permissionCalls === 2) {
+                        publicationEntered = true
+                        await publicationGate.promise
+                    }
+                },
+                cursorRegistry: new CursorRegistry(),
+                queryCaptureCache: new QueryCaptureCache(),
+            },
+        )
+        const listing = service.listContextModules({
+            scope: 'installed', captureScope: 'query', limit: 1,
+        })
+        await waitFor(() => publicationEntered)
+        mutate(modules)
+        publicationGate.resolve()
+
+        await expect(listing).rejects.toMatchObject({ code: 'CONFLICT' })
+        service.dispose()
+    })
+
+    it.each([
+        ['append', (character: Record<string, any>) => {
+            character.additionalAssets.push(['appended', 'assets/appended.png', 'png'])
+        }],
+        ['delete', (character: Record<string, any>) => character.ccAssets.splice(1, 1)],
+        ['reorder', (character: Record<string, any>) => character.ccAssets.reverse()],
+    ])('rejects an asset page when off-page membership changes by %s before publication', async (_change, mutate) => {
+        const character = makeCharacter()
+        const publicationGate = deferred<void>()
+        let publicationEntered = false
+        let permissionCalls = 0
+        const service = new ContextResourceService(
+            {
+                principalId: '11111111-1111-4111-8111-111111111111',
+                instanceId: `asset-collection-fence-${_change}`,
+                displayName: 'Asset collection fence',
+                signal: new AbortController().signal,
+            },
+            createRisuContextResourceAdapter(dependencies({
+                getDatabase: () => ({ characters: [character], modules: [] }),
+                getCurrentCharacter: () => character,
+                getCurrentChat: () => character.chats[0],
+                getActiveModulesWithReasons: () => [],
+            })),
+            {
+                requirePermission: async () => {
+                    permissionCalls += 1
+                    if (permissionCalls === 7) {
+                        publicationEntered = true
+                        await publicationGate.promise
+                    }
+                },
+                cursorRegistry: new CursorRegistry(),
+                queryCaptureCache: new QueryCaptureCache(),
+            },
+        )
+        const listing = service.listContextAssets({
+            moduleScope: 'none', captureScope: 'query', limit: 1,
+        })
+        await waitFor(() => publicationEntered)
+        mutate(character)
+        publicationGate.resolve()
+
+        await expect(listing).rejects.toMatchObject({ code: 'CONFLICT' })
         service.dispose()
     })
 })
