@@ -1028,21 +1028,24 @@ export class ContextResourceService {
             const cursorCountsAuthorized = requestedCounts && countsAuthorized
             const query = queryFor(cursorCountsAuthorized)
             const input = inputFor()
-            const cursorRecord = await this.cursorRegistry.read<CapturePageRecord>(
-                options.cursor,
-                this.context.principalId,
-                'context-modules',
-                this.context.instanceId,
-                query,
-            )
+            const [cursorRecord, capturePreparation] = await Promise.all([
+                this.cursorRegistry.read<CapturePageRecord>(
+                    options.cursor,
+                    this.context.principalId,
+                    'context-modules',
+                    this.context.instanceId,
+                    query,
+                ),
+                this.queryCaptureCache.prepareCreate(owner, query),
+            ])
             this.cursorRegistry.clear(options.cursor)
             if (options.captureRevision && options.captureRevision !== cursorRecord.captureRevision) {
                 throw new PluginApiError('INVALID_ARGUMENT', 'Context query capture does not match this request')
             }
             const captureRevision = cursorRecord.captureRevision
-            const sources = (await this.queryCaptureCache.read<ContextModuleSource>(
-                owner, query, cursorRecord.captureRevision,
-            )).items
+            const sources = this.queryCaptureCache.readPrepared<ContextModuleSource>(
+                capturePreparation, cursorRecord.captureRevision,
+            ).items
             const pageSources = sources.slice(cursorRecord.offset, cursorRecord.offset + limit)
             const nextOffset = cursorRecord.offset + pageSources.length
             const nextCursorPreparation = nextOffset < sources.length
@@ -1078,6 +1081,9 @@ export class ContextResourceService {
                 this.refreshCaptureGeneration()
                 this.assertActive(generation)
             }
+            this.queryCaptureCache.readPrepared<ContextModuleSource>(
+                capturePreparation, captureRevision,
+            )
             const items = pageSources.flatMap((source) => {
                 const projection = this.moduleCaptureProjections.get(source)
                 return projection ? [projection] : []

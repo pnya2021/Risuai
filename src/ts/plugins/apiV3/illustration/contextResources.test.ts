@@ -1793,6 +1793,90 @@ describe('captured context count, filter, and fence security', () => {
         })).rejects.toMatchObject({ code: 'INVALID_ARGUMENT' })
     })
 
+    it('rejects a later module page when its capture expires during publication permission', async () => {
+        const principalId = '11111111-1111-4111-8111-111111111111'
+        const state = makeState()
+        state.installedModules.push(moduleSource({
+            id: 'module-third', name: 'Third', assets: [], activatedBy: [],
+        }))
+        let now = 0
+        let publicationGateArmed = false
+        let publicationPermissionCalls = 0
+        const captures = new QueryCaptureCache({ now: () => now, ttlMs: 10 })
+        const cursors = new CursorRegistry({ now: () => now, ttlMs: 100 })
+        const h = harness({
+            state,
+            principalId,
+            queryCaptureCache: captures,
+            cursorRegistry: cursors,
+            onPermission() {
+                if (!publicationGateArmed) return
+                publicationPermissionCalls += 1
+                if (publicationPermissionCalls === 2) now = 11
+            },
+        })
+        const first = await h.service.listContextModules({
+            scope: 'installed', captureScope: 'query', limit: 1,
+        })
+        expect(first.nextCursor).toBeTypeOf('string')
+        publicationGateArmed = true
+
+        await expect(h.service.listContextModules({
+            scope: 'installed', captureScope: 'query', cursor: first.nextCursor, limit: 1,
+        })).rejects.toMatchObject({ code: 'CONFLICT', retryable: true })
+        expect(publicationPermissionCalls).toBe(2)
+        expect(cursors.activeCount(principalId)).toBe(0)
+    })
+
+    it('preserves an unrelated capture when a later module page loses LRU residency', async () => {
+        const principalId = '11111111-1111-4111-8111-111111111111'
+        const state = makeState()
+        state.installedModules.push(moduleSource({
+            id: 'module-third', name: 'Third', assets: [], activatedBy: [],
+        }))
+        const captures = new QueryCaptureCache({ maxCapturesPerPrincipal: 1 })
+        const cursors = new CursorRegistry()
+        const unrelatedOwner = {
+            principalId,
+            service: 'context-assets' as const,
+            instanceId: 'unrelated-resident-capture',
+        }
+        const unrelatedQuery = { kind: 'unrelated-resident-query' }
+        let unrelatedRevision: string | undefined
+        let publicationGateArmed = false
+        let publicationPermissionCalls = 0
+        const h = harness({
+            state,
+            principalId,
+            queryCaptureCache: captures,
+            cursorRegistry: cursors,
+            async onPermission() {
+                if (!publicationGateArmed) return
+                publicationPermissionCalls += 1
+                if (publicationPermissionCalls === 2) {
+                    unrelatedRevision = (await captures.create(
+                        unrelatedOwner, unrelatedQuery, [{ id: 'unrelated-resident-item' }],
+                    )).captureRevision
+                }
+            },
+        })
+        const first = await h.service.listContextModules({
+            scope: 'installed', captureScope: 'query', limit: 1,
+        })
+        expect(first.nextCursor).toBeTypeOf('string')
+        publicationGateArmed = true
+
+        await expect(h.service.listContextModules({
+            scope: 'installed', captureScope: 'query', cursor: first.nextCursor, limit: 1,
+        })).rejects.toMatchObject({ code: 'CONFLICT', retryable: true })
+        expect(publicationPermissionCalls).toBe(2)
+        expect(cursors.activeCount(principalId)).toBe(0)
+        expect(unrelatedRevision).toBeTypeOf('string')
+        await expect(captures.read(
+            unrelatedOwner, unrelatedQuery, unrelatedRevision!,
+        )).resolves.toMatchObject({ items: [{ id: 'unrelated-resident-item' }] })
+    })
+
     it('uses a cursorless final probe, performs no new asset reads, and fails closed on collection drift', async () => {
         const h = harness()
         const first = await h.service.listContextAssets({
