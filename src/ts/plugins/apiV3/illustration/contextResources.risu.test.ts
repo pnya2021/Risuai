@@ -453,9 +453,13 @@ describe('Risu context resource adapter', () => {
             fullStateCalls: 0,
             moduleMaterializations: 0,
             moduleSlotVisits: 0,
+            moduleRevisionProbes: 0,
+            moduleCollectionProbes: 0,
+            modulePhysicalReads: 0,
             cachedModuleEmissions: 0,
             finalModuleEmissions: 0,
         }
+        let moduleCaptureActive = false
         const countedModule = (id: string, assetCount: number) => {
             const module = makeModule(id, {
                 assets: Array.from({ length: assetCount }, (_, index) => [
@@ -486,11 +490,30 @@ describe('Risu context resource adapter', () => {
             getCurrentChat: () => current.chats[0],
             getActiveModulesWithReasons: () => [],
             getAssetStorageRevision: (storageKey) => {
-                counters.moduleSlotVisits += 1
+                if (moduleCaptureActive) counters.moduleSlotVisits += 1
+                else counters.moduleRevisionProbes += 1
                 return `revision:${storageKey}:1`
+            },
+            readImage: async () => {
+                counters.modulePhysicalReads += 1
+                return new Uint8Array([1])
             },
         })
         const adapter = createRisuContextResourceAdapter(deps)
+        const captureModules = adapter.captureModuleSources!.bind(adapter)
+        adapter.captureModuleSources = async (input) => {
+            moduleCaptureActive = true
+            try {
+                return await captureModules(input)
+            } finally {
+                moduleCaptureActive = false
+            }
+        }
+        const revalidateModuleCollection = adapter.revalidateModuleCollection!.bind(adapter)
+        adapter.revalidateModuleCollection = async (probe) => {
+            counters.moduleCollectionProbes += 1
+            return revalidateModuleCollection(probe)
+        }
         const originalGetState = adapter.getState
         adapter.getState = async () => {
             counters.fullStateCalls += 1
@@ -522,6 +545,9 @@ describe('Risu context resource adapter', () => {
         const moduleWork = {
             materializations: counters.moduleMaterializations,
             slotVisits: counters.moduleSlotVisits,
+            revisionProbes: counters.moduleRevisionProbes,
+            collectionProbes: counters.moduleCollectionProbes,
+            physicalReads: counters.modulePhysicalReads,
         }
         moduleService.dispose()
 
@@ -530,6 +556,10 @@ describe('Risu context resource adapter', () => {
         expect(counters.fullStateCalls).toBe(0)
         expect(moduleWork.materializations).toBeLessThanOrEqual(2 * M)
         expect(moduleWork.slotVisits).toBeLessThanOrEqual(2 * S)
+        expect(moduleWork.revisionProbes).toBeGreaterThan(0)
+        expect(moduleWork.revisionProbes).toBeLessThanOrEqual(2 * S)
+        expect(moduleWork.collectionProbes).toBe(2)
+        expect(moduleWork.physicalReads).toBe(0)
         expect(counters.cachedModuleEmissions).toBe(M)
         expect(counters.finalModuleEmissions).toBeLessThanOrEqual(1)
 
@@ -826,6 +856,61 @@ describe('Risu context resource adapter', () => {
         publicationGate.resolve()
 
         await expect(listing).rejects.toMatchObject({ code: 'CONFLICT' })
+        service.dispose()
+    })
+
+    it('rejects an installed-module count page when a nested asset revision changes before publication', async () => {
+        const principalId = '11111111-1111-4111-8111-111111111111'
+        const character = makeCharacter()
+        const modules = [makeModule('module-first'), makeModule('module-second')]
+        const cursorRegistry = new CursorRegistry()
+        const publicationGate = deferred<void>()
+        let publicationEntered = false
+        let permissionCalls = 0
+        const storageRevisions = new Map<string, number>()
+        let physicalReads = 0
+        const service = new ContextResourceService(
+            {
+                principalId,
+                instanceId: 'module-storage-revision-fence',
+                displayName: 'Module storage revision fence',
+                signal: new AbortController().signal,
+            },
+            createRisuContextResourceAdapter(dependencies({
+                getDatabase: () => ({ characters: [character], modules }),
+                getCurrentCharacter: () => character,
+                getCurrentChat: () => character.chats[0],
+                getActiveModulesWithReasons: () => [],
+                getAssetStorageRevision: (storageKey) =>
+                    `revision:${storageKey}:${storageRevisions.get(storageKey) ?? 1}`,
+                readImage: async () => {
+                    physicalReads += 1
+                    return new Uint8Array([1])
+                },
+            })),
+            {
+                requirePermission: async () => {
+                    permissionCalls += 1
+                    if (permissionCalls === 3) {
+                        publicationEntered = true
+                        await publicationGate.promise
+                    }
+                },
+                cursorRegistry,
+                queryCaptureCache: new QueryCaptureCache(),
+            },
+        )
+        const listing = service.listContextModules({
+            scope: 'installed', includeAssetCount: true, captureScope: 'query', limit: 1,
+        })
+        await waitFor(() => publicationEntered)
+        storageRevisions.set('assets/module-second.png', 2)
+        publicationGate.resolve()
+
+        await expect(listing).rejects.toMatchObject({ code: 'CONFLICT' })
+        expect(cursorRegistry.activeCount(principalId)).toBe(0)
+        expect(physicalReads).toBe(0)
+        expect(permissionCalls).toBe(4)
         service.dispose()
     })
 

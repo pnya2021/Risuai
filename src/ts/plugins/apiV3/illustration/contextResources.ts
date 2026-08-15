@@ -923,25 +923,6 @@ export class ContextResourceService {
         return { selectors, modules: modules.map((source) => this.copyModuleSource(source)) }
     }
 
-    private async revalidateCapturedModule(
-        source: ContextModuleSource,
-        input: ContextModuleCollectionInput,
-        generation: number,
-    ) {
-        if (this.adapter.revalidateModuleSource) {
-            return this.fenced(
-                this.adapter.revalidateModuleSource({ source, input }),
-                generation,
-                input.signal,
-            )
-        }
-        const current = await this.captureModuleCollection(input, generation)
-        const matched = current.modules.find((candidate) => candidate.id === source.id
-            && this.moduleSourceIdentity(candidate) === this.moduleSourceIdentity(source))
-        if (!matched) throw this.contextChanged()
-        return matched
-    }
-
     private async revalidateCapturedModuleCollection(
         sources: readonly ContextModuleSource[],
         selectors: ContextCollectionSelectors,
@@ -1093,7 +1074,6 @@ export class ContextResourceService {
             } else {
                 await this.permission('contextAssets', generation)
             }
-            await Promise.all(pageSources.map((source) => this.revalidateCapturedModule(source, input, generation)))
             await this.revalidateCapturedModuleCollection(sources, selectors, input, generation)
             if (!countsAuthorized) {
                 items = items.map(({ assetCount: _assetCount, assetCollectionRevision: _revision, ...legacy }) => legacy)
