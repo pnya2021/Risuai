@@ -1919,6 +1919,9 @@ export class ContextResourceService {
         )
         this.refreshCaptureGeneration()
         this.assertActive(generation, signal)
+        if (!stagedCapture) {
+            this.queryCaptureCache.readPrepared<ContextLocatedAssetSource>(capturePreparation, captureRevision)
+        }
         const nextCursorCommit = nextCursorValue && nextCursorPreparation
             ? this.cursorRegistry.prepareCommit(nextCursorPreparation, nextCursorValue)
             : undefined
@@ -1929,8 +1932,10 @@ export class ContextResourceService {
             ...(options.captureScope === 'query' ? { captureRevision } : {}),
         }
         assertContextSnapshotLimits(result)
-        if (stagedCapture) this.queryCaptureCache.commitPrepared(capturePreparation, sources)
-        this.queryCaptureCache.readPrepared<ContextLocatedAssetSource>(capturePreparation, captureRevision)
+        if (stagedCapture) {
+            this.queryCaptureCache.commitPrepared(capturePreparation, sources)
+            this.queryCaptureCache.readPrepared<ContextLocatedAssetSource>(capturePreparation, captureRevision)
+        }
         for (const [assetId, issued] of stagedHandles) {
             lruSet(this.issuedHandles, assetId, issued, MAX_ISSUED_HANDLES)
         }

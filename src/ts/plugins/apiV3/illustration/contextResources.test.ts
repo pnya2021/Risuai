@@ -1787,6 +1787,17 @@ describe('captured context count, filter, and fence security', () => {
         })).rejects.toMatchObject({ code: 'INVALID_ARGUMENT' })
     })
 
+    it('runs the full installed permission sequence for an explicit empty module filter', async () => {
+        const h = harness()
+        await expect(h.service.listContextAssets({
+            moduleScope: 'installed', moduleIds: [], include: ['module'], captureScope: 'query', limit: 100,
+        })).resolves.toMatchObject({ assets: [] })
+        expect(h.permissionCalls).toEqual([
+            'contextAssets', 'installedModulesRead', 'contextAssets',
+            'contextAssets', 'installedModulesRead', 'contextAssets',
+        ])
+    })
+
     it('keeps omitted and explicit-empty module filters in distinct captured cursor identities', async () => {
         const h = harness()
         const omitted = await h.service.listContextAssets({
@@ -2105,6 +2116,113 @@ describe('captured context count, filter, and fence security', () => {
             }
         },
     )
+
+    it('prioritizes an expired later asset capture over final cursor saturation without clearing unrelated state', async () => {
+        const principalId = '11111111-1111-4111-8111-111111111111'
+        const state = makeState()
+        state.installedModules.push(moduleSource({
+            id: 'module-third',
+            name: 'Third installed module',
+            assets: [asset('third-ref', 'module-ref', 'module')],
+            activatedBy: [],
+        }))
+        let now = 0
+        let publicationGateArmed = false
+        let publicationPermissionCalls = 0
+        const captures = new QueryCaptureCache({ now: () => now, ttlMs: 10 })
+        const cursors = new CursorRegistry({ now: () => now, ttlMs: 100, maxPerPrincipal: 1 })
+        const unrelatedOwner = {
+            principalId,
+            service: 'context-modules' as const,
+            instanceId: 'still-live-unrelated-capture',
+        }
+        const unrelatedQuery = { kind: 'still-live-unrelated-query' }
+        let unrelatedRevision: string | undefined
+        let unrelatedCursor: string | undefined
+        const h = harness({
+            state,
+            principalId,
+            queryCaptureCache: captures,
+            cursorRegistry: cursors,
+            async onPermission() {
+                if (!publicationGateArmed) return
+                publicationPermissionCalls += 1
+                if (publicationPermissionCalls !== 5) return
+                now = 11
+                unrelatedRevision = (await captures.create(
+                    unrelatedOwner, unrelatedQuery, [{ id: 'still-live-unrelated-item' }],
+                )).captureRevision
+                unrelatedCursor = await cursors.create(
+                    principalId, 'context-assets', unrelatedOwner.instanceId,
+                    unrelatedQuery, { offset: 1 },
+                )
+            },
+        })
+        const first = await h.service.listContextAssets({
+            moduleScope: 'installed', include: ['module'], captureScope: 'query', limit: 1,
+        })
+        const handlesBefore = (h.service as any).issuedHandles.size
+        publicationGateArmed = true
+
+        await expect(h.service.listContextAssets({
+            moduleScope: 'installed', include: ['module'], captureScope: 'query',
+            cursor: first.nextCursor, limit: 1,
+        })).rejects.toMatchObject({ code: 'CONFLICT', retryable: true })
+        expect(publicationPermissionCalls).toBe(9)
+        expect(cursors.activeCount(principalId)).toBe(1)
+        expect((h.service as any).issuedHandles.size).toBe(handlesBefore)
+        await expect(captures.read(unrelatedOwner, unrelatedQuery, unrelatedRevision!))
+            .resolves.toMatchObject({ items: [{ id: 'still-live-unrelated-item' }] })
+        await expect(cursors.read(
+            unrelatedCursor!, principalId, 'context-assets', unrelatedOwner.instanceId, unrelatedQuery,
+        )).resolves.toEqual({ offset: 1 })
+    })
+
+    it('prioritizes an evicted later asset capture over an oversized response without clearing unrelated state', async () => {
+        const principalId = '11111111-1111-4111-8111-111111111111'
+        const state = makeState()
+        state.installedModules[1].assets[0].name = 'x'.repeat(524_289)
+        let publicationGateArmed = false
+        let publicationPermissionCalls = 0
+        const captures = new QueryCaptureCache({ maxCapturesPerPrincipal: 1 })
+        const cursors = new CursorRegistry()
+        const unrelatedOwner = {
+            principalId,
+            service: 'context-modules' as const,
+            instanceId: 'oversized-unrelated-capture',
+        }
+        const unrelatedQuery = { kind: 'oversized-unrelated-query' }
+        let unrelatedRevision: string | undefined
+        const h = harness({
+            state,
+            principalId,
+            queryCaptureCache: captures,
+            cursorRegistry: cursors,
+            async onPermission() {
+                if (!publicationGateArmed) return
+                publicationPermissionCalls += 1
+                if (publicationPermissionCalls !== 5) return
+                unrelatedRevision = (await captures.create(
+                    unrelatedOwner, unrelatedQuery, [{ id: 'oversized-unrelated-item' }],
+                )).captureRevision
+            },
+        })
+        const first = await h.service.listContextAssets({
+            moduleScope: 'installed', include: ['module'], captureScope: 'query', limit: 1,
+        })
+        const handlesBefore = (h.service as any).issuedHandles.size
+        publicationGateArmed = true
+
+        await expect(h.service.listContextAssets({
+            moduleScope: 'installed', include: ['module'], captureScope: 'query',
+            cursor: first.nextCursor, limit: 1,
+        })).rejects.toMatchObject({ code: 'CONFLICT', retryable: true })
+        expect(publicationPermissionCalls).toBe(9)
+        expect(cursors.activeCount(principalId)).toBe(0)
+        expect((h.service as any).issuedHandles.size).toBe(handlesBefore)
+        await expect(captures.read(unrelatedOwner, unrelatedQuery, unrelatedRevision!))
+            .resolves.toMatchObject({ items: [{ id: 'oversized-unrelated-item' }] })
+    })
 
     it('rejects an asset page when permission generation resets after the final async collection probe', async () => {
         const cursors = new CursorRegistry()
