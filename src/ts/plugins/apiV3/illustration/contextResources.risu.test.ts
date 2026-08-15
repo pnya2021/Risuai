@@ -757,6 +757,202 @@ describe('Risu context resource adapter', () => {
         service.dispose()
     }, 30_000)
 
+    it('rejects a later module page when its raw source changes before the final synchronous probe', async () => {
+        const current = makeCharacter()
+        const modules = [makeModule('first'), makeModule('second'), makeModule('third')]
+        const cursorRegistry = new CursorRegistry()
+        const adapter = createRisuContextResourceAdapter(dependencies({
+            getDatabase: () => ({ characters: [current], modules }),
+            getCurrentCharacter: () => current,
+            getCurrentChat: () => current.chats[0],
+            getActiveModulesWithReasons: () => [],
+        }))
+        type CollectionProbe = Parameters<NonNullable<typeof adapter.revalidateModuleCollection>>[0]
+        type ModuleSource = Parameters<NonNullable<typeof adapter.revalidateModuleSource>>[0]['source']
+        const nativeAdapter = adapter as typeof adapter & {
+            revalidateModulePageSynchronously?: (
+                probe: CollectionProbe & { pageSources: readonly ModuleSource[] },
+            ) => void
+        }
+        const service = new ContextResourceService(
+            {
+                principalId: '11111111-1111-4111-8111-111111111111',
+                instanceId: 'module-page-source-linearization',
+                displayName: 'Module page source linearization',
+                signal: new AbortController().signal,
+            },
+            adapter,
+            {
+                requirePermission: async () => undefined,
+                cursorRegistry,
+                queryCaptureCache: new QueryCaptureCache(),
+            },
+        )
+        const first = await service.listContextModules({
+            scope: 'installed', captureScope: 'query', limit: 1,
+        })
+        expect(first.nextCursor).toBeTypeOf('string')
+
+        let mutated = false
+        const mutateBeforeFinalProbe = () => {
+            if (mutated) return
+            mutated = true
+            modules[1].name = 'changed before final synchronous probe'
+        }
+        if (nativeAdapter.revalidateModulePageSynchronously) {
+            const revalidate = nativeAdapter.revalidateModulePageSynchronously.bind(nativeAdapter)
+            nativeAdapter.revalidateModulePageSynchronously = (probe) => {
+                mutateBeforeFinalProbe()
+                revalidate(probe)
+            }
+        } else {
+            const revalidate = adapter.revalidateModuleSource!.bind(adapter)
+            adapter.revalidateModuleSource = async (probe) => {
+                const source = await revalidate(probe)
+                queueMicrotask(mutateBeforeFinalProbe)
+                return source
+            }
+        }
+
+        await expect(service.listContextModules({
+            scope: 'installed', captureScope: 'query', cursor: first.nextCursor, limit: 1,
+        })).rejects.toMatchObject({ code: 'CONFLICT', retryable: true })
+        expect(mutated).toBe(true)
+        expect(cursorRegistry.activeCount('11111111-1111-4111-8111-111111111111')).toBe(0)
+        service.dispose()
+    })
+
+    it('rejects a later module page when permission generation resets before the final synchronous probe', async () => {
+        const principalId = '11111111-1111-4111-8111-111111111111'
+        const current = makeCharacter()
+        const modules = [makeModule('first'), makeModule('second'), makeModule('third')]
+        let permissionGeneration = 0
+        const cursorRegistry = new CursorRegistry()
+        const adapter = createRisuContextResourceAdapter(dependencies({
+            getDatabase: () => ({ characters: [current], modules }),
+            getCurrentCharacter: () => current,
+            getCurrentChat: () => current.chats[0],
+            getActiveModulesWithReasons: () => [],
+        }))
+        type CollectionProbe = Parameters<NonNullable<typeof adapter.revalidateModuleCollection>>[0]
+        type ModuleSource = Parameters<NonNullable<typeof adapter.revalidateModuleSource>>[0]['source']
+        const nativeAdapter = adapter as typeof adapter & {
+            revalidateModulePageSynchronously?: (
+                probe: CollectionProbe & { pageSources: readonly ModuleSource[] },
+            ) => void
+        }
+        const service = new ContextResourceService(
+            {
+                principalId,
+                instanceId: 'module-page-generation-linearization',
+                displayName: 'Module page generation linearization',
+                signal: new AbortController().signal,
+            },
+            adapter,
+            {
+                requirePermission: async () => undefined,
+                getPermissionGeneration: () => permissionGeneration,
+                cursorRegistry,
+                queryCaptureCache: new QueryCaptureCache(),
+            },
+        )
+        const first = await service.listContextModules({
+            scope: 'installed', captureScope: 'query', limit: 1,
+        })
+        expect(first.nextCursor).toBeTypeOf('string')
+
+        let reset = false
+        const resetBeforeFinalProbe = () => {
+            if (reset) return
+            reset = true
+            permissionGeneration += 1
+        }
+        if (nativeAdapter.revalidateModulePageSynchronously) {
+            const revalidate = nativeAdapter.revalidateModulePageSynchronously.bind(nativeAdapter)
+            nativeAdapter.revalidateModulePageSynchronously = (probe) => {
+                resetBeforeFinalProbe()
+                revalidate(probe)
+            }
+        } else {
+            const revalidate = adapter.revalidateModuleSource!.bind(adapter)
+            adapter.revalidateModuleSource = async (probe) => {
+                const source = await revalidate(probe)
+                queueMicrotask(resetBeforeFinalProbe)
+                return source
+            }
+        }
+
+        await expect(service.listContextModules({
+            scope: 'installed', captureScope: 'query', cursor: first.nextCursor, limit: 1,
+        })).rejects.toMatchObject({ code: 'ABORTED', retryable: false })
+        expect(reset).toBe(true)
+        expect(cursorRegistry.activeCount(principalId)).toBe(0)
+        service.dispose()
+    })
+
+    it('commits a later module cursor before microtasks queued by the final synchronous probe', async () => {
+        const principalId = '11111111-1111-4111-8111-111111111111'
+        const current = makeCharacter()
+        const modules = [makeModule('first'), makeModule('second'), makeModule('third')]
+        const cursorRegistry = new CursorRegistry()
+        const adapter = createRisuContextResourceAdapter(dependencies({
+            getDatabase: () => ({ characters: [current], modules }),
+            getCurrentCharacter: () => current,
+            getCurrentChat: () => current.chats[0],
+            getActiveModulesWithReasons: () => [],
+        }))
+        type CollectionProbe = Parameters<NonNullable<typeof adapter.revalidateModuleCollection>>[0]
+        type ModuleSource = Parameters<NonNullable<typeof adapter.revalidateModuleSource>>[0]['source']
+        const nativeAdapter = adapter as typeof adapter & {
+            revalidateModulePageSynchronously?: (
+                probe: CollectionProbe & { pageSources: readonly ModuleSource[] },
+            ) => void
+        }
+        const service = new ContextResourceService(
+            {
+                principalId,
+                instanceId: 'module-page-hook-commit-order',
+                displayName: 'Module page hook commit order',
+                signal: new AbortController().signal,
+            },
+            adapter,
+            {
+                requirePermission: async () => undefined,
+                cursorRegistry,
+                queryCaptureCache: new QueryCaptureCache(),
+            },
+        )
+        const first = await service.listContextModules({
+            scope: 'installed', captureScope: 'query', limit: 1,
+        })
+        expect(first.nextCursor).toBeTypeOf('string')
+        expect(nativeAdapter.revalidateModulePageSynchronously).toBeTypeOf('function')
+        if (!nativeAdapter.revalidateModulePageSynchronously) return
+
+        let queuedMutationRan = false
+        let mutationObservedAtCursorCommit: boolean | undefined
+        const revalidate = nativeAdapter.revalidateModulePageSynchronously.bind(nativeAdapter)
+        nativeAdapter.revalidateModulePageSynchronously = (probe) => {
+            revalidate(probe)
+            queueMicrotask(() => { queuedMutationRan = true })
+        }
+        const commitPrepared = cursorRegistry.commitPrepared.bind(cursorRegistry)
+        vi.spyOn(cursorRegistry, 'commitPrepared').mockImplementation((preparation, value, commit) => {
+            mutationObservedAtCursorCommit = queuedMutationRan
+            return commitPrepared(preparation, value, commit)
+        })
+
+        const second = await service.listContextModules({
+            scope: 'installed', captureScope: 'query', cursor: first.nextCursor, limit: 1,
+        })
+
+        expect(second.items.map((item) => item.id)).toEqual(['second'])
+        expect(second.nextCursor).toBeTypeOf('string')
+        expect(mutationObservedAtCursorCommit).toBe(false)
+        expect(queuedMutationRan).toBe(true)
+        service.dispose()
+    })
+
     it('uses native captures for Host first pages and metadata-only final probes without full-state calls', async () => {
         let fullStateCalls = 0
         let physicalReads = 0

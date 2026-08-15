@@ -1845,6 +1845,61 @@ describe('captured context count, filter, and fence security', () => {
         })).resolves.toMatchObject({ items: [{ id: 'module-second-active' }] })
     })
 
+    it.each(['expired', 'evicted', 'wrong-owner'] as const)(
+        'rejects an %s module capture revision instead of returning an empty successful final probe',
+        async (scenario) => {
+            let now = 0
+            const state = makeState()
+            const captures = new QueryCaptureCache({
+                maxCapturesPerPrincipal: scenario === 'evicted' ? 1 : 64,
+                ttlMs: 10,
+                now: () => now,
+            })
+            const first = harness({
+                state,
+                principalId: '11111111-1111-4111-8111-111111111111',
+                instanceId: 'final-probe-owner',
+                queryCaptureCache: captures,
+            })
+            const expected = await first.service.listContextModules({
+                scope: 'active', captureScope: 'query', limit: 1,
+            })
+
+            let probe = first
+            if (scenario === 'expired') {
+                now = 11
+            } else if (scenario === 'evicted') {
+                await first.service.listContextModules({
+                    scope: 'installed', captureScope: 'query', limit: 100,
+                })
+            } else {
+                probe = harness({
+                    state,
+                    principalId: '22222222-2222-4222-8222-222222222222',
+                    instanceId: 'wrong-final-probe-owner',
+                    queryCaptureCache: captures,
+                })
+            }
+
+            await expect(probe.service.listContextModules({
+                scope: 'active', captureScope: 'query', captureRevision: expected.captureRevision, limit: 1,
+            })).rejects.toMatchObject({ code: 'CONFLICT', retryable: true })
+        },
+    )
+
+    it('returns the retained nonempty page for a valid matching module final probe', async () => {
+        const h = harness()
+        const expected = await h.service.listContextModules({
+            scope: 'active', captureScope: 'query', limit: 1,
+        })
+        await expect(h.service.listContextModules({
+            scope: 'active', captureScope: 'query', captureRevision: expected.captureRevision, limit: 1,
+        })).resolves.toMatchObject({
+            captureRevision: expected.captureRevision,
+            items: [{ id: 'module-active' }],
+        })
+    })
+
     it('keeps an expected-revision asset probe ephemeral and preserves unrelated asset captures', async () => {
         const captures = new QueryCaptureCache()
         const cursors = new CursorRegistry()
@@ -1878,6 +1933,177 @@ describe('captured context count, filter, and fence security', () => {
             moduleScope: 'none', include: ['portrait', 'emotion', 'additional'],
             captureScope: 'query', cursor: retained.nextCursor, limit: 1,
         })).resolves.toMatchObject({ assets: [{ role: 'emotion' }] })
+    })
+
+    it('publishes no module cache or cursor when the aggregate first-page result exceeds its limit', async () => {
+        const principalId = '11111111-1111-4111-8111-111111111111'
+        const state = makeState()
+        state.activeModules = [
+            moduleSource({ id: 'active-first', name: 'Active first', assets: [] }),
+            moduleSource({ id: 'active-second', name: 'Active second', assets: [] }),
+        ]
+        const largeDescription = 'x'.repeat(500_000)
+        state.installedModules = Array.from({ length: 6 }, (_, index) => moduleSource({
+            id: `large-${index}`,
+            name: `Large ${index}`,
+            description: largeDescription,
+            assets: [],
+            activatedBy: [],
+        }))
+        const captures = new QueryCaptureCache({ maxCapturesPerPrincipal: 1 })
+        const cursors = new CursorRegistry({ maxPerPrincipal: 4 })
+        const h = harness({ state, principalId, queryCaptureCache: captures, cursorRegistry: cursors })
+        const retained = await h.service.listContextModules({
+            scope: 'active', captureScope: 'query', limit: 1,
+        })
+        expect(retained.nextCursor).toBeTypeOf('string')
+
+        await expect(h.service.listContextModules({
+            scope: 'installed', captureScope: 'query', limit: 5,
+        })).rejects.toMatchObject({ code: 'RESOURCE_LIMIT' })
+
+        expect(cursors.activeCount(principalId)).toBe(1)
+        await expect(h.service.listContextModules({
+            scope: 'active', captureScope: 'query', cursor: retained.nextCursor, limit: 1,
+        })).resolves.toMatchObject({ items: [{ id: 'active-second' }] })
+    })
+
+    it('preserves unrelated module state when first-page cursor capacity rejects publication', async () => {
+        const principalId = '11111111-1111-4111-8111-111111111111'
+        const state = makeState()
+        state.activeModules = [
+            moduleSource({ id: 'active-first', name: 'Active first', assets: [] }),
+            moduleSource({ id: 'active-second', name: 'Active second', assets: [] }),
+        ]
+        const captures = new QueryCaptureCache({ maxCapturesPerPrincipal: 1 })
+        const cursors = new CursorRegistry({ maxPerPrincipal: 1 })
+        const h = harness({ state, principalId, queryCaptureCache: captures, cursorRegistry: cursors })
+        const retained = await h.service.listContextModules({
+            scope: 'active', captureScope: 'query', limit: 1,
+        })
+        expect(retained.nextCursor).toBeTypeOf('string')
+
+        await expect(h.service.listContextModules({
+            scope: 'installed', captureScope: 'query', limit: 1,
+        })).rejects.toMatchObject({ code: 'RESOURCE_LIMIT', retryable: true })
+
+        expect(cursors.activeCount(principalId)).toBe(1)
+        await expect(h.service.listContextModules({
+            scope: 'active', captureScope: 'query', cursor: retained.nextCursor, limit: 1,
+        })).resolves.toMatchObject({ items: [{ id: 'active-second' }] })
+    })
+
+    it('preserves unrelated module state when cursor lifecycle invalidates first-page publication', async () => {
+        const principalId = '11111111-1111-4111-8111-111111111111'
+        const instanceId = 'transaction-lifecycle-instance'
+        const state = makeState()
+        const captures = new QueryCaptureCache({ maxCapturesPerPrincipal: 1 })
+        const cursors = new CursorRegistry({ maxPerPrincipal: 4 })
+        const retainedOwner = {
+            principalId,
+            service: 'context-modules' as const,
+            instanceId: 'retained-instance',
+        }
+        const retainedQuery = { kind: 'retained-module-query' }
+        const retainedCapture = await captures.create(
+            retainedOwner, retainedQuery, [{ id: 'retained-module' }],
+        )
+        const retainedCursor = await cursors.create(
+            principalId, 'context-modules', retainedOwner.instanceId,
+            retainedQuery, { offset: 1 },
+        )
+        const h = harness({
+            state,
+            principalId,
+            instanceId,
+            queryCaptureCache: captures,
+            cursorRegistry: cursors,
+            adapterOverrides: {
+                captureModuleSourcesSynchronously(input) {
+                    cursors.clearInstance(principalId, instanceId)
+                    return {
+                        selectors: { characterId: 'char-1', conversationId: 'conversation-1' },
+                        modules: structuredClone(
+                            input.scope === 'installed' ? state.installedModules : state.activeModules,
+                        ),
+                    }
+                },
+            },
+        })
+
+        await expect(h.service.listContextModules({
+            scope: 'installed', captureScope: 'query', limit: 1,
+        })).rejects.toMatchObject({ code: 'ABORTED' })
+
+        await expect(captures.read(
+            retainedOwner, retainedQuery, retainedCapture.captureRevision,
+        )).resolves.toMatchObject({ items: [{ id: 'retained-module' }] })
+        await expect(cursors.read(
+            retainedCursor,
+            principalId,
+            'context-modules',
+            retainedOwner.instanceId,
+            retainedQuery,
+        )).resolves.toEqual({ offset: 1 })
+    })
+
+    it('rejects module publication when permission generation resets after authorize resolves', async () => {
+        const principalId = '11111111-1111-4111-8111-111111111111'
+        const instanceId = 'post-authorize-generation-instance'
+        const state = makeState()
+        const captures = new QueryCaptureCache({ maxCapturesPerPrincipal: 1 })
+        const cursors = new CursorRegistry({ maxPerPrincipal: 4 })
+        const retainedOwner = {
+            principalId,
+            service: 'context-modules' as const,
+            instanceId: 'retained-generation-instance',
+        }
+        const retainedQuery = { kind: 'retained-generation-query' }
+        const retainedCapture = await captures.create(
+            retainedOwner, retainedQuery, [{ id: 'retained-module' }],
+        )
+        const retainedCursor = await cursors.create(
+            principalId, 'context-modules', retainedOwner.instanceId,
+            retainedQuery, { offset: 1 },
+        )
+        let permissionGeneration = 0
+        let generationReads = 0
+        const h = harness({
+            state,
+            principalId,
+            instanceId,
+            queryCaptureCache: captures,
+            cursorRegistry: cursors,
+            getPermissionGeneration() {
+                generationReads += 1
+                const observed = permissionGeneration
+                if (generationReads === 6) {
+                    queueMicrotask(() => { permissionGeneration += 1 })
+                }
+                return observed
+            },
+        })
+
+        const outcome = await h.service.listContextModules({
+            scope: 'installed', captureScope: 'query', limit: 1,
+        }).then(
+            () => ({ code: 'RESOLVED' }),
+            (error: PluginApiError) => ({ code: error.code, retryable: error.retryable }),
+        )
+
+        expect(permissionGeneration).toBe(1)
+        expect(outcome).toEqual({ code: 'ABORTED', retryable: false })
+        expect(cursors.activeCount(principalId)).toBe(1)
+        await expect(captures.read(
+            retainedOwner, retainedQuery, retainedCapture.captureRevision,
+        )).resolves.toMatchObject({ items: [{ id: 'retained-module' }] })
+        await expect(cursors.read(
+            retainedCursor,
+            principalId,
+            'context-modules',
+            retainedOwner.instanceId,
+            retainedQuery,
+        )).resolves.toEqual({ offset: 1 })
     })
 
     it('clears instance captures and cursors on permission-generation change and dispose', async () => {

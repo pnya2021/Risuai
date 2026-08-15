@@ -14,6 +14,7 @@ import type {
     ContextModuleSource,
     ContextModuleCollectionInput,
     ContextModuleCollectionProbe,
+    ContextModulePageProbe,
     ContextModuleSourceProbe,
     ContextResourceAdapter,
 } from './contextResources'
@@ -548,6 +549,57 @@ export function createRisuContextResourceAdapter(
         return { selectors, modules }
     }
 
+    const revalidateModuleMembership = (probe: ContextModuleCollectionProbe) => {
+        assertNotAborted(probe.input.signal)
+        const selectors = selectorsFor(
+            probe.input.characterId,
+            probe.input.conversationId,
+            probe.input.scope === 'installed',
+        )
+        if (!sameSelectors(selectors, probe.selectors)) throw changed()
+        const records = currentModuleRecords(probe.input.scope).filter(({ module }) =>
+            nonEmptyString(module?.id) && nonEmptyString(module?.name))
+        if (records.length !== probe.sources.length) throw changed()
+        for (let index = 0; index < records.length; index++) {
+            assertNotAborted(probe.input.signal)
+            const source = probe.sources[index]
+            const record = records[index]
+            const locator = moduleLocators.get(source)
+            if (!locator
+                || locator.scope !== probe.input.scope
+                || locator.ownerId !== source.id
+                || locator.ownerId !== record.module.id
+                || locator.rawSlotIndex !== record.rawSlotIndex) throw changed()
+        }
+        assertNotAborted(probe.input.signal)
+        return records
+    }
+
+    const revalidateModulePage = (probe: ContextModulePageProbe) => {
+        const records = revalidateModuleMembership(probe)
+        const capturedSources = new Set(probe.sources)
+        const recordsByRawSlot = new Map(records.map((record) => [record.rawSlotIndex, record]))
+        for (const source of probe.pageSources) {
+            assertNotAborted(probe.input.signal)
+            const locator = moduleLocators.get(source)
+            const record = locator ? recordsByRawSlot.get(locator.rawSlotIndex) : undefined
+            if (!locator
+                || !capturedSources.has(source)
+                || locator.scope !== probe.input.scope
+                || locator.ownerId !== source.id
+                || record?.module.id !== source.id) throw changed()
+            revalidateModuleRecord(
+                source,
+                locator,
+                record.module,
+                record.activatedBy,
+                moduleAssetMetadataSources.has(source),
+                probe.input.signal,
+            )
+        }
+        assertNotAborted(probe.input.signal)
+    }
+
     return {
         async resolveCollectionSelectors(input) {
             assertNotAborted(input.signal)
@@ -649,27 +701,10 @@ export function createRisuContextResourceAdapter(
             return probe.source
         },
         async revalidateModuleCollection(probe: ContextModuleCollectionProbe) {
-            assertNotAborted(probe.input.signal)
-            const selectors = selectorsFor(
-                probe.input.characterId,
-                probe.input.conversationId,
-                probe.input.scope === 'installed',
-            )
-            if (!sameSelectors(selectors, probe.selectors)) throw changed()
-            const records = currentModuleRecords(probe.input.scope).filter(({ module }) =>
-                nonEmptyString(module?.id) && nonEmptyString(module?.name))
-            if (records.length !== probe.sources.length) throw changed()
-            for (let index = 0; index < records.length; index++) {
-                assertNotAborted(probe.input.signal)
-                const source = probe.sources[index]
-                const record = records[index]
-                const locator = moduleLocators.get(source)
-                if (!locator
-                    || locator.scope !== probe.input.scope
-                    || locator.ownerId !== source.id
-                    || locator.rawSlotIndex !== record.rawSlotIndex) throw changed()
-            }
-            assertNotAborted(probe.input.signal)
+            revalidateModuleMembership(probe)
+        },
+        revalidateModulePageSynchronously(probe: ContextModulePageProbe) {
+            revalidateModulePage(probe)
         },
         async captureAssetSources(input: ContextAssetCollectionInput) {
             assertNotAborted(input.signal)

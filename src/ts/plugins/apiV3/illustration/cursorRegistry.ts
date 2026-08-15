@@ -18,6 +18,13 @@ export interface CursorPreparation {
     readonly lifecycle: readonly (readonly [string, number])[]
 }
 
+export interface CursorCommitPreparation<T> {
+    readonly preparation: CursorPreparation
+    readonly cursor: string
+    readonly value: T
+    readonly expiresAt: number
+}
+
 export class CursorRegistry {
     private records = new Map<string, CursorRecord>()
     private ttlMs: number
@@ -57,7 +64,7 @@ export class CursorRegistry {
         return { principalId, service, instanceId, queryDigest, lifecycle }
     }
 
-    commitPrepared<T>(preparation: CursorPreparation, value: T) {
+    prepareCommit<T>(preparation: CursorPreparation, value: T): CursorCommitPreparation<T> {
         if (!this.isLifecycleCurrent(preparation.lifecycle)) {
             throw new PluginApiError('ABORTED', 'Plugin cursor owner is no longer active')
         }
@@ -71,15 +78,43 @@ export class CursorRegistry {
         if (!this.isLifecycleCurrent(preparation.lifecycle)) {
             throw new PluginApiError('ABORTED', 'Plugin cursor owner is no longer active')
         }
-        this.records.set(cursor, {
+        const expiresAt = this.now() + this.ttlMs
+        if (!this.isLifecycleCurrent(preparation.lifecycle)) {
+            throw new PluginApiError('ABORTED', 'Plugin cursor owner is no longer active')
+        }
+        return Object.freeze({
+            preparation,
+            cursor,
+            value,
+            expiresAt,
+        })
+    }
+
+    commitPrepared<T>(
+        preparation: CursorPreparation,
+        value: T,
+        commit = this.prepareCommit(preparation, value),
+    ) {
+        if (commit.preparation !== preparation || commit.value !== value) {
+            throw new PluginApiError('INVALID_ARGUMENT', 'Cursor commit does not match its preparation')
+        }
+        if (!this.isLifecycleCurrent(preparation.lifecycle)) {
+            throw new PluginApiError('ABORTED', 'Plugin cursor owner is no longer active')
+        }
+        if (this.records.has(commit.cursor)
+            || [...this.records.values()].filter((record) =>
+                record.principalId === preparation.principalId).length >= this.maxPerPrincipal) {
+            throw new PluginApiError('RESOURCE_LIMIT', 'Too many active cursors', { retryable: true })
+        }
+        this.records.set(commit.cursor, {
             principalId: preparation.principalId,
             service: preparation.service,
             instanceId: preparation.instanceId,
             queryDigest: preparation.queryDigest,
             value,
-            expiresAt: this.now() + this.ttlMs,
+            expiresAt: commit.expiresAt,
         })
-        return cursor
+        return commit.cursor
     }
 
     async read<T>(cursor: string, principalId: string, service: string, instanceId: string, query: unknown): Promise<T> {
