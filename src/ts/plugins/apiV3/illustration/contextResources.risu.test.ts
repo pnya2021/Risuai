@@ -437,6 +437,7 @@ describe('Risu context resource adapter', () => {
             include: ['portrait', 'emotion', 'additional', 'module'],
             moduleScope: 'installed',
             moduleIds: ['module-installed'],
+            moduleIdsSpecified: true,
             mediaTypes: [],
         }
         const assets = await adapter.captureAssetSources!(assetInput)
@@ -446,6 +447,23 @@ describe('Risu context resource adapter', () => {
         expect(assets.assets.some(({ origin }) => origin.kind === 'character')).toBe(true)
         await expect(adapter.revalidateAssetSource!({ located: assets.assets.at(-1)!, input: assetInput }))
             .resolves.toMatchObject({ storageKey: 'assets/module-installed.png' })
+    })
+
+    it('treats an explicit empty installed-module filter as no module source while an omitted filter remains inclusive', async () => {
+        const adapter = createRisuContextResourceAdapter(dependencies())
+        const base: Omit<ContextAssetCollectionInput, 'moduleIds'> = {
+            characterIds: ['char-1'],
+            conversationId: 'conversation-1',
+            include: ['module'],
+            moduleScope: 'installed',
+            mediaTypes: [],
+        }
+        const omitted = await adapter.captureAssetSources!({ ...base, moduleIds: [] })
+        const explicitEmpty = await adapter.captureAssetSources!({
+            ...base, moduleIds: [], moduleIdsSpecified: true,
+        })
+        expect(omitted.assets.filter(({ origin }) => origin.kind === 'module')).toHaveLength(3)
+        expect(explicitEmpty.assets.filter(({ origin }) => origin.kind === 'module')).toHaveLength(0)
     })
 
     it('bounds real-size Host first-capture and final-probe work to selected modules and assets', async () => {

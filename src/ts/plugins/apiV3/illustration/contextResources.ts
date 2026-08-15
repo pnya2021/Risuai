@@ -96,6 +96,8 @@ export interface ContextAssetCollectionInput {
     include: readonly ContextAssetRole[]
     moduleScope: 'active' | 'installed' | 'none'
     moduleIds: readonly string[]
+    /** Internal discriminator: omitted public moduleIds means all module sources. */
+    moduleIdsSpecified?: boolean
     mediaTypes: readonly string[]
     signal?: AbortSignal
 }
@@ -1626,16 +1628,11 @@ export class ContextResourceService {
     }
 
     private normalizeModuleIds(value: string[] | undefined) {
-        if (value === undefined) return []
-        if (!Array.isArray(value) || value.length > MAX_MODULE_IDS_PER_ASSET_LIST) {
+        if (value === undefined) return { moduleIds: [], specified: false }
+        if (!Array.isArray(value)) {
             throw new PluginApiError(
-                value.length > MAX_MODULE_IDS_PER_ASSET_LIST ? 'RESOURCE_LIMIT' : 'INVALID_ARGUMENT',
-                value.length > MAX_MODULE_IDS_PER_ASSET_LIST
-                    ? 'Module ID filter exceeds the advertised maximum'
-                    : 'Invalid module ID filter',
-                value.length > MAX_MODULE_IDS_PER_ASSET_LIST
-                    ? { details: { maximum: MAX_MODULE_IDS_PER_ASSET_LIST } }
-                    : {},
+                'INVALID_ARGUMENT',
+                'Invalid module ID filter',
             )
         }
         const normalized = value.map((moduleId) => {
@@ -1644,7 +1641,15 @@ export class ContextResourceService {
             }
             return moduleId.trim()
         })
-        return [...new Set(normalized)].sort()
+        const moduleIds = [...new Set(normalized)].sort()
+        if (moduleIds.length > MAX_MODULE_IDS_PER_ASSET_LIST) {
+            throw new PluginApiError(
+                'RESOURCE_LIMIT',
+                'Module ID filter exceeds the advertised maximum',
+                { details: { maximum: MAX_MODULE_IDS_PER_ASSET_LIST } },
+            )
+        }
+        return { moduleIds, specified: true }
     }
 
     private async captureAssetCollection(
@@ -1663,7 +1668,7 @@ export class ContextResourceService {
         const modules = input.moduleScope === 'installed'
             ? state.installedModules
             : input.moduleScope === 'active' ? state.activeModules : []
-        const filteredModules = input.moduleIds.length > 0
+        const filteredModules = input.moduleIdsSpecified
             ? modules.filter((module) => input.moduleIds.includes(module.id))
             : modules
         const assets = [
@@ -1732,13 +1737,14 @@ export class ContextResourceService {
         include: ContextAssetRole[],
         mediaTypes: string[] | undefined,
         moduleIds: string[],
+        moduleIdsSpecified: boolean,
         limit: number,
     ) {
         const signal = options.signal
         this.refreshCaptureGeneration()
         const generation = this.generation
         this.assertActive(generation, signal)
-        if (moduleIds.length > 0 && moduleScope !== 'installed') {
+        if (moduleIdsSpecified && moduleScope !== 'installed') {
             throw new PluginApiError('INVALID_ARGUMENT', 'Module ID filtering requires installed module scope')
         }
         await this.permission('contextAssets', generation, signal)
@@ -1759,6 +1765,7 @@ export class ContextResourceService {
             include,
             moduleScope,
             moduleIds,
+            moduleIdsSpecified,
             mediaTypes: mediaTypes ?? [],
             signal,
         }
@@ -1769,6 +1776,7 @@ export class ContextResourceService {
             include,
             moduleScope,
             moduleIds,
+            moduleIdsSpecified,
             mediaTypes: mediaTypes ?? null,
             serviceGeneration: this.captureGeneration,
         }
@@ -1777,31 +1785,34 @@ export class ContextResourceService {
         let captureRevision: Revision
         let sources: readonly ContextLocatedAssetSource[]
         let verificationSources: readonly ContextLocatedAssetSource[]
+        let capturePreparation: QueryCapturePreparation
         const stagedHandles = new Map<string, IssuedAssetHandle>()
         let stagedCapture = false
         if (options.cursor) {
-            const cursorRecord = await this.cursorRegistry.read<CapturePageRecord>(
-                options.cursor,
-                this.context.principalId,
-                'context-assets',
-                this.context.instanceId,
-                query,
-            )
+            const [cursorRecord, preparation] = await Promise.all([
+                this.cursorRegistry.read<CapturePageRecord>(
+                    options.cursor,
+                    this.context.principalId,
+                    'context-assets',
+                    this.context.instanceId,
+                    query,
+                ),
+                this.queryCaptureCache.prepareCreate(owner, query),
+            ])
             this.cursorRegistry.clear(options.cursor)
             if (options.captureRevision && options.captureRevision !== cursorRecord.captureRevision) {
                 throw new PluginApiError('INVALID_ARGUMENT', 'Context query capture does not match this request')
             }
             offset = cursorRecord.offset
             captureRevision = cursorRecord.captureRevision
-            sources = (await this.queryCaptureCache.read<ContextLocatedAssetSource>(
-                owner, query, captureRevision,
-            )).items
+            capturePreparation = preparation
+            sources = this.queryCaptureCache.readPrepared<ContextLocatedAssetSource>(
+                capturePreparation, captureRevision,
+            ).items
             verificationSources = sources
         } else {
-            const preparation = options.captureRevision
-                ? await this.queryCaptureCache.prepareCreate(owner, query)
-                : undefined
-            const retained = preparation && options.captureRevision
+            const preparation = await this.queryCaptureCache.prepareCreate(owner, query)
+            const retained = options.captureRevision
                 ? this.queryCaptureCache.readPrepared<ContextLocatedAssetSource>(
                     preparation, options.captureRevision,
                 )
@@ -1816,7 +1827,8 @@ export class ContextResourceService {
                 conversationId: collection.selectors.conversationId,
             }
             verificationSources = collection.assets
-            if (preparation && retained && options.captureRevision) {
+            capturePreparation = preparation
+            if (retained && options.captureRevision) {
                 captureRevision = createSynchronousRevision({
                     queryDigest: preparation.queryDigest,
                     items: collection.assets,
@@ -1824,9 +1836,11 @@ export class ContextResourceService {
                 if (options.captureRevision !== captureRevision) throw this.contextChanged()
                 sources = retained.items
             } else {
-                const current = await this.queryCaptureCache.create(owner, query, collection.assets)
-                captureRevision = current.captureRevision
-                sources = current.items
+                captureRevision = createSynchronousRevision({
+                    queryDigest: preparation.queryDigest,
+                    items: collection.assets,
+                })
+                sources = collection.assets
             }
             if (!options.captureRevision) {
                 stagedCapture = true
@@ -1852,11 +1866,7 @@ export class ContextResourceService {
                             return undefined
                         },
                     )
-                } catch (error) {
-                    this.queryCaptureCache.clearService(this.context.principalId, 'context-assets')
-                    this.cursorRegistry.clearService(this.context.principalId, 'context-assets')
-                    throw error
-                }
+                } catch (error) { throw error }
             }
         }
 
@@ -1869,61 +1879,65 @@ export class ContextResourceService {
             ? references.filter((reference) => reference.mediaType && mediaTypes.includes(reference.mediaType))
             : references
         const nextOffset = offset + pageSources.length
-        let nextCursor: string | undefined
-        if (!options.captureRevision && nextOffset < sources.length) {
-            nextCursor = await this.cursorRegistry.create(
+        const nextCursorValue = !options.captureRevision && nextOffset < sources.length
+            ? { offset: nextOffset, captureRevision }
+            : undefined
+        const nextCursorPreparation = nextCursorValue
+            ? await this.cursorRegistry.prepareCreate(
                 this.context.principalId,
                 'context-assets',
                 this.context.instanceId,
                 query,
-                { offset: nextOffset, captureRevision },
             )
-        }
-        try {
+            : undefined
+        await this.permission('contextAssets', generation, signal)
+        if (moduleScope === 'installed') {
+            await this.permission('installedModulesRead', generation, signal)
             await this.permission('contextAssets', generation, signal)
-            if (moduleScope === 'installed') {
-                await this.permission('installedModulesRead', generation, signal)
-                await this.permission('contextAssets', generation, signal)
-            }
-            const publicationSources = stagedCapture && this.adapter.revalidateAssetSource
-                ? sources
-                : options.captureRevision
-                    ? []
-                    : pageSources
-            await this.boundedMap(
-                publicationSources,
-                MAX_LIST_DIGEST_WORKERS,
-                generation,
-                signal,
-                async (located) => {
-                    await this.revalidateCapturedAsset(
-                        located, input, preflightSelectors, generation, signal,
-                    )
-                    return undefined
-                },
-            )
-            await this.revalidateCapturedAssetCollection(
-                verificationSources, preflightSelectors, input, generation, signal,
-            )
-            const result = {
-                contextRevision: captureRevision,
-                assets: items,
-                ...(nextCursor ? { nextCursor } : {}),
-                ...(options.captureScope === 'query' ? { captureRevision } : {}),
-            }
-            assertContextSnapshotLimits(result)
-            for (const [assetId, issued] of stagedHandles) {
-                lruSet(this.issuedHandles, assetId, issued, MAX_ISSUED_HANDLES)
-            }
-            return result
-        } catch (error) {
-            if (nextCursor) this.cursorRegistry.clear(nextCursor)
-            if (stagedCapture) {
-                this.queryCaptureCache.clearService(this.context.principalId, 'context-assets')
-                this.cursorRegistry.clearService(this.context.principalId, 'context-assets')
-            }
-            throw error
         }
+        const publicationSources = stagedCapture && this.adapter.revalidateAssetSource
+            ? sources
+            : options.captureRevision
+                ? []
+                : pageSources
+        await this.boundedMap(
+            publicationSources,
+            MAX_LIST_DIGEST_WORKERS,
+            generation,
+            signal,
+            async (located) => {
+                await this.revalidateCapturedAsset(
+                    located, input, preflightSelectors, generation, signal,
+                )
+                return undefined
+            },
+        )
+        this.refreshCaptureGeneration()
+        this.assertActive(generation, signal)
+        await this.revalidateCapturedAssetCollection(
+            verificationSources, preflightSelectors, input, generation, signal,
+        )
+        this.refreshCaptureGeneration()
+        this.assertActive(generation, signal)
+        const nextCursorCommit = nextCursorValue && nextCursorPreparation
+            ? this.cursorRegistry.prepareCommit(nextCursorPreparation, nextCursorValue)
+            : undefined
+        const result = {
+            contextRevision: captureRevision,
+            assets: items,
+            ...(nextCursorCommit ? { nextCursor: nextCursorCommit.cursor } : {}),
+            ...(options.captureScope === 'query' ? { captureRevision } : {}),
+        }
+        assertContextSnapshotLimits(result)
+        if (stagedCapture) this.queryCaptureCache.commitPrepared(capturePreparation, sources)
+        this.queryCaptureCache.readPrepared<ContextLocatedAssetSource>(capturePreparation, captureRevision)
+        for (const [assetId, issued] of stagedHandles) {
+            lruSet(this.issuedHandles, assetId, issued, MAX_ISSUED_HANDLES)
+        }
+        if (nextCursorValue && nextCursorPreparation && nextCursorCommit) {
+            this.cursorRegistry.commitPrepared(nextCursorPreparation, nextCursorValue, nextCursorCommit)
+        }
+        return result
     }
 
     async listContextAssets(options: ContextAssetListOptions = {}): Promise<ContextAssetPage> {
@@ -1937,11 +1951,12 @@ export class ContextResourceService {
         const limit = normalizeLimit(options.limit)
         const include = this.normalizeIncludes(options.include)
         const mediaTypes = this.normalizeMediaTypes(options.mediaTypes)
-        const moduleIds = this.normalizeModuleIds(options.moduleIds)
+        const { moduleIds, specified: moduleIdsSpecified } = this.normalizeModuleIds(options.moduleIds)
         const captured = this.normalizeCaptureOptions(options.captureScope, options.captureRevision)
         if (captured || options.moduleIds !== undefined) {
             return this.listCapturedContextAssets(
-                options, moduleScope as 'active' | 'installed' | 'none', include, mediaTypes, moduleIds, limit,
+                options, moduleScope as 'active' | 'installed' | 'none', include, mediaTypes,
+                moduleIds, moduleIdsSpecified, limit,
             )
         }
         const preflight = await this.state(generation, signal)

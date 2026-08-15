@@ -490,7 +490,7 @@ export function createRisuContextResourceAdapter(
         }
         if (probe.input.include.includes('module') && probe.input.moduleScope !== 'none') {
             const records = currentModuleRecords(probe.input.moduleScope)
-                .filter(({ module }) => probe.input.moduleIds.length === 0
+                .filter(({ module }) => !probe.input.moduleIdsSpecified
                     || probe.input.moduleIds.includes(module?.id))
             for (const { module, rawSlotIndex } of records) {
                 if (!nonEmptyString(module?.id) || !Array.isArray(module.assets)) continue
@@ -747,13 +747,13 @@ export function createRisuContextResourceAdapter(
                 const activeById = new Map(dependencies.getActiveModulesWithReasons().flatMap(({ module, activatedBy }) =>
                     nonEmptyString(module?.id) ? [[module.id, activatedBy] as const] : []))
                 moduleRecords = (database.modules ?? []).flatMap((module, rawSlotIndex) =>
-                    input.moduleIds.length === 0 || input.moduleIds.includes(module?.id)
+                    !input.moduleIdsSpecified || input.moduleIds.includes(module?.id)
                         ? [{ module, activatedBy: activeById.get(module?.id) ?? [], rawSlotIndex }]
                         : [])
             } else if (input.moduleScope === 'active') {
                 moduleRecords = dependencies.getActiveModulesWithReasons().flatMap(
                     ({ module, activatedBy }, rawSlotIndex) =>
-                        input.moduleIds.length === 0 || input.moduleIds.includes(module?.id)
+                        !input.moduleIdsSpecified || input.moduleIds.includes(module?.id)
                             ? [{ module, activatedBy, rawSlotIndex }] : [],
                 )
             }
@@ -791,7 +791,7 @@ export function createRisuContextResourceAdapter(
             let current: ContextAssetSource | null = null
             if (locator.ownerKind === 'module') {
                 if (probe.input.moduleScope === 'none'
-                    || (probe.input.moduleIds.length > 0 && !probe.input.moduleIds.includes(locator.ownerId))) {
+                    || (probe.input.moduleIdsSpecified && !probe.input.moduleIds.includes(locator.ownerId))) {
                     throw changed()
                 }
                 const records = probe.input.moduleScope === 'installed'

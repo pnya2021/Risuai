@@ -1746,6 +1746,18 @@ describe('captured context count, filter, and fence security', () => {
 
     it('normalizes module IDs and rejects empty, over-limit, and non-installed filters before storage reads', async () => {
         const h = harness()
+        const omitted = await h.service.listContextAssets({
+            moduleScope: 'installed', captureScope: 'query', include: ['module'], limit: 100,
+        })
+        const explicitEmpty = await h.service.listContextAssets({
+            moduleScope: 'installed', moduleIds: [], captureScope: 'query', include: ['module'], limit: 100,
+        })
+        expect(omitted.assets.map((item) => item.origin)).toEqual([
+            { kind: 'module', moduleId: 'module-active' },
+            { kind: 'module', moduleId: 'module-installed' },
+        ])
+        expect(explicitEmpty.assets).toEqual([])
+
         const filtered = await h.service.listContextAssets({
             moduleScope: 'installed', moduleIds: [' module-installed ', 'module-active', 'module-installed'],
             captureScope: 'query', include: ['portrait', 'module'], limit: 100,
@@ -1764,7 +1776,26 @@ describe('captured context count, filter, and fence security', () => {
             captureScope: 'query',
         })).rejects.toMatchObject({ code: 'RESOURCE_LIMIT' })
         await expect(h.service.listContextAssets({
+            moduleScope: 'installed',
+            moduleIds: Array.from({ length: 101 }, () => ' module-installed '),
+            captureScope: 'query', include: ['module'], limit: 100,
+        })).resolves.toMatchObject({
+            assets: [{ origin: { kind: 'module', moduleId: 'module-installed' } }],
+        })
+        await expect(h.service.listContextAssets({
             moduleScope: 'active', moduleIds: ['module-active'], captureScope: 'query',
+        })).rejects.toMatchObject({ code: 'INVALID_ARGUMENT' })
+    })
+
+    it('keeps omitted and explicit-empty module filters in distinct captured cursor identities', async () => {
+        const h = harness()
+        const omitted = await h.service.listContextAssets({
+            moduleScope: 'installed', include: ['module'], captureScope: 'query', limit: 1,
+        })
+        expect(omitted.nextCursor).toBeTypeOf('string')
+        await expect(h.service.listContextAssets({
+            moduleScope: 'installed', moduleIds: [], include: ['module'], captureScope: 'query',
+            cursor: omitted.nextCursor, limit: 1,
         })).rejects.toMatchObject({ code: 'INVALID_ARGUMENT' })
     })
 
@@ -2017,6 +2048,87 @@ describe('captured context count, filter, and fence security', () => {
             moduleScope: 'none', include: ['portrait', 'emotion', 'additional'],
             captureScope: 'query', cursor: retained.nextCursor, limit: 1,
         })).resolves.toMatchObject({ assets: [{ role: 'emotion' }] })
+    })
+
+    it.each(['expired', 'evicted'] as const)(
+        'rejects a later asset page when its capture is %s during final permission without publishing staged state',
+        async (scenario) => {
+            const principalId = '11111111-1111-4111-8111-111111111111'
+            let now = 0
+            let publicationGateArmed = false
+            let publicationPermissionCalls = 0
+            const captures = new QueryCaptureCache({
+                now: () => now,
+                ttlMs: 10,
+                maxCapturesPerPrincipal: scenario === 'evicted' ? 1 : 64,
+            })
+            const cursors = new CursorRegistry({ now: () => now, ttlMs: 100 })
+            const unrelatedOwner = {
+                principalId,
+                service: 'context-modules' as const,
+                instanceId: 'unrelated-asset-resident-capture',
+            }
+            const unrelatedQuery = { kind: 'unrelated-asset-resident-query' }
+            let unrelatedRevision: string | undefined
+            const h = harness({
+                principalId,
+                queryCaptureCache: captures,
+                cursorRegistry: cursors,
+                async onPermission() {
+                    if (!publicationGateArmed) return
+                    publicationPermissionCalls += 1
+                    if (publicationPermissionCalls !== 5) return
+                    if (scenario === 'expired') now = 11
+                    else {
+                        unrelatedRevision = (await captures.create(
+                            unrelatedOwner, unrelatedQuery, [{ id: 'unrelated-resident-item' }],
+                        )).captureRevision
+                    }
+                },
+            })
+            const first = await h.service.listContextAssets({
+                moduleScope: 'installed', include: ['module'], captureScope: 'query', limit: 1,
+            })
+            const handlesBefore = (h.service as any).issuedHandles.size
+            publicationGateArmed = true
+
+            await expect(h.service.listContextAssets({
+                moduleScope: 'installed', include: ['module'], captureScope: 'query',
+                cursor: first.nextCursor, limit: 1,
+            })).rejects.toMatchObject({ code: 'CONFLICT', retryable: true })
+            expect(publicationPermissionCalls).toBe(9)
+            expect(cursors.activeCount(principalId)).toBe(0)
+            expect((h.service as any).issuedHandles.size).toBe(handlesBefore)
+            if (scenario === 'evicted') {
+                await expect(captures.read(unrelatedOwner, unrelatedQuery, unrelatedRevision!))
+                    .resolves.toMatchObject({ items: [{ id: 'unrelated-resident-item' }] })
+            }
+        },
+    )
+
+    it('rejects an asset page when permission generation resets after the final async collection probe', async () => {
+        const cursors = new CursorRegistry()
+        let permissionGeneration = 0
+        let reset = false
+        const h = harness({
+            cursorRegistry: cursors,
+            getPermissionGeneration: () => permissionGeneration,
+            adapterOverrides: {
+                revalidateAssetCollection: async () => {
+                    if (!reset) {
+                        reset = true
+                        permissionGeneration += 1
+                    }
+                },
+            },
+        })
+
+        await expect(h.service.listContextAssets({
+            moduleScope: 'none', captureScope: 'query', limit: 1,
+        })).rejects.toMatchObject({ code: 'ABORTED', retryable: false })
+        expect(reset).toBe(true)
+        expect(cursors.activeCount((h.service as any).context.principalId)).toBe(0)
+        expect((h.service as any).issuedHandles.size).toBe(0)
     })
 
     it('publishes no module cache or cursor when the aggregate first-page result exceeds its limit', async () => {
