@@ -1,12 +1,14 @@
-import { CursorRegistry, illustrationCursorRegistry } from './cursorRegistry'
+import { CursorRegistry, illustrationCursorRegistry, type CursorPreparation } from './cursorRegistry'
 import { PluginApiError } from './errors'
 import { createRevision, validateJsonLimits } from './revision'
 import type { PluginExecutionContext } from './permissions'
 import type { ModuleActivationReason } from './moduleActivation'
 import {
     QueryCaptureCache,
+    createSynchronousRevision,
     illustrationQueryCaptureCache,
     type QueryCaptureOwner,
+    type QueryCapturePreparation,
 } from './queryCaptureCache'
 import {
     ContextAssetReadCoordinator,
@@ -158,6 +160,10 @@ export interface ContextResourceAdapter {
         signal?: AbortSignal
     }): Promise<ContextCollectionSelectors>
     captureModuleSources?(input: ContextModuleCollectionInput): Promise<ContextModuleCollection>
+    captureModuleSourcesSynchronously?(
+        input: ContextModuleCollectionInput,
+        options: { includeAssetMetadata: boolean },
+    ): ContextModuleCollection
     captureAssetSources?(input: ContextAssetCollectionInput): Promise<ContextAssetCollection>
     revalidateModuleSource?(input: ContextModuleSourceProbe): Promise<ContextModuleSource>
     revalidateAssetSource?(input: ContextAssetSourceProbe): Promise<ContextAssetSource>
@@ -645,17 +651,17 @@ export class ContextResourceService {
         }
     }
 
-    private async moduleSnapshot(
+    private moduleSnapshot(
         source: ContextModuleSource,
         includeAssetCount = false,
-    ): Promise<ContextModuleSnapshot> {
+    ): ContextModuleSnapshot {
         const base = {
             ...this.activeSummary(source),
             description: source.description,
             lorebook: copyLorebook(source.lorebook),
             ...(includeAssetCount ? {
                 assetCount: source.assets.length,
-                assetCollectionRevision: await createRevision(source.assets.map((asset) => ({
+                assetCollectionRevision: createSynchronousRevision(source.assets.map((asset) => ({
                     origin: { kind: 'module', moduleId: source.id },
                     identity: asset.identity,
                     storageKey: asset.storageKey,
@@ -669,24 +675,26 @@ export class ContextResourceService {
             } : {}),
         }
         assertContextSnapshotLimits(base)
-        const snapshot = { ...base, revision: await createRevision(base) }
+        const snapshot = { ...base, revision: createSynchronousRevision(base) }
         assertContextSnapshotLimits(snapshot)
         return snapshot
     }
 
-    private moduleSourceIdentity(source: ContextModuleSource) {
+    private moduleSourceIdentity(source: ContextModuleSource, includeAssetMetadata = true) {
         return JSON.stringify([
             source.id,
             source.namespace ?? null,
             source.name,
             source.description,
             source.lorebook.map((entry) => [entry.id, entry.name, entry.content, entry.enabled]),
-            source.assets.map((asset) => [
-                asset.identity,
-                asset.storageKey,
-                this.storageRevision(asset),
-                asset.role,
-            ]),
+            includeAssetMetadata
+                ? source.assets.map((asset) => [
+                    asset.identity,
+                    asset.storageKey,
+                    this.storageRevision(asset),
+                    asset.role,
+                ])
+                : null,
         ])
     }
 
@@ -890,14 +898,14 @@ export class ContextResourceService {
         return captureScope === 'query'
     }
 
-    private copyModuleSource(source: ContextModuleSource): ContextModuleSource {
+    private copyModuleSource(source: ContextModuleSource, includeAssetMetadata = true): ContextModuleSource {
         return {
             id: source.id,
             ...(source.namespace ? { namespace: source.namespace } : {}),
             name: source.name,
             description: source.description,
             lorebook: copyLorebook(source.lorebook),
-            assets: source.assets.map((asset) => ({ ...asset })),
+            assets: includeAssetMetadata ? source.assets.map((asset) => ({ ...asset })) : [],
             activatedBy: [...source.activatedBy],
         }
     }
@@ -905,9 +913,16 @@ export class ContextResourceService {
     private async captureModuleCollection(
         input: ContextModuleCollectionInput,
         generation: number,
+        includeAssetMetadata = true,
     ): Promise<ContextModuleCollection> {
         if (this.adapter.captureModuleSources) {
-            return this.fenced(this.adapter.captureModuleSources(input), generation, input.signal)
+            const collection = await this.fenced(
+                this.adapter.captureModuleSources(input), generation, input.signal,
+            )
+            return includeAssetMetadata ? collection : {
+                selectors: collection.selectors,
+                modules: collection.modules.map((source) => this.copyModuleSource(source, false)),
+            }
         }
         const state = await this.state(generation, input.signal)
         let selectors: ContextCollectionSelectors
@@ -920,7 +935,10 @@ export class ContextResourceService {
             selectors = { characterId: null, conversationId: null }
         }
         const modules = input.scope === 'installed' ? state.installedModules : state.activeModules
-        return { selectors, modules: modules.map((source) => this.copyModuleSource(source)) }
+        return {
+            selectors,
+            modules: modules.map((source) => this.copyModuleSource(source, includeAssetMetadata)),
+        }
     }
 
     private async revalidateCapturedModuleCollection(
@@ -928,6 +946,7 @@ export class ContextResourceService {
         selectors: ContextCollectionSelectors,
         input: ContextModuleCollectionInput,
         generation: number,
+        includeAssetMetadata = true,
     ) {
         if (this.adapter.revalidateModuleCollection) {
             await this.fenced(
@@ -937,11 +956,12 @@ export class ContextResourceService {
             )
             return
         }
-        const current = await this.captureModuleCollection(input, generation)
+        const current = await this.captureModuleCollection(input, generation, includeAssetMetadata)
         if (!this.sameSelectors(selectors, current.selectors)
             || current.modules.length !== sources.length
             || current.modules.some((source, index) =>
-                this.moduleSourceIdentity(source) !== this.moduleSourceIdentity(sources[index]))) {
+                this.moduleSourceIdentity(source, includeAssetMetadata)
+                    !== this.moduleSourceIdentity(sources[index], includeAssetMetadata))) {
             throw this.contextChanged()
         }
     }
@@ -960,51 +980,49 @@ export class ContextResourceService {
         if (options.includeAssetCount && scope !== 'installed') {
             throw new PluginApiError('INVALID_ARGUMENT', 'includeAssetCount is available only for installed modules')
         }
-        let input: ContextModuleCollectionInput = {
-            scope,
-            ...(options.characterId !== undefined ? { characterId: options.characterId } : {}),
-            ...(options.conversationId !== undefined ? { conversationId: options.conversationId } : {}),
-        }
         const requestedCounts = options.includeAssetCount === true
         let countsAuthorized = requestedCounts
-        if (scope === 'installed') {
-            await this.permission('installedModulesRead', generation)
-            if (requestedCounts) {
-                try {
-                    await this.permission('contextAssets', generation)
-                } catch (error) {
-                    if (!(error instanceof PluginApiError) || error.code !== 'PERMISSION_DENIED') throw error
-                    countsAuthorized = false
+        const authorize = async (allowCountPromotion: boolean) => {
+            if (scope === 'installed') {
+                await this.permission('installedModulesRead', generation)
+                if (requestedCounts) {
+                    try {
+                        await this.permission('contextAssets', generation)
+                        if (allowCountPromotion) countsAuthorized = true
+                    } catch (error) {
+                        if (!(error instanceof PluginApiError) || error.code !== 'PERMISSION_DENIED') throw error
+                        countsAuthorized = false
+                    }
                 }
+            } else {
+                await this.permission('contextAssets', generation)
             }
-        } else {
-            await this.permission('contextAssets', generation)
         }
+        await authorize(true)
 
         const selectors = await this.resolveCaptureSelectors({
             characterId: options.characterId,
             conversationId: options.conversationId,
             allowMissingCurrent: scope === 'installed',
         }, generation)
-        input = {
+        const inputFor = (): ContextModuleCollectionInput => ({
             scope,
             ...(selectors.characterId !== null ? { characterId: selectors.characterId } : {}),
             ...(selectors.conversationId !== null ? { conversationId: selectors.conversationId } : {}),
-        }
-
-        const query = {
-            kind: 'modules-capture',
+        })
+        const queryFor = (includeAssetCount: boolean) => ({
+            kind: 'modules-capture' as const,
             scope,
             characterId: selectors.characterId,
             conversationId: selectors.conversationId,
-            includeAssetCount: requestedCounts && countsAuthorized,
+            includeAssetCount,
             serviceGeneration: this.captureGeneration,
-        }
+        })
         const owner = this.captureOwner('context-modules')
-        let offset = 0
-        let captureRevision: Revision
-        let sources: readonly ContextModuleSource[]
         if (options.cursor) {
+            const cursorCountsAuthorized = requestedCounts && countsAuthorized
+            const query = queryFor(cursorCountsAuthorized)
+            const input = inputFor()
             const cursorRecord = await this.cursorRegistry.read<CapturePageRecord>(
                 options.cursor,
                 this.context.principalId,
@@ -1016,79 +1034,150 @@ export class ContextResourceService {
             if (options.captureRevision && options.captureRevision !== cursorRecord.captureRevision) {
                 throw new PluginApiError('INVALID_ARGUMENT', 'Context query capture does not match this request')
             }
-            offset = cursorRecord.offset
-            captureRevision = cursorRecord.captureRevision
-            sources = (await this.queryCaptureCache.read<ContextModuleSource>(
-                owner, query, captureRevision,
+            const captureRevision = cursorRecord.captureRevision
+            const sources = (await this.queryCaptureCache.read<ContextModuleSource>(
+                owner, query, cursorRecord.captureRevision,
             )).items
-        } else {
-            const collection = await this.captureModuleCollection(input, generation)
-            if (!this.sameSelectors(selectors, collection.selectors)) throw this.contextChanged()
-            const current = await this.queryCaptureCache.create(owner, query, collection.modules)
-            captureRevision = current.captureRevision
-            if (options.captureRevision && options.captureRevision !== captureRevision) {
-                this.queryCaptureCache.clearService(this.context.principalId, 'context-modules')
-                this.cursorRegistry.clearService(this.context.principalId, 'context-modules')
-                throw this.contextChanged()
+            const pageSources = sources.slice(cursorRecord.offset, cursorRecord.offset + limit)
+            const nextOffset = cursorRecord.offset + pageSources.length
+            let nextCursor: string | undefined
+            if (nextOffset < sources.length) {
+                nextCursor = await this.cursorRegistry.create(
+                    this.context.principalId,
+                    'context-modules',
+                    this.context.instanceId,
+                    query,
+                    { offset: nextOffset, captureRevision },
+                )
             }
-            sources = current.items
-            if (!options.captureRevision) {
-                await Promise.all(sources.map(async (source) => {
-                    if (!this.moduleCaptureProjections.has(source)) {
-                        this.moduleCaptureProjections.set(
-                            source,
-                            await this.moduleSnapshot(source, requestedCounts && countsAuthorized),
-                        )
-                    }
-                }))
+            try {
+                await authorize(false)
+                if (cursorCountsAuthorized !== (requestedCounts && countsAuthorized)) {
+                    throw this.contextChanged()
+                }
+                await this.revalidateCapturedModuleCollection(
+                    sources, selectors, input, generation, cursorCountsAuthorized,
+                )
+                if (this.adapter.revalidateModuleSource) {
+                    await Promise.all(pageSources.map((source) => this.fenced(
+                        this.adapter.revalidateModuleSource!({ source, input }),
+                        generation,
+                    )))
+                }
+                const items = pageSources.flatMap((source) => {
+                    const projection = this.moduleCaptureProjections.get(source)
+                    return projection ? [projection] : []
+                })
+                const result = {
+                    items,
+                    ...(nextCursor ? { nextCursor } : {}),
+                    ...(options.captureScope === 'query' ? { captureRevision } : {}),
+                }
+                assertContextSnapshotLimits(result)
+                return result
+            } catch (error) {
+                if (nextCursor) this.cursorRegistry.clear(nextCursor)
+                throw error
             }
         }
 
-        const pageSources = sources.slice(offset, offset + limit)
-        let items = pageSources.flatMap((source) => {
-            const projection = this.moduleCaptureProjections.get(source)
-            return projection ? [projection] : []
-        })
-        const nextOffset = offset + pageSources.length
-        let nextCursor: string | undefined
-        if (nextOffset < sources.length) {
-            nextCursor = await this.cursorRegistry.create(
-                this.context.principalId,
-                'context-modules',
-                this.context.instanceId,
-                query,
-                { offset: nextOffset, captureRevision },
-            )
+        type PreparedCapture = {
+            query: ReturnType<typeof queryFor>
+            cache: QueryCapturePreparation
+            cursor?: CursorPreparation
         }
-        try {
-            if (scope === 'installed') {
-                await this.permission('installedModulesRead', generation)
-                if (requestedCounts) {
-                    try {
-                        await this.permission('contextAssets', generation)
-                    } catch (error) {
-                        if (!(error instanceof PluginApiError) || error.code !== 'PERMISSION_DENIED') throw error
-                        countsAuthorized = false
-                    }
-                }
-            } else {
-                await this.permission('contextAssets', generation)
+        const prepare = async (includeAssetCount: boolean): Promise<PreparedCapture> => {
+            const query = queryFor(includeAssetCount)
+            const [cache, cursor] = await Promise.all([
+                this.queryCaptureCache.prepareCreate(owner, query),
+                options.captureRevision
+                    ? Promise.resolve(undefined)
+                    : this.cursorRegistry.prepareCreate(
+                        this.context.principalId,
+                        'context-modules',
+                        this.context.instanceId,
+                        query,
+                    ),
+            ])
+            return { query, cache, ...(cursor ? { cursor } : {}) }
+        }
+        const initialCountsAuthorized = requestedCounts && countsAuthorized
+        const preparations = await Promise.all(
+            initialCountsAuthorized ? [prepare(true), prepare(false)] : [prepare(false)],
+        )
+
+        await authorize(false)
+        const includeAssetCount = requestedCounts && countsAuthorized
+        const prepared = preparations.find((candidate) =>
+            candidate.query.includeAssetCount === includeAssetCount)!
+        const input = inputFor()
+        let retained: readonly ContextModuleSource[] | undefined
+        if (options.captureRevision) {
+            try {
+                retained = this.queryCaptureCache.readPrepared<ContextModuleSource>(
+                    prepared.cache, options.captureRevision,
+                ).items
+            } catch (error) {
+                if (!(error instanceof PluginApiError)
+                    || (error.code !== 'CONFLICT' && error.code !== 'INVALID_ARGUMENT')) throw error
             }
-            await this.revalidateCapturedModuleCollection(sources, selectors, input, generation)
-            if (!countsAuthorized) {
-                items = items.map(({ assetCount: _assetCount, assetCollectionRevision: _revision, ...legacy }) => legacy)
-            }
+        }
+        let collection: ContextModuleCollection
+        if (this.adapter.captureModuleSourcesSynchronously) {
+            this.assertActive(generation)
+            collection = this.adapter.captureModuleSourcesSynchronously(
+                input, { includeAssetMetadata: includeAssetCount },
+            )
+            this.assertActive(generation)
+        } else {
+            collection = await this.captureModuleCollection(input, generation, includeAssetCount)
+        }
+        if (!this.sameSelectors(selectors, collection.selectors)) throw this.contextChanged()
+
+        const captureRevision = createSynchronousRevision({
+            queryDigest: prepared.cache.queryDigest,
+            items: collection.modules,
+        })
+        if (options.captureRevision) {
+            if (options.captureRevision !== captureRevision) throw this.contextChanged()
+            const items = (retained ?? []).slice(0, limit).flatMap((source) => {
+                const projection = this.moduleCaptureProjections.get(source)
+                return projection ? [projection] : []
+            })
             const result = {
                 items,
-                ...(nextCursor ? { nextCursor } : {}),
                 ...(options.captureScope === 'query' ? { captureRevision } : {}),
             }
             assertContextSnapshotLimits(result)
             return result
-        } catch (error) {
-            if (nextCursor) this.cursorRegistry.clear(nextCursor)
-            throw error
         }
+
+        for (const source of collection.modules) {
+            if (!this.moduleCaptureProjections.has(source)) {
+                this.moduleCaptureProjections.set(source, this.moduleSnapshot(source, includeAssetCount))
+            }
+        }
+        const current = this.queryCaptureCache.commitPrepared(prepared.cache, collection.modules)
+        const sources = current.items
+        const pageSources = sources.slice(0, limit)
+        const items = pageSources.flatMap((source) => {
+            const projection = this.moduleCaptureProjections.get(source)
+            return projection ? [projection] : []
+        })
+        const nextOffset = pageSources.length
+        const nextCursor = nextOffset < sources.length
+            ? this.cursorRegistry.commitPrepared(
+                prepared.cursor!,
+                { offset: nextOffset, captureRevision: current.captureRevision },
+            )
+            : undefined
+        const result = {
+            items,
+            ...(nextCursor ? { nextCursor } : {}),
+            ...(options.captureScope === 'query' ? { captureRevision: current.captureRevision } : {}),
+        }
+        assertContextSnapshotLimits(result)
+        return result
     }
 
     async listContextModules(options: ContextModuleListOptions = {}): Promise<ContextModulePage> {
@@ -1538,12 +1627,6 @@ export class ContextResourceService {
         const modules = input.moduleScope === 'installed'
             ? state.installedModules
             : input.moduleScope === 'active' ? state.activeModules : []
-        if (input.moduleIds.length > 0) {
-            const available = new Set(modules.map((module) => module.id))
-            if (input.moduleIds.some((moduleId) => !available.has(moduleId))) {
-                throw new PluginApiError('INVALID_ARGUMENT', 'Unknown module ID in context asset filter')
-            }
-        }
         const filteredModules = input.moduleIds.length > 0
             ? modules.filter((module) => input.moduleIds.includes(module.id))
             : modules
@@ -1657,6 +1740,7 @@ export class ContextResourceService {
         let offset = 0
         let captureRevision: Revision
         let sources: readonly ContextLocatedAssetSource[]
+        let verificationSources: readonly ContextLocatedAssetSource[]
         const stagedHandles = new Map<string, IssuedAssetHandle>()
         let stagedCapture = false
         if (options.cursor) {
@@ -1676,7 +1760,16 @@ export class ContextResourceService {
             sources = (await this.queryCaptureCache.read<ContextLocatedAssetSource>(
                 owner, query, captureRevision,
             )).items
+            verificationSources = sources
         } else {
+            const preparation = options.captureRevision
+                ? await this.queryCaptureCache.prepareCreate(owner, query)
+                : undefined
+            const retained = preparation && options.captureRevision
+                ? this.queryCaptureCache.readPrepared<ContextLocatedAssetSource>(
+                    preparation, options.captureRevision,
+                )
+                : undefined
             const collection = await this.captureAssetCollection(input, generation)
             if (preflightSelectors.characterId
                 && !this.sameSelectors(preflightSelectors, collection.selectors)) throw this.contextChanged()
@@ -1686,14 +1779,19 @@ export class ContextResourceService {
                 characterIds: [collection.selectors.characterId],
                 conversationId: collection.selectors.conversationId,
             }
-            const current = await this.queryCaptureCache.create(owner, query, collection.assets)
-            captureRevision = current.captureRevision
-            if (options.captureRevision && options.captureRevision !== captureRevision) {
-                this.queryCaptureCache.clearService(this.context.principalId, 'context-assets')
-                this.cursorRegistry.clearService(this.context.principalId, 'context-assets')
-                throw this.contextChanged()
+            verificationSources = collection.assets
+            if (preparation && retained && options.captureRevision) {
+                captureRevision = createSynchronousRevision({
+                    queryDigest: preparation.queryDigest,
+                    items: collection.assets,
+                })
+                if (options.captureRevision !== captureRevision) throw this.contextChanged()
+                sources = retained.items
+            } else {
+                const current = await this.queryCaptureCache.create(owner, query, collection.assets)
+                captureRevision = current.captureRevision
+                sources = current.items
             }
-            sources = current.items
             if (!options.captureRevision) {
                 stagedCapture = true
                 try {
@@ -1736,7 +1834,7 @@ export class ContextResourceService {
             : references
         const nextOffset = offset + pageSources.length
         let nextCursor: string | undefined
-        if (nextOffset < sources.length) {
+        if (!options.captureRevision && nextOffset < sources.length) {
             nextCursor = await this.cursorRegistry.create(
                 this.context.principalId,
                 'context-assets',
@@ -1769,7 +1867,7 @@ export class ContextResourceService {
                 },
             )
             await this.revalidateCapturedAssetCollection(
-                sources, preflightSelectors, input, generation, signal,
+                verificationSources, preflightSelectors, input, generation, signal,
             )
             const result = {
                 contextRevision: captureRevision,

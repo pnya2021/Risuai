@@ -79,4 +79,31 @@ describe('cursor registry', () => {
 
         await expect(read).rejects.toMatchObject({ code: 'INVALID_ARGUMENT' })
     })
+
+    it('prepares cursor hashing before a synchronous lifecycle-bound commit', async () => {
+        const registry = new CursorRegistry()
+        const preparedApi = registry as unknown as {
+            prepareCreate?: (
+                principalId: string,
+                service: string,
+                instanceId: string,
+                query: unknown,
+            ) => Promise<unknown>
+            commitPrepared?: <T>(preparation: unknown, value: T) => string
+        }
+        expect(preparedApi.prepareCreate).toBeTypeOf('function')
+        expect(preparedApi.commitPrepared).toBeTypeOf('function')
+        if (!preparedApi.prepareCreate || !preparedApi.commitPrepared) return
+
+        const prepared = await preparedApi.prepareCreate('p', 'modules', 'instance', { page: 1 })
+        const cursor = preparedApi.commitPrepared(prepared, { offset: 1 })
+        expect(cursor).toBeTypeOf('string')
+        expect(await registry.read(cursor, 'p', 'modules', 'instance', { page: 1 }))
+            .toEqual({ offset: 1 })
+
+        const stale = await preparedApi.prepareCreate('p', 'modules', 'instance', { page: 2 })
+        registry.clearInstance('p', 'instance')
+        expect(() => preparedApi.commitPrepared!(stale, { offset: 2 }))
+            .toThrowError(expect.objectContaining({ code: 'ABORTED' }))
+    })
 })

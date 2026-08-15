@@ -1664,7 +1664,87 @@ describe('captured context count, filter, and fence security', () => {
         expect(page.items.every((item) => !('assetCount' in item) && !('assetCollectionRevision' in item))).toBe(true)
     })
 
-    it('normalizes module IDs and rejects empty, unknown, over-limit, and non-installed filters before storage reads', async () => {
+    it('keeps no-count and denied-count capture revisions independent of module asset metadata', async () => {
+        const baseline = makeState()
+        const changed = structuredClone(baseline)
+        changed.installedModules[1].assets[0].storageRevision = 'storage:installed-ref:changed'
+
+        const firstNoCount = harness({ state: baseline })
+        const secondNoCount = harness({ state: changed })
+        const firstNoCountPage = await firstNoCount.service.listContextModules({
+            scope: 'installed', includeAssetCount: false, captureScope: 'query', limit: 100,
+        })
+        const secondNoCountPage = await secondNoCount.service.listContextModules({
+            scope: 'installed', includeAssetCount: false, captureScope: 'query', limit: 100,
+        })
+        expect(firstNoCount.permissionCalls).toEqual(['installedModulesRead', 'installedModulesRead'])
+        expect(secondNoCount.permissionCalls).toEqual(['installedModulesRead', 'installedModulesRead'])
+        expect(secondNoCountPage.captureRevision).toBe(firstNoCountPage.captureRevision)
+
+        const firstDenied = harness({ state: baseline, grants: ['installedModulesRead'] })
+        const secondDenied = harness({ state: changed, grants: ['installedModulesRead'] })
+        const firstDeniedPage = await firstDenied.service.listContextModules({
+            scope: 'installed', includeAssetCount: true, captureScope: 'query', limit: 100,
+        })
+        const secondDeniedPage = await secondDenied.service.listContextModules({
+            scope: 'installed', includeAssetCount: true, captureScope: 'query', limit: 100,
+        })
+        expect(firstDenied.permissionCalls).toEqual([
+            'installedModulesRead', 'contextAssets', 'installedModulesRead', 'contextAssets',
+        ])
+        expect(secondDenied.permissionCalls).toEqual(firstDenied.permissionCalls)
+        expect(secondDeniedPage.captureRevision).toBe(firstDeniedPage.captureRevision)
+        expect(secondDeniedPage.items.every((item) =>
+            !('assetCount' in item) && !('assetCollectionRevision' in item))).toBe(true)
+    })
+
+    it('downgrades to an asset-independent capture when count permission is revoked at publication', async () => {
+        const state = makeState()
+        const baseline = harness({ state })
+        const noCount = await baseline.service.listContextModules({
+            scope: 'installed', captureScope: 'query', limit: 100,
+        })
+
+        let countPermissionCalls = 0
+        const revoked = harness({
+            state,
+            onPermission(permission) {
+                if (permission !== 'contextAssets') return
+                countPermissionCalls += 1
+                if (countPermissionCalls === 2) {
+                    throw new PluginApiError('PERMISSION_DENIED', 'Count permission revoked')
+                }
+            },
+        })
+        const page = await revoked.service.listContextModules({
+            scope: 'installed', includeAssetCount: true, captureScope: 'query', limit: 100,
+        })
+
+        expect(revoked.permissionCalls).toEqual([
+            'installedModulesRead', 'contextAssets',
+            'installedModulesRead', 'contextAssets',
+        ])
+        expect(page.captureRevision).toBe(noCount.captureRevision)
+        expect(page.items.every((item) =>
+            !('assetCount' in item) && !('assetCollectionRevision' in item))).toBe(true)
+    })
+
+    it('returns zero module assets for unknown installed module IDs after the exact permission sequence', async () => {
+        const h = harness()
+        const page = await h.service.listContextAssets({
+            moduleScope: 'installed', moduleIds: ['missing'], include: ['module'],
+            captureScope: 'query', limit: 100,
+        })
+
+        expect(page.assets).toEqual([])
+        expect(h.permissionCalls).toEqual([
+            'contextAssets', 'installedModulesRead', 'contextAssets',
+            'contextAssets', 'installedModulesRead', 'contextAssets',
+        ])
+        expect(h.reads).not.toHaveBeenCalled()
+    })
+
+    it('normalizes module IDs and rejects empty, over-limit, and non-installed filters before storage reads', async () => {
         const h = harness()
         const filtered = await h.service.listContextAssets({
             moduleScope: 'installed', moduleIds: [' module-installed ', 'module-active', 'module-installed'],
@@ -1677,9 +1757,6 @@ describe('captured context count, filter, and fence security', () => {
         ])
         await expect(h.service.listContextAssets({
             moduleScope: 'installed', moduleIds: [' '], captureScope: 'query',
-        })).rejects.toMatchObject({ code: 'INVALID_ARGUMENT' })
-        await expect(h.service.listContextAssets({
-            moduleScope: 'installed', moduleIds: ['missing'], captureScope: 'query',
         })).rejects.toMatchObject({ code: 'INVALID_ARGUMENT' })
         await expect(h.service.listContextAssets({
             moduleScope: 'installed',
@@ -1697,12 +1774,12 @@ describe('captured context count, filter, and fence security', () => {
             id: 'module-third', name: 'Third', assets: [asset('third', 'third', 'module')], activatedBy: [],
         }))
         const cursors = new CursorRegistry()
-        const createCursor = vi.spyOn(cursors, 'create')
+        const commitCursor = vi.spyOn(cursors, 'commitPrepared')
         const h = harness({ state, cursorRegistry: cursors })
         const first = await h.service.listContextModules({
             scope: 'installed', captureScope: 'query', limit: 1,
         })
-        expect(createCursor.mock.calls[0]?.[4]).toEqual({
+        expect(commitCursor.mock.calls[0]?.[1]).toEqual({
             offset: 1,
             captureRevision: first.captureRevision,
         })
@@ -1737,6 +1814,70 @@ describe('captured context count, filter, and fence security', () => {
             captureRevision: first.captureRevision, limit: 1,
         })).rejects.toMatchObject({ code: 'CONFLICT', retryable: true })
         expect(h.reads).toHaveBeenCalledTimes(readsAfterCapture)
+    })
+
+    it('keeps an expected-revision final probe ephemeral and preserves unrelated module captures', async () => {
+        const state = makeState()
+        const secondActive = moduleSource({
+            id: 'module-second-active', name: 'Second active module', activatedBy: ['chat'],
+        })
+        state.activeModules.push(secondActive)
+        state.installedModules.splice(1, 0, secondActive)
+        const captures = new QueryCaptureCache()
+        const cursors = new CursorRegistry()
+        const h = harness({ state, queryCaptureCache: captures, cursorRegistry: cursors })
+
+        const expected = await h.service.listContextModules({
+            scope: 'installed', captureScope: 'query', limit: 100,
+        })
+        const retained = await h.service.listContextModules({
+            scope: 'active', captureScope: 'query', limit: 1,
+        })
+        expect(retained.nextCursor).toBeTypeOf('string')
+
+        state.installedModules[2].name = 'Changed installed-only module'
+        await expect(h.service.listContextModules({
+            scope: 'installed', captureScope: 'query', captureRevision: expected.captureRevision, limit: 100,
+        })).rejects.toMatchObject({ code: 'CONFLICT', retryable: true })
+
+        await expect(h.service.listContextModules({
+            scope: 'active', captureScope: 'query', cursor: retained.nextCursor, limit: 1,
+        })).resolves.toMatchObject({ items: [{ id: 'module-second-active' }] })
+    })
+
+    it('keeps an expected-revision asset probe ephemeral and preserves unrelated asset captures', async () => {
+        const captures = new QueryCaptureCache()
+        const cursors = new CursorRegistry()
+        const createCapture = vi.spyOn(captures, 'create')
+        const createCursor = vi.spyOn(cursors, 'create')
+        const h = harness({ queryCaptureCache: captures, cursorRegistry: cursors })
+
+        const expected = await h.service.listContextAssets({
+            moduleScope: 'installed', moduleIds: ['module-active'], captureScope: 'query', limit: 1,
+        })
+        const retained = await h.service.listContextAssets({
+            moduleScope: 'none', include: ['portrait', 'emotion', 'additional'],
+            captureScope: 'query', limit: 1,
+        })
+        expect(retained.nextCursor).toBeTypeOf('string')
+        const capturesBeforeProbe = createCapture.mock.calls.length
+        const cursorsBeforeProbe = createCursor.mock.calls.length
+        const handlesBeforeProbe = (h.service as any).issuedHandles.size
+
+        h.state.activeModules[0].assets[0].storageRevision = 'storage:module-ref:changed'
+        h.state.installedModules[0].assets[0].storageRevision = 'storage:module-ref:changed'
+        await expect(h.service.listContextAssets({
+            moduleScope: 'installed', moduleIds: ['module-active'], captureScope: 'query',
+            captureRevision: expected.captureRevision, limit: 1,
+        })).rejects.toMatchObject({ code: 'CONFLICT', retryable: true })
+
+        expect(createCapture).toHaveBeenCalledTimes(capturesBeforeProbe)
+        expect(createCursor).toHaveBeenCalledTimes(cursorsBeforeProbe)
+        expect((h.service as any).issuedHandles.size).toBe(handlesBeforeProbe)
+        await expect(h.service.listContextAssets({
+            moduleScope: 'none', include: ['portrait', 'emotion', 'additional'],
+            captureScope: 'query', cursor: retained.nextCursor, limit: 1,
+        })).resolves.toMatchObject({ assets: [{ role: 'emotion' }] })
     })
 
     it('clears instance captures and cursors on permission-generation change and dispose', async () => {

@@ -1,6 +1,7 @@
+import { Sha256 } from '@aws-crypto/sha256-js'
 import { PluginApiError } from './errors'
 import { canonicalArgumentsDigest } from './idempotency'
-import { canonicalJson, createRevision } from './revision'
+import { canonicalJson } from './revision'
 import type { Revision } from './contextResources'
 
 export interface QueryCaptureOwner {
@@ -12,6 +13,12 @@ export interface QueryCaptureOwner {
 export interface QueryCaptureRecord<T> {
     captureRevision: Revision
     items: readonly T[]
+}
+
+export interface QueryCapturePreparation {
+    readonly owner: QueryCaptureOwner
+    readonly queryDigest: string
+    readonly lifecycle: readonly (readonly [string, number])[]
 }
 
 interface StoredQueryCapture<T = unknown> extends QueryCaptureRecord<T> {
@@ -65,8 +72,16 @@ function deepFreeze<T>(value: T, seen = new Set<object>()): T {
     return Object.freeze(value)
 }
 
+export function createSynchronousRevision(value: unknown): Revision {
+    const hasher = new Sha256()
+    hasher.update(new TextEncoder().encode(canonicalJson(value)))
+    const digest = hasher.digestSync()
+    return `sha256:${[...digest].map((byte) => byte.toString(16).padStart(2, '0')).join('')}`
+}
+
 export class QueryCaptureCache {
     private readonly records = new Map<string, StoredQueryCapture>()
+    private readonly lifecycleEpochs = new Map<string, number>()
     private readonly now: () => number
     private readonly ttlMs: number
     private readonly maxCapturesPerPrincipal: number
@@ -88,22 +103,38 @@ export class QueryCaptureCache {
     }
 
     async create<T>(owner: QueryCaptureOwner, query: unknown, items: readonly T[]): Promise<QueryCaptureRecord<T>> {
+        const preparation = await this.prepareCreate(owner, query)
+        return this.commitPrepared(preparation, items)
+    }
+
+    async prepareCreate(owner: QueryCaptureOwner, query: unknown): Promise<QueryCapturePreparation> {
+        const lifecycle = this.captureLifecycle(owner)
+        const queryDigest = await canonicalArgumentsDigest(query)
+        if (!this.isLifecycleCurrent(lifecycle)) throw unavailable()
+        return deepFreeze({ owner: { ...owner }, queryDigest, lifecycle })
+    }
+
+    commitPrepared<T>(
+        preparation: QueryCapturePreparation,
+        items: readonly T[],
+    ): QueryCaptureRecord<T> {
         this.removeExpired()
+        if (!this.isLifecycleCurrent(preparation.lifecycle)) throw unavailable()
         if (!Array.isArray(items)) throw new PluginApiError('INVALID_ARGUMENT', 'Context query capture items must be an array')
         assertNoSecretReferences(items)
         const canonicalItems = canonicalJson(items)
         const metadataBytes = new TextEncoder().encode(canonicalItems).byteLength
-        const queryDigest = await canonicalArgumentsDigest(query)
-        const captureRevision = await createRevision({ queryDigest, items })
-        const key = this.key(owner, captureRevision)
+        const captureRevision = createSynchronousRevision({ queryDigest: preparation.queryDigest, items })
+        const key = this.key(preparation.owner, captureRevision)
         const existing = this.records.get(key) as StoredQueryCapture<T> | undefined
         if (existing) {
-            if (existing.queryDigest !== queryDigest) throw mismatch()
+            if (existing.queryDigest !== preparation.queryDigest) throw mismatch()
+            if (!this.isLifecycleCurrent(preparation.lifecycle)) throw unavailable()
             this.touch(key, existing)
             return existing
         }
 
-        const usage = this.principalUsage(owner.principalId)
+        const usage = this.principalUsage(preparation.owner.principalId)
         if (items.length > this.maxItemsPerPrincipal
             || metadataBytes > this.maxMetadataBytesPerPrincipal
             || usage.items + items.length > this.maxItemsPerPrincipal
@@ -112,16 +143,17 @@ export class QueryCaptureCache {
         }
 
         const record = deepFreeze({
-            owner: { ...owner },
-            queryDigest,
+            owner: { ...preparation.owner },
+            queryDigest: preparation.queryDigest,
             captureRevision,
             items: [...items],
             itemCount: items.length,
             metadataBytes,
             expiresAt: this.now() + this.ttlMs,
         }) as StoredQueryCapture<T>
+        if (!this.isLifecycleCurrent(preparation.lifecycle)) throw unavailable()
         this.records.set(key, record)
-        this.evictPrincipalLru(owner.principalId)
+        this.evictPrincipalLru(preparation.owner.principalId)
         return record
     }
 
@@ -130,27 +162,38 @@ export class QueryCaptureCache {
         query: unknown,
         captureRevision: Revision,
     ): Promise<QueryCaptureRecord<T>> {
+        const preparation = await this.prepareCreate(owner, query)
+        return this.readPrepared<T>(preparation, captureRevision)
+    }
+
+    readPrepared<T>(
+        preparation: QueryCapturePreparation,
+        captureRevision: Revision,
+    ): QueryCaptureRecord<T> {
         this.removeExpired()
-        const key = this.key(owner, captureRevision)
+        if (!this.isLifecycleCurrent(preparation.lifecycle)) throw unavailable()
+        const key = this.key(preparation.owner, captureRevision)
         const record = this.records.get(key) as StoredQueryCapture<T> | undefined
         if (!record) throw unavailable()
-        const queryDigest = await canonicalArgumentsDigest(query)
         if (this.records.get(key) !== record || record.expiresAt < this.now()) {
             this.records.delete(key)
             throw unavailable()
         }
-        if (record.queryDigest !== queryDigest) throw mismatch()
+        if (record.queryDigest !== preparation.queryDigest) throw mismatch()
+        if (!this.isLifecycleCurrent(preparation.lifecycle)) throw unavailable()
         this.touch(key, record)
         return record
     }
 
     clearPrincipal(principalId: string) {
+        this.bumpLifecycle(`principal:${principalId}`)
         for (const [key, record] of this.records) {
             if (record.owner.principalId === principalId) this.records.delete(key)
         }
     }
 
     clearInstance(principalId: string, instanceId: string) {
+        this.bumpLifecycle(`instance:${principalId}:${instanceId}`)
         for (const [key, record] of this.records) {
             if (record.owner.principalId === principalId && record.owner.instanceId === instanceId) {
                 this.records.delete(key)
@@ -159,6 +202,7 @@ export class QueryCaptureCache {
     }
 
     clearService(principalId: string, service: string) {
+        this.bumpLifecycle(`service:${principalId}:${service}`)
         for (const [key, record] of this.records) {
             if (record.owner.principalId === principalId && record.owner.service === service) {
                 this.records.delete(key)
@@ -168,6 +212,23 @@ export class QueryCaptureCache {
 
     private key(owner: QueryCaptureOwner, revision: Revision) {
         return JSON.stringify([owner.principalId, owner.service, owner.instanceId, revision])
+    }
+
+    private bumpLifecycle(key: string) {
+        this.lifecycleEpochs.set(key, (this.lifecycleEpochs.get(key) ?? 0) + 1)
+    }
+
+    private captureLifecycle(owner: QueryCaptureOwner) {
+        const keys = [
+            `principal:${owner.principalId}`,
+            `service:${owner.principalId}:${owner.service}`,
+            `instance:${owner.principalId}:${owner.instanceId}`,
+        ]
+        return keys.map((key) => [key, this.lifecycleEpochs.get(key) ?? 0] as const)
+    }
+
+    private isLifecycleCurrent(lifecycle: readonly (readonly [string, number])[]) {
+        return lifecycle.every(([key, epoch]) => (this.lifecycleEpochs.get(key) ?? 0) === epoch)
     }
 
     private touch(key: string, record: StoredQueryCapture) {

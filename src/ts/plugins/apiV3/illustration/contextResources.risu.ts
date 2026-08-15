@@ -10,6 +10,7 @@ import type {
     ContextCharacterSource,
     ContextHostState,
     ContextLoreSnapshot,
+    ContextModuleCollection,
     ContextModuleSource,
     ContextModuleCollectionInput,
     ContextModuleCollectionProbe,
@@ -317,9 +318,10 @@ const mapModule = (
     activatedBy: ModuleActivationReason[],
     ownerRawSlotIndex = -1,
     context?: ProjectionContext,
+    includeAssets = true,
 ): ContextModuleSource | null => {
     if (!nonEmptyString(module?.id) || !nonEmptyString(module?.name)) return null
-    const assets = Array.isArray(module.assets)
+    const assets = includeAssets && Array.isArray(module.assets)
         ? module.assets.flatMap((_entry: unknown, index: number) => {
             const asset = mapModuleAssetAt(module, ownerRawSlotIndex, index, context)
             return asset ? [asset] : []
@@ -353,6 +355,7 @@ export function createRisuContextResourceAdapter(
     dependencies: RisuContextAdapterDependencies,
 ): ContextResourceAdapter {
     const moduleLocators = new WeakMap<ContextModuleSource, ModuleSourceLocator>()
+    const moduleAssetMetadataSources = new WeakSet<ContextModuleSource>()
     const assetLocators = new WeakMap<ContextAssetSource, AssetSourceLocator>()
     const projectionContext: ProjectionContext = {
         getStorageRevision: (storageKey) => dependencies.getAssetStorageRevision?.(storageKey) ?? storageKey,
@@ -439,12 +442,13 @@ export function createRisuContextResourceAdapter(
         locator: ModuleSourceLocator,
         raw: UnknownRecord | undefined,
         activatedBy: ModuleActivationReason[],
+        includeAssetMetadata: boolean,
         signal?: AbortSignal,
     ) => {
         if (!raw || raw.id !== locator.ownerId) throw changed()
         const namespace = nonEmptyString(raw.namespace) ? raw.namespace : undefined
         const description = typeof raw.description === 'string' ? raw.description : ''
-        const currentAssets = Array.isArray(raw.assets)
+        const currentAssets = includeAssetMetadata && Array.isArray(raw.assets)
             ? raw.assets.flatMap((_entry: unknown, index: number) => {
                 assertNotAborted(signal)
                 const current = mapModuleAssetAt(raw, locator.rawSlotIndex, index, projectionContext)
@@ -455,8 +459,8 @@ export function createRisuContextResourceAdapter(
             || namespace !== source.namespace
             || description !== source.description
             || JSON.stringify(activatedBy) !== JSON.stringify(source.activatedBy)
-            || currentAssets.length !== source.assets.length
-            || currentAssets.some((current, index) => !sameSource(current, source.assets[index]))
+            || (includeAssetMetadata && (currentAssets.length !== source.assets.length
+                || currentAssets.some((current, index) => !sameSource(current, source.assets[index]))))
             || (locator.lorebookFingerprint !== undefined
                 && rawLorebookFingerprint(raw) !== locator.lorebookFingerprint)) throw changed()
     }
@@ -487,8 +491,6 @@ export function createRisuContextResourceAdapter(
             const records = currentModuleRecords(probe.input.moduleScope)
                 .filter(({ module }) => probe.input.moduleIds.length === 0
                     || probe.input.moduleIds.includes(module?.id))
-            const found = new Set(records.flatMap(({ module }) => nonEmptyString(module?.id) ? [module.id] : []))
-            if (probe.input.moduleIds.some((moduleId) => !found.has(moduleId))) throw changed()
             for (const { module, rawSlotIndex } of records) {
                 if (!nonEmptyString(module?.id) || !Array.isArray(module.assets)) continue
                 for (let index = 0; index < module.assets.length; index++) {
@@ -498,6 +500,52 @@ export function createRisuContextResourceAdapter(
             }
         }
         return entries
+    }
+
+    const captureModuleSources = (
+        input: ContextModuleCollectionInput,
+        includeAssetMetadata: boolean,
+    ): ContextModuleCollection => {
+        assertNotAborted(input.signal)
+        if (input.scope !== 'active' && input.scope !== 'installed') {
+            throw new PluginApiError('INVALID_ARGUMENT', 'Invalid module scope')
+        }
+        const selectors = selectorsFor(
+            input.characterId,
+            input.conversationId,
+            input.scope === 'installed',
+        )
+        const activeRecords = dependencies.getActiveModulesWithReasons()
+        const activeById = new Map(activeRecords.flatMap(({ module, activatedBy }) =>
+            nonEmptyString(module?.id) ? [[module.id, activatedBy] as const] : []))
+        const records = input.scope === 'installed'
+            ? (dependencies.getDatabase().modules ?? []).map((module, rawSlotIndex) => ({
+                module, activatedBy: activeById.get(module?.id) ?? [], rawSlotIndex,
+            }))
+            : activeRecords.map(({ module, activatedBy }, rawSlotIndex) => ({
+                module, activatedBy, rawSlotIndex,
+            }))
+        const modules = records.flatMap(({ module, activatedBy, rawSlotIndex }) => {
+            assertNotAborted(input.signal)
+            const source = mapModule(
+                module,
+                activatedBy,
+                rawSlotIndex,
+                projectionContext,
+                includeAssetMetadata,
+            )
+            if (!source) return []
+            moduleLocators.set(source, {
+                scope: input.scope,
+                ownerId: source.id,
+                rawSlotIndex,
+                lorebookFingerprint: rawLorebookFingerprint(module),
+            })
+            if (includeAssetMetadata) moduleAssetMetadataSources.add(source)
+            return [source]
+        })
+        assertNotAborted(input.signal)
+        return { selectors, modules }
     }
 
     return {
@@ -561,39 +609,13 @@ export function createRisuContextResourceAdapter(
             }
         },
         async captureModuleSources(input: ContextModuleCollectionInput) {
-            assertNotAborted(input.signal)
-            if (input.scope !== 'active' && input.scope !== 'installed') {
-                throw new PluginApiError('INVALID_ARGUMENT', 'Invalid module scope')
-            }
-            const selectors = selectorsFor(
-                input.characterId,
-                input.conversationId,
-                input.scope === 'installed',
-            )
-            const activeRecords = dependencies.getActiveModulesWithReasons()
-            const activeById = new Map(activeRecords.flatMap(({ module, activatedBy }) =>
-                nonEmptyString(module?.id) ? [[module.id, activatedBy] as const] : []))
-            const records = input.scope === 'installed'
-                ? (dependencies.getDatabase().modules ?? []).map((module, rawSlotIndex) => ({
-                    module, activatedBy: activeById.get(module?.id) ?? [], rawSlotIndex,
-                }))
-                : activeRecords.map(({ module, activatedBy }, rawSlotIndex) => ({
-                    module, activatedBy, rawSlotIndex,
-                }))
-            const modules = records.flatMap(({ module, activatedBy, rawSlotIndex }) => {
-                assertNotAborted(input.signal)
-                const source = mapModule(module, activatedBy, rawSlotIndex, projectionContext)
-                if (!source) return []
-                moduleLocators.set(source, {
-                    scope: input.scope,
-                    ownerId: source.id,
-                    rawSlotIndex,
-                    lorebookFingerprint: rawLorebookFingerprint(module),
-                })
-                return [source]
-            })
-            assertNotAborted(input.signal)
-            return { selectors, modules }
+            return captureModuleSources(input, true)
+        },
+        captureModuleSourcesSynchronously(
+            input: ContextModuleCollectionInput,
+            options: { includeAssetMetadata: boolean },
+        ) {
+            return captureModuleSources(input, options.includeAssetMetadata)
         },
         async revalidateModuleSource(probe: ContextModuleSourceProbe) {
             assertNotAborted(probe.input.signal)
@@ -615,7 +637,14 @@ export function createRisuContextResourceAdapter(
                 raw = record?.module
                 activatedBy = record?.activatedBy ?? []
             }
-            revalidateModuleRecord(probe.source, locator, raw, activatedBy, probe.input.signal)
+            revalidateModuleRecord(
+                probe.source,
+                locator,
+                raw,
+                activatedBy,
+                moduleAssetMetadataSources.has(probe.source),
+                probe.input.signal,
+            )
             assertNotAborted(probe.input.signal)
             return probe.source
         },
@@ -639,9 +668,6 @@ export function createRisuContextResourceAdapter(
                     || locator.scope !== probe.input.scope
                     || locator.ownerId !== source.id
                     || locator.rawSlotIndex !== record.rawSlotIndex) throw changed()
-                revalidateModuleRecord(
-                    source, locator, record.module, record.activatedBy, probe.input.signal,
-                )
             }
             assertNotAborted(probe.input.signal)
         },
@@ -695,12 +721,6 @@ export function createRisuContextResourceAdapter(
                         input.moduleIds.length === 0 || input.moduleIds.includes(module?.id)
                             ? [{ module, activatedBy, rawSlotIndex }] : [],
                 )
-            }
-            if (input.moduleIds.length > 0) {
-                const found = new Set(moduleRecords.flatMap(({ module }) => nonEmptyString(module?.id) ? [module.id] : []))
-                if (input.moduleIds.some((moduleId) => !found.has(moduleId))) {
-                    throw new PluginApiError('INVALID_ARGUMENT', 'Unknown module ID in context asset filter')
-                }
             }
             const modules = moduleRecords.flatMap(({ module, activatedBy, rawSlotIndex }) => {
                 assertNotAborted(input.signal)

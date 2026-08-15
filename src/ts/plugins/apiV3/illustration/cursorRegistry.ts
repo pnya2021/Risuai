@@ -10,6 +10,14 @@ interface CursorRecord<T = unknown> {
     expiresAt: number
 }
 
+export interface CursorPreparation {
+    readonly principalId: string
+    readonly service: string
+    readonly instanceId: string
+    readonly queryDigest: string
+    readonly lifecycle: readonly (readonly [string, number])[]
+}
+
 export class CursorRegistry {
     private records = new Map<string, CursorRecord>()
     private ttlMs: number
@@ -31,20 +39,44 @@ export class CursorRegistry {
     }
 
     async create<T>(principalId: string, service: string, instanceId: string, query: unknown, value: T) {
+        const preparation = await this.prepareCreate(principalId, service, instanceId, query)
+        return this.commitPrepared(preparation, value)
+    }
+
+    async prepareCreate(
+        principalId: string,
+        service: string,
+        instanceId: string,
+        query: unknown,
+    ): Promise<CursorPreparation> {
         const lifecycle = this.captureLifecycle(principalId, service, instanceId)
         const queryDigest = await this.digest(query)
         if (!this.isLifecycleCurrent(lifecycle)) {
             throw new PluginApiError('ABORTED', 'Plugin cursor owner is no longer active')
         }
+        return { principalId, service, instanceId, queryDigest, lifecycle }
+    }
+
+    commitPrepared<T>(preparation: CursorPreparation, value: T) {
+        if (!this.isLifecycleCurrent(preparation.lifecycle)) {
+            throw new PluginApiError('ABORTED', 'Plugin cursor owner is no longer active')
+        }
         this.removeExpired()
-        if (this.activeCount(principalId) >= this.maxPerPrincipal) {
+        if (this.activeCount(preparation.principalId) >= this.maxPerPrincipal) {
             throw new PluginApiError('RESOURCE_LIMIT', 'Too many active cursors', { retryable: true })
         }
         let cursor: string
         do cursor = `${crypto.randomUUID()}.${crypto.randomUUID()}`
         while (this.records.has(cursor))
+        if (!this.isLifecycleCurrent(preparation.lifecycle)) {
+            throw new PluginApiError('ABORTED', 'Plugin cursor owner is no longer active')
+        }
         this.records.set(cursor, {
-            principalId, service, instanceId, queryDigest, value,
+            principalId: preparation.principalId,
+            service: preparation.service,
+            instanceId: preparation.instanceId,
+            queryDigest: preparation.queryDigest,
+            value,
             expiresAt: this.now() + this.ttlMs,
         })
         return cursor

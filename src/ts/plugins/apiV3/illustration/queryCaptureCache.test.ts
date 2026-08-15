@@ -1,5 +1,7 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
+import * as queryCaptureCacheExports from './queryCaptureCache'
 import { QueryCaptureCache, type QueryCaptureOwner } from './queryCaptureCache'
+import { createRevision } from './revision'
 
 const owner = (overrides: Partial<QueryCaptureOwner> = {}): QueryCaptureOwner => ({
     principalId: '11111111-1111-4111-8111-111111111111',
@@ -8,7 +10,79 @@ const owner = (overrides: Partial<QueryCaptureOwner> = {}): QueryCaptureOwner =>
     ...overrides,
 })
 
+const deferred = <T>() => {
+    let resolve!: (value: T) => void
+    const promise = new Promise<T>((resolvePromise) => { resolve = resolvePromise })
+    return { promise, resolve }
+}
+
 describe('query capture cache', () => {
+    it('produces byte-exact synchronous revisions matching the canonical async revision', async () => {
+        const synchronousRevision = (queryCaptureCacheExports as {
+            createSynchronousRevision?: (value: unknown) => string
+        }).createSynchronousRevision
+        expect(synchronousRevision).toBeTypeOf('function')
+        if (!synchronousRevision) return
+
+        const fixture = {
+            unicode: '한국어 🌿',
+            nested: [{ zero: -0, enabled: true }, { value: null }],
+            order: { second: 2, first: 1 },
+        }
+        expect(synchronousRevision(fixture)).toBe(await createRevision(fixture))
+    })
+
+    it('prepares query hashing before a synchronous lifecycle-bound capture commit', async () => {
+        const cache = new QueryCaptureCache()
+        const preparedApi = cache as unknown as {
+            prepareCreate?: (owner: QueryCaptureOwner, query: unknown) => Promise<unknown>
+            commitPrepared?: <T>(preparation: unknown, items: readonly T[]) => {
+                captureRevision: string
+                items: readonly T[]
+            }
+        }
+        expect(preparedApi.prepareCreate).toBeTypeOf('function')
+        expect(preparedApi.commitPrepared).toBeTypeOf('function')
+        if (!preparedApi.prepareCreate || !preparedApi.commitPrepared) return
+
+        const query = { scope: 'installed', selectors: ['char-1', 'conversation-1'] }
+        const items = [{ id: 'module-a', nested: { count: 1 } }]
+        const preparation = await preparedApi.prepareCreate(owner(), query)
+        const committed = preparedApi.commitPrepared(preparation, items)
+        const reference = await new QueryCaptureCache().create(owner(), query, items)
+        expect(committed).not.toBeInstanceOf(Promise)
+        expect(committed.captureRevision).toBe(reference.captureRevision)
+        expect(committed.items).toEqual(reference.items)
+
+        const stale = await preparedApi.prepareCreate(owner(), { stale: true })
+        cache.clearInstance(owner().principalId, owner().instanceId)
+        expect(() => preparedApi.commitPrepared!(stale, [{ id: 'stale' }]))
+            .toThrowError(expect.objectContaining({ code: 'CONFLICT', retryable: true }))
+    })
+
+    it('does not commit a capture after its instance is cleared while query hashing is pending', async () => {
+        const cache = new QueryCaptureCache()
+        const digestGate = deferred<void>()
+        const originalDigest = crypto.subtle.digest.bind(crypto.subtle)
+        let digestCalls = 0
+        const digestSpy = vi.spyOn(crypto.subtle, 'digest').mockImplementation(async (algorithm, data) => {
+            digestCalls += 1
+            if (digestCalls === 1) await digestGate.promise
+            return originalDigest(algorithm, data)
+        })
+        try {
+            const pending = cache.create(owner(), { delayed: true }, [{ id: 'late' }])
+            await vi.waitFor(() => expect(digestCalls).toBe(1))
+            cache.clearInstance(owner().principalId, owner().instanceId)
+            digestGate.resolve()
+
+            await expect(pending).rejects.toMatchObject({ code: 'CONFLICT', retryable: true })
+        } finally {
+            digestGate.resolve()
+            digestSpy.mockRestore()
+        }
+    })
+
     it('binds deterministic captures to the principal, service, instance, and complete query', async () => {
         const cache = new QueryCaptureCache()
         const query = { scope: 'installed', selectors: { characterId: 'char-1', conversationId: 'chat-1' } }
