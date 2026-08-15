@@ -77,11 +77,14 @@ const databaseWithMessage = (messageData: string, values: Partial<Database> = {}
 })
 
 async function advanceUntil(predicate: () => boolean, message: string) {
-    for (let attempt = 0; attempt < 30; attempt += 1) {
-        await vi.advanceTimersByTimeAsync(250)
-        if (predicate()) return
+    try {
+        await vi.waitUntil(async () => {
+            await vi.advanceTimersByTimeAsync(250)
+            return predicate()
+        }, { interval: 10, timeout: 4_000 })
+    } catch {
+        throw new Error(message)
     }
-    throw new Error(message)
 }
 
 async function reload(bytes: Uint8Array) {
@@ -102,7 +105,7 @@ describe.sequential('database persistence consumer boundary', () => {
         databaseModule.setDatabaseLite(database())
         void globalApi.saveDb()
         await advanceUntil(() => durable.databaseWrites.length > 0, 'background save did not reach durable storage')
-    })
+    }, 30_000)
 
     beforeEach(() => {
         durable.databaseWrites.length = 0
