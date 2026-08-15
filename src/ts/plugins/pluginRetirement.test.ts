@@ -1,11 +1,13 @@
 import { describe, expect, it } from 'vitest'
 import { ContextAssetReadCoordinator } from './apiV3/illustration/contextAssetReadCoordinator'
+import { CursorRegistry } from './apiV3/illustration/cursorRegistry'
+import { QueryCaptureCache } from './apiV3/illustration/queryCaptureCache'
 import {
     ContextResourceService,
     type ContextHostState,
 } from './apiV3/illustration/contextResources'
 import { PluginDataLifecycleRegistry } from './pluginDataLifecycle'
-import { retirePluginPrincipals } from './pluginRetirement'
+import { retirePluginPrincipal, retirePluginPrincipals } from './pluginRetirement'
 
 const deferred = <T>() => {
     let resolve!: (value: T) => void
@@ -14,6 +16,51 @@ const deferred = <T>() => {
 }
 
 describe('production principal retirement', () => {
+    it('clears query captures and cursors synchronously before awaiting lifecycle retirement', async () => {
+        const principalId = 'principal-with-catalogue-state'
+        const instanceId = 'instance-with-catalogue-state'
+        const cache = new QueryCaptureCache()
+        const cursors = new CursorRegistry()
+        const query = { kind: 'captured-catalogue' }
+        const capture = await cache.create(
+            { principalId, instanceId, service: 'context-modules' },
+            query,
+            [{ id: 'module' }],
+        )
+        const cursor = await cursors.create(
+            principalId, 'context-modules', instanceId, query, { offset: 1, captureRevision: capture.captureRevision },
+        )
+        const registry = new PluginDataLifecycleRegistry()
+        const gate = deferred<void>()
+        let lifecycleEntered = false
+        registry.register('summary', 'summarize', async () => {
+            lifecycleEntered = true
+            await gate.promise
+        })
+
+        const retirement = retirePluginPrincipal(
+            principalId,
+            { invalidate: () => undefined },
+            registry,
+            { retirePrincipal: () => undefined },
+            {
+                clearPrincipal(retiringPrincipal: string) {
+                    cache.clearPrincipal(retiringPrincipal)
+                    cursors.clearPrincipal(retiringPrincipal)
+                },
+            },
+        )
+        await expect.poll(() => lifecycleEntered).toBe(true)
+        await expect(cache.read(
+            { principalId, instanceId, service: 'context-modules' }, query, capture.captureRevision,
+        )).rejects.toMatchObject({ code: 'CONFLICT' })
+        await expect(cursors.read(cursor, principalId, 'context-modules', instanceId, query))
+            .rejects.toMatchObject({ code: 'INVALID_ARGUMENT' })
+
+        gate.resolve()
+        await retirement
+    })
+
     for (const source of ['manual update', 'programmatic replacement', 'live database replacement']) {
         it(`${source} stops plugin code only after permission/data purge and quarantine`, async () => {
             const registry = new PluginDataLifecycleRegistry()

@@ -1,8 +1,21 @@
 import { pluginDataLifecycle, type PluginDataLifecycleRegistry } from './pluginDataLifecycle'
 import { contextAssetReadCoordinator } from './apiV3/illustration/contextAssetReadCoordinator'
+import { illustrationCursorRegistry } from './apiV3/illustration/cursorRegistry'
+import { illustrationQueryCaptureCache } from './apiV3/illustration/queryCaptureCache'
 
 export interface PrincipalReadRetirer {
     retirePrincipal(principalId: string): void
+}
+
+export interface PrincipalCatalogueRetirer {
+    clearPrincipal(principalId: string): void
+}
+
+const contextCatalogueRetirer: PrincipalCatalogueRetirer = {
+    clearPrincipal(principalId) {
+        illustrationQueryCaptureCache.clearPrincipal(principalId)
+        illustrationCursorRegistry.clearPrincipal(principalId)
+    },
 }
 
 export interface PluginPrincipalRetirementOptions {
@@ -16,10 +29,11 @@ export function retirePluginPrincipal(
     options: PluginPrincipalRetirementOptions,
     registry: PluginDataLifecycleRegistry = pluginDataLifecycle,
     readRetirer: PrincipalReadRetirer = contextAssetReadCoordinator,
+    catalogueRetirer: PrincipalCatalogueRetirer = contextCatalogueRetirer,
 ) {
-    const retirement = registry.retirePrincipal(principalId, options)
+    catalogueRetirer.clearPrincipal(principalId)
     readRetirer.retirePrincipal(principalId)
-    return retirement
+    return registry.retirePrincipal(principalId, options)
 }
 
 export async function retirePluginPrincipals(
@@ -27,10 +41,11 @@ export async function retirePluginPrincipals(
     invalidate: (principalId: string) => void | Promise<void>,
     registry: PluginDataLifecycleRegistry = pluginDataLifecycle,
     readRetirer: PrincipalReadRetirer = contextAssetReadCoordinator,
+    catalogueRetirer: PrincipalCatalogueRetirer = contextCatalogueRetirer,
 ) {
     for (const principalId of principalIds) {
         await retirePluginPrincipal(principalId, {
             invalidate: () => invalidate(principalId),
-        }, registry, readRetirer)
+        }, registry, readRetirer, catalogueRetirer)
     }
 }

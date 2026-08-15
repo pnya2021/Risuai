@@ -4,15 +4,40 @@ import type {
     BoundedThumbnailResult,
     CharacterTextSection,
     ContextAssetSource,
+    ContextAssetCollectionInput,
+    ContextAssetSourceProbe,
     ContextCharacterSource,
     ContextHostState,
     ContextLoreSnapshot,
     ContextModuleSource,
+    ContextModuleCollectionInput,
+    ContextModuleSourceProbe,
     ContextResourceAdapter,
 } from './contextResources'
 import type { ModuleActivationReason } from './moduleActivation'
 
 type UnknownRecord = Record<string, any>
+
+interface ModuleSourceLocator {
+    scope: 'active' | 'installed'
+    ownerId: string
+    rawSlotIndex: number
+}
+
+interface AssetSourceLocator {
+    ownerKind: 'character' | 'module'
+    ownerId: string
+    ownerRawSlotIndex: number
+    rawCollection: 'image' | 'emotionImages' | 'additionalAssets' | 'ccAssets' | 'assets'
+    rawSlotIndex: number
+    storageKey: string
+    storageRevision: string
+}
+
+interface ProjectionContext {
+    getStorageRevision(storageKey: string): string
+    attachAsset(source: ContextAssetSource, locator: Omit<AssetSourceLocator, 'storageKey' | 'storageRevision'>): void
+}
 
 export interface RisuContextAdapterDependencies {
     getDatabase(): { characters?: UnknownRecord[]; modules?: UnknownRecord[] }
@@ -100,6 +125,7 @@ const makeAsset = (
     storageKey: string,
     name: string,
     explicitExtension?: string,
+    storageRevision = storageKey,
 ): ContextAssetSource | null => {
     if (!isCanonicalLocalAssetStorageKey(storageKey)) return null
     const declaredExtension = explicitExtension?.replace(/^\./, '').toLowerCase()
@@ -108,7 +134,7 @@ const makeAsset = (
     return {
         identity: `${ownerKind}:${ownerId}:${storageKey}`,
         storageKey,
-        storageRevision: storageKey,
+        storageRevision,
         name,
         ...(extension ? { extension } : {}),
         ...(mediaTypeOf(extension) ? { mediaType: mediaTypeOf(extension) } : {}),
@@ -116,18 +142,40 @@ const makeAsset = (
     }
 }
 
-const mapCharacterAssets = (character: UnknownRecord, id: string): ContextAssetSource[] => {
+const mapCharacterAssets = (
+    character: UnknownRecord,
+    id: string,
+    ownerRawSlotIndex = -1,
+    context?: ProjectionContext,
+): ContextAssetSource[] => {
     const assets: ContextAssetSource[] = []
+    const retain = (
+        asset: ContextAssetSource | null,
+        rawCollection: AssetSourceLocator['rawCollection'],
+        rawSlotIndex: number,
+    ) => {
+        if (!asset) return
+        context?.attachAsset(asset, {
+            ownerKind: 'character', ownerId: id, ownerRawSlotIndex, rawCollection, rawSlotIndex,
+        })
+        assets.push(asset)
+    }
     if (nonEmptyString(character.image)) {
-        const asset = makeAsset('character', id, 'portrait', character.image, `${character.name || id}.${extensionOf(character.image) || 'png'}`)
-        if (asset) assets.push(asset)
+        retain(makeAsset(
+            'character', id, 'portrait', character.image,
+            `${character.name || id}.${extensionOf(character.image) || 'png'}`,
+            undefined,
+            context?.getStorageRevision(character.image),
+        ), 'image', 0)
     }
     if (Array.isArray(character.emotionImages)) {
         character.emotionImages.forEach((entry: unknown, index: number) => {
             if (!Array.isArray(entry) || !nonEmptyString(entry[1])) return
             const name = nonEmptyString(entry[0]) ? entry[0] : `emotion-${index}`
-            const asset = makeAsset('character', id, 'emotion', entry[1], `${name}.${extensionOf(entry[1]) || 'png'}`)
-            if (asset) assets.push(asset)
+            retain(makeAsset(
+                'character', id, 'emotion', entry[1], `${name}.${extensionOf(entry[1]) || 'png'}`,
+                undefined, context?.getStorageRevision(entry[1]),
+            ), 'emotionImages', index)
         })
     }
     if (Array.isArray(character.additionalAssets)) {
@@ -135,8 +183,10 @@ const mapCharacterAssets = (character: UnknownRecord, id: string): ContextAssetS
             if (!Array.isArray(entry) || !nonEmptyString(entry[1])) return
             const name = nonEmptyString(entry[0]) ? entry[0] : `additional-${index}`
             const extension = nonEmptyString(entry[2]) ? entry[2] : undefined
-            const asset = makeAsset('character', id, 'additional', entry[1], name, extension)
-            if (asset) assets.push(asset)
+            retain(makeAsset(
+                'character', id, 'additional', entry[1], name, extension,
+                context?.getStorageRevision(entry[1]),
+            ), 'additionalAssets', index)
         })
     }
     if (Array.isArray(character.ccAssets)) {
@@ -144,14 +194,85 @@ const mapCharacterAssets = (character: UnknownRecord, id: string): ContextAssetS
             if (!nonEmptyString(entry?.uri)) return
             const name = nonEmptyString(entry?.name) ? entry.name : `card-asset-${index}`
             const extension = nonEmptyString(entry?.ext) ? entry.ext : extensionOf(entry.uri)
-            const asset = makeAsset('character', id, 'additional', entry.uri, name, extension)
-            if (asset) assets.push(asset)
+            retain(makeAsset(
+                'character', id, 'additional', entry.uri, name, extension,
+                context?.getStorageRevision(entry.uri),
+            ), 'ccAssets', index)
         })
     }
     return assets
 }
 
-const mapCharacter = (character: UnknownRecord): ContextCharacterSource | null => {
+const mapCharacterAssetAt = (
+    character: UnknownRecord,
+    locator: AssetSourceLocator,
+    context?: ProjectionContext,
+) => {
+    const id = character.chaId
+    if (!nonEmptyString(id)) return null
+    const attach = (asset: ContextAssetSource | null) => {
+        if (asset) context?.attachAsset(asset, {
+            ownerKind: locator.ownerKind,
+            ownerId: locator.ownerId,
+            ownerRawSlotIndex: locator.ownerRawSlotIndex,
+            rawCollection: locator.rawCollection,
+            rawSlotIndex: locator.rawSlotIndex,
+        })
+        return asset
+    }
+    switch (locator.rawCollection) {
+        case 'image': {
+            if (!nonEmptyString(character.image)) return null
+            const asset = makeAsset(
+                'character', id, 'portrait', character.image,
+                `${character.name || id}.${extensionOf(character.image) || 'png'}`,
+                undefined, context?.getStorageRevision(character.image),
+            )
+            return attach(asset)
+        }
+        case 'emotionImages': {
+            const entry = Array.isArray(character.emotionImages)
+                ? character.emotionImages[locator.rawSlotIndex] : undefined
+            if (!Array.isArray(entry) || !nonEmptyString(entry[1])) return null
+            const name = nonEmptyString(entry[0]) ? entry[0] : `emotion-${locator.rawSlotIndex}`
+            const asset = makeAsset(
+                'character', id, 'emotion', entry[1], `${name}.${extensionOf(entry[1]) || 'png'}`,
+                undefined, context?.getStorageRevision(entry[1]),
+            )
+            return attach(asset)
+        }
+        case 'additionalAssets': {
+            const entry = Array.isArray(character.additionalAssets)
+                ? character.additionalAssets[locator.rawSlotIndex] : undefined
+            if (!Array.isArray(entry) || !nonEmptyString(entry[1])) return null
+            const name = nonEmptyString(entry[0]) ? entry[0] : `additional-${locator.rawSlotIndex}`
+            const extension = nonEmptyString(entry[2]) ? entry[2] : undefined
+            const asset = makeAsset(
+                'character', id, 'additional', entry[1], name, extension,
+                context?.getStorageRevision(entry[1]),
+            )
+            return attach(asset)
+        }
+        case 'ccAssets': {
+            const entry = Array.isArray(character.ccAssets) ? character.ccAssets[locator.rawSlotIndex] : undefined
+            if (!entry || !nonEmptyString(entry.uri)) return null
+            const name = nonEmptyString(entry.name) ? entry.name : `card-asset-${locator.rawSlotIndex}`
+            const extension = nonEmptyString(entry.ext) ? entry.ext : extensionOf(entry.uri)
+            const asset = makeAsset(
+                'character', id, 'additional', entry.uri, name, extension,
+                context?.getStorageRevision(entry.uri),
+            )
+            return attach(asset)
+        }
+        default: return null
+    }
+}
+
+const mapCharacter = (
+    character: UnknownRecord,
+    ownerRawSlotIndex = -1,
+    context?: ProjectionContext,
+): ContextCharacterSource | null => {
     if (!nonEmptyString(character?.chaId) || !nonEmptyString(character?.name)) return null
     const type = character.type === 'group' ? 'group' : 'character'
     return {
@@ -163,21 +284,41 @@ const mapCharacter = (character: UnknownRecord): ContextCharacterSource | null =
         ...(type === 'group' && Array.isArray(character.characters)
             ? { groupMemberIds: character.characters.filter(nonEmptyString) }
             : {}),
-        assets: mapCharacterAssets(character, character.chaId),
+        assets: mapCharacterAssets(character, character.chaId, ownerRawSlotIndex, context),
     }
+}
+
+const mapModuleAssetAt = (
+    module: UnknownRecord,
+    ownerRawSlotIndex: number,
+    rawSlotIndex: number,
+    context?: ProjectionContext,
+) => {
+    const entry = Array.isArray(module.assets) ? module.assets[rawSlotIndex] : undefined
+    if (!Array.isArray(entry) || !nonEmptyString(entry[1]) || !nonEmptyString(module.id)) return null
+    const name = nonEmptyString(entry[0]) ? entry[0] : `module-asset-${rawSlotIndex}`
+    const extension = nonEmptyString(entry[2]) ? entry[2] : undefined
+    const asset = makeAsset(
+        'module', module.id, 'module', entry[1], name, extension,
+        context?.getStorageRevision(entry[1]),
+    )
+    if (asset) context?.attachAsset(asset, {
+        ownerKind: 'module', ownerId: module.id, ownerRawSlotIndex,
+        rawCollection: 'assets', rawSlotIndex,
+    })
+    return asset
 }
 
 const mapModule = (
     module: UnknownRecord,
     activatedBy: ModuleActivationReason[],
+    ownerRawSlotIndex = -1,
+    context?: ProjectionContext,
 ): ContextModuleSource | null => {
     if (!nonEmptyString(module?.id) || !nonEmptyString(module?.name)) return null
     const assets = Array.isArray(module.assets)
-        ? module.assets.flatMap((entry: unknown, index: number) => {
-            if (!Array.isArray(entry) || !nonEmptyString(entry[1])) return []
-            const name = nonEmptyString(entry[0]) ? entry[0] : `module-asset-${index}`
-            const extension = nonEmptyString(entry[2]) ? entry[2] : undefined
-            const asset = makeAsset('module', module.id, 'module', entry[1], name, extension)
+        ? module.assets.flatMap((_entry: unknown, index: number) => {
+            const asset = mapModuleAssetAt(module, ownerRawSlotIndex, index, context)
             return asset ? [asset] : []
         })
         : []
@@ -208,6 +349,55 @@ const assertNotAborted = (signal?: AbortSignal) => {
 export function createRisuContextResourceAdapter(
     dependencies: RisuContextAdapterDependencies,
 ): ContextResourceAdapter {
+    const moduleLocators = new WeakMap<ContextModuleSource, ModuleSourceLocator>()
+    const assetLocators = new WeakMap<ContextAssetSource, AssetSourceLocator>()
+    const projectionContext: ProjectionContext = {
+        getStorageRevision: (storageKey) => dependencies.getAssetStorageRevision?.(storageKey) ?? storageKey,
+        attachAsset(source, locator) {
+            assetLocators.set(source, {
+                ...locator,
+                storageKey: source.storageKey,
+                storageRevision: source.storageRevision ?? source.storageKey,
+            })
+        },
+    }
+    const changed = () => new PluginApiError(
+        'CONFLICT', 'Current context changed while the operation was running', { retryable: true },
+    )
+    const selectorsFor = (
+        characterId: string | undefined,
+        conversationId: string | undefined,
+        allowMissing: boolean,
+    ) => {
+        const currentCharacter = dependencies.getCurrentCharacter()
+        const currentChat = dependencies.getCurrentChat()
+        if (!currentCharacter || !currentChat) {
+            if (allowMissing && characterId === undefined && conversationId === undefined) {
+                return { characterId: null, conversationId: null }
+            }
+            throw new PluginApiError('NOT_FOUND', 'No current character or conversation')
+        }
+        if (!nonEmptyString(currentCharacter.chaId) || !nonEmptyString(currentChat.id)) {
+            throw new PluginApiError('INTERNAL', 'Current context IDs were not normalized during database load')
+        }
+        const authorized = new Set([
+            currentCharacter.chaId,
+            ...(currentCharacter.type === 'group' && Array.isArray(currentCharacter.characters)
+                ? currentCharacter.characters.filter(nonEmptyString) : []),
+        ])
+        const selectedCharacterId = characterId ?? currentCharacter.chaId
+        const selectedConversationId = conversationId ?? currentChat.id
+        if (!authorized.has(selectedCharacterId)) {
+            throw new PluginApiError('PERMISSION_DENIED', 'Character is outside the current context')
+        }
+        if (selectedConversationId !== currentChat.id) {
+            throw new PluginApiError('PERMISSION_DENIED', 'Conversation is outside the current context')
+        }
+        return { characterId: selectedCharacterId, conversationId: selectedConversationId }
+    }
+    const sameSource = (left: ContextAssetSource, right: ContextAssetSource) =>
+        JSON.stringify(left) === JSON.stringify(right)
+
     return {
         async getState(): Promise<ContextHostState> {
             const database = dependencies.getDatabase()
@@ -236,36 +426,196 @@ export function createRisuContextResourceAdapter(
             }
 
             const characters = (database.characters ?? [])
-                .map(mapCharacter)
+                .map((character, index) => mapCharacter(character, index, projectionContext))
                 .filter((value): value is ContextCharacterSource => value !== null)
             if (currentCharacter && current && !characters.some((character) => character.id === current.characterId)) {
-                const projected = mapCharacter(currentCharacter)
+                const projected = mapCharacter(currentCharacter, -1, projectionContext)
                 if (projected) characters.unshift(projected)
             }
 
             const activeRecords = dependencies.getActiveModulesWithReasons()
             const activeModules = activeRecords
-                .map(({ module, activatedBy }) => mapModule(module, activatedBy))
+                .map(({ module, activatedBy }, index) => mapModule(module, activatedBy, index, projectionContext))
                 .filter((value): value is ContextModuleSource => value !== null)
             const activeById = new Map(activeModules.map((module) => [module.id, module.activatedBy]))
             const installedModules = (database.modules ?? [])
-                .map((module) => mapModule(module, activeById.get(module.id) ?? []))
+                .map((module, index) => mapModule(module, activeById.get(module.id) ?? [], index, projectionContext))
                 .filter((value): value is ContextModuleSource => value !== null)
-            if (dependencies.getAssetStorageRevision) {
-                for (const asset of [
-                    ...characters.flatMap((character) => character.assets),
-                    ...activeModules.flatMap((module) => module.assets),
-                    ...installedModules.flatMap((module) => module.assets),
-                ]) {
-                    asset.storageRevision = dependencies.getAssetStorageRevision(asset.storageKey)
-                }
-            }
             return {
                 ...(current ? { current } : {}),
                 characters,
                 activeModules,
                 installedModules,
             }
+        },
+        async captureModuleSources(input: ContextModuleCollectionInput) {
+            assertNotAborted(input.signal)
+            if (input.scope !== 'active' && input.scope !== 'installed') {
+                throw new PluginApiError('INVALID_ARGUMENT', 'Invalid module scope')
+            }
+            const selectors = selectorsFor(
+                input.characterId,
+                input.conversationId,
+                input.scope === 'installed',
+            )
+            const activeRecords = dependencies.getActiveModulesWithReasons()
+            const activeById = new Map(activeRecords.flatMap(({ module, activatedBy }) =>
+                nonEmptyString(module?.id) ? [[module.id, activatedBy] as const] : []))
+            const records = input.scope === 'installed'
+                ? (dependencies.getDatabase().modules ?? []).map((module, rawSlotIndex) => ({
+                    module, activatedBy: activeById.get(module?.id) ?? [], rawSlotIndex,
+                }))
+                : activeRecords.map(({ module, activatedBy }, rawSlotIndex) => ({
+                    module, activatedBy, rawSlotIndex,
+                }))
+            const modules = records.flatMap(({ module, activatedBy, rawSlotIndex }) => {
+                assertNotAborted(input.signal)
+                const source = mapModule(module, activatedBy, rawSlotIndex, projectionContext)
+                if (!source) return []
+                moduleLocators.set(source, { scope: input.scope, ownerId: source.id, rawSlotIndex })
+                return [source]
+            })
+            assertNotAborted(input.signal)
+            return { selectors, modules }
+        },
+        async revalidateModuleSource(probe: ContextModuleSourceProbe) {
+            assertNotAborted(probe.input.signal)
+            const locator = moduleLocators.get(probe.source)
+            if (!locator || locator.scope !== probe.input.scope || locator.ownerId !== probe.source.id) throw changed()
+            selectorsFor(
+                probe.input.characterId,
+                probe.input.conversationId,
+                probe.input.scope === 'installed',
+            )
+            const activeRecords = dependencies.getActiveModulesWithReasons()
+            let raw: UnknownRecord | undefined
+            let activatedBy: ModuleActivationReason[] = []
+            if (locator.scope === 'installed') {
+                raw = dependencies.getDatabase().modules?.[locator.rawSlotIndex]
+                activatedBy = activeRecords.find(({ module }) => module?.id === locator.ownerId)?.activatedBy ?? []
+            } else {
+                const record = activeRecords[locator.rawSlotIndex]
+                raw = record?.module
+                activatedBy = record?.activatedBy ?? []
+            }
+            if (!raw || raw.id !== locator.ownerId) throw changed()
+            const current = mapModule(raw, activatedBy, locator.rawSlotIndex, projectionContext)
+            if (!current || JSON.stringify(current) !== JSON.stringify(probe.source)) throw changed()
+            moduleLocators.set(current, locator)
+            assertNotAborted(probe.input.signal)
+            return current
+        },
+        async captureAssetSources(input: ContextAssetCollectionInput) {
+            assertNotAborted(input.signal)
+            if (!Array.isArray(input.characterIds)) {
+                throw new PluginApiError('INVALID_ARGUMENT', 'Character IDs must be an array')
+            }
+            const defaultCharacterId = dependencies.getCurrentCharacter()?.chaId
+            const characterIds = input.characterIds.length > 0
+                ? [...input.characterIds]
+                : nonEmptyString(defaultCharacterId) ? [defaultCharacterId] : []
+            for (const characterId of characterIds) {
+                selectorsFor(characterId, input.conversationId || undefined, false)
+            }
+            const selectors = selectorsFor(characterIds[0], input.conversationId || undefined, false) as {
+                characterId: string
+                conversationId: string
+            }
+            const database = dependencies.getDatabase()
+            const includeCharacterAssets = input.include.some((role) => role !== 'module')
+            const characters = (includeCharacterAssets ? characterIds : []).flatMap((characterId) => {
+                let rawSlotIndex = (database.characters ?? []).findIndex((character) => character?.chaId === characterId)
+                const raw = rawSlotIndex >= 0
+                    ? database.characters![rawSlotIndex]
+                    : dependencies.getCurrentCharacter()?.chaId === characterId
+                        ? dependencies.getCurrentCharacter() : undefined
+                if (!raw) throw new PluginApiError('NOT_FOUND', 'Character was not found')
+                const projected = mapCharacter(raw, rawSlotIndex, projectionContext)
+                if (!projected) throw new PluginApiError('NOT_FOUND', 'Character was not found')
+                return projected.assets.map((source) => ({
+                    source,
+                    origin: { kind: 'character' as const, characterId },
+                }))
+            })
+            let moduleRecords: Array<{
+                module: UnknownRecord
+                activatedBy: ModuleActivationReason[]
+                rawSlotIndex: number
+            }> = []
+            if (input.moduleScope === 'installed') {
+                const activeById = new Map(dependencies.getActiveModulesWithReasons().flatMap(({ module, activatedBy }) =>
+                    nonEmptyString(module?.id) ? [[module.id, activatedBy] as const] : []))
+                moduleRecords = (database.modules ?? []).flatMap((module, rawSlotIndex) =>
+                    input.moduleIds.length === 0 || input.moduleIds.includes(module?.id)
+                        ? [{ module, activatedBy: activeById.get(module?.id) ?? [], rawSlotIndex }]
+                        : [])
+            } else if (input.moduleScope === 'active') {
+                moduleRecords = dependencies.getActiveModulesWithReasons().flatMap(
+                    ({ module, activatedBy }, rawSlotIndex) =>
+                        input.moduleIds.length === 0 || input.moduleIds.includes(module?.id)
+                            ? [{ module, activatedBy, rawSlotIndex }] : [],
+                )
+            }
+            if (input.moduleIds.length > 0) {
+                const found = new Set(moduleRecords.flatMap(({ module }) => nonEmptyString(module?.id) ? [module.id] : []))
+                if (input.moduleIds.some((moduleId) => !found.has(moduleId))) {
+                    throw new PluginApiError('INVALID_ARGUMENT', 'Unknown module ID in context asset filter')
+                }
+            }
+            const modules = moduleRecords.flatMap(({ module, activatedBy, rawSlotIndex }) => {
+                assertNotAborted(input.signal)
+                const projected = mapModule(module, activatedBy, rawSlotIndex, projectionContext)
+                if (!projected) return []
+                return projected.assets.map((source) => ({
+                    source,
+                    origin: { kind: 'module' as const, moduleId: projected.id },
+                }))
+            })
+            const assets = [...characters, ...modules]
+                .filter(({ source }) => input.include.includes(source.role))
+            assertNotAborted(input.signal)
+            return { selectors, assets }
+        },
+        async revalidateAssetSource(probe: ContextAssetSourceProbe) {
+            assertNotAborted(probe.input.signal)
+            const locator = assetLocators.get(probe.located.source)
+            if (!locator
+                || locator.ownerKind !== probe.located.origin.kind
+                || locator.ownerId !== (probe.located.origin.kind === 'character'
+                    ? probe.located.origin.characterId : probe.located.origin.moduleId)
+                || locator.storageKey !== probe.located.source.storageKey
+                || locator.storageRevision !== (probe.located.source.storageRevision ?? probe.located.source.storageKey)) {
+                throw changed()
+            }
+            selectorsFor(
+                probe.input.characterIds[0],
+                probe.input.conversationId || undefined,
+                false,
+            )
+            const database = dependencies.getDatabase()
+            let current: ContextAssetSource | null = null
+            if (locator.ownerKind === 'module') {
+                if (probe.input.moduleScope === 'none'
+                    || (probe.input.moduleIds.length > 0 && !probe.input.moduleIds.includes(locator.ownerId))) {
+                    throw changed()
+                }
+                const records = probe.input.moduleScope === 'installed'
+                    ? database.modules ?? []
+                    : dependencies.getActiveModulesWithReasons().map(({ module }) => module)
+                const raw = records[locator.ownerRawSlotIndex]
+                if (!raw || raw.id !== locator.ownerId) throw changed()
+                current = mapModuleAssetAt(raw, locator.ownerRawSlotIndex, locator.rawSlotIndex, projectionContext)
+            } else {
+                if (probe.input.characterIds.length > 0 && !probe.input.characterIds.includes(locator.ownerId)) throw changed()
+                const raw = locator.ownerRawSlotIndex >= 0
+                    ? database.characters?.[locator.ownerRawSlotIndex]
+                    : dependencies.getCurrentCharacter()
+                if (!raw || raw.chaId !== locator.ownerId) throw changed()
+                current = mapCharacterAssetAt(raw, locator, projectionContext)
+            }
+            if (!current || !sameSource(current, probe.located.source)) throw changed()
+            assertNotAborted(probe.input.signal)
+            return current
         },
         async readAsset(source, signal) {
             assertNotAborted(signal)

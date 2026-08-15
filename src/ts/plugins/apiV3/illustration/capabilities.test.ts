@@ -42,6 +42,18 @@ describe('V3 capability discovery', () => {
             maxThumbnailOutputBytes: 1_048_576,
             maxRpcBinaryValueBytes: 67_108_864,
             maxRpcAggregateBytes: 134_217_728,
+            moduleIdsFilter: true,
+            maxModuleIdsPerAssetList: 100,
+            captureFence: 'query-collection-v1',
+            maxCapturedQueryItemsPerPrincipal: 20_000,
+            maxCapturedQueryMetadataBytesPerPrincipal: 16_777_216,
+        })
+        expect(CAPABILITY_CONTRACT['context.modules-installed.v1'].limits).toMatchObject({
+            moduleAssetCount: true,
+            moduleAssetCollectionRevision: true,
+            captureFence: 'query-collection-v1',
+            maxCapturedQueryItemsPerPrincipal: 20_000,
+            maxCapturedQueryMetadataBytesPerPrincipal: 16_777_216,
         })
         expect(CAPABILITY_CONTRACT['context.assets.v1'].limits).not.toHaveProperty('assetReadsPerMinute')
         expect(CAPABILITY_CONTRACT['inlay.atomic-attach.v1'].additionalPermissions).toEqual(['chatWriteAll', 'inlayWrite'])
@@ -55,8 +67,8 @@ describe('V3 capability discovery', () => {
         const serialized = JSON.stringify(CAPABILITY_CONTRACT)
         const digest = [...new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(serialized)))]
             .map((value) => value.toString(16).padStart(2, '0')).join('')
-        expect(new TextEncoder().encode(serialized).byteLength).toBe(5358)
-        expect(digest).toBe('e6bab29cde36e6feba004263f5499a55ce057288a36465f7089c8f7b7202af97')
+        expect(new TextEncoder().encode(serialized).byteLength).toBe(5737)
+        expect(digest).toBe('d752071c7a94ec0f38749106e905f4177a0475975b3a615cf56394e6c63c940c')
     })
 
     it('returns an explicit descriptor for unknown IDs', async () => {

@@ -244,4 +244,21 @@ describe('principal permission service', () => {
         expect(first.context.signal.aborted).toBe(true)
         expect(second.context.signal.aborted).toBe(false)
     })
+
+    it('exposes a read-only generation token that changes synchronously for principal and global resets', async () => {
+        const otherPrincipal = '22222222-2222-4222-8222-222222222222'
+        const initial = service.generation(context.principalId)
+        expect(service.generation(otherPrincipal)).toBe(initial)
+
+        const principalReset = service.resetPrincipal(context.principalId)
+        const afterPrincipal = service.generation(context.principalId)
+        expect(afterPrincipal).not.toBe(initial)
+        expect(service.generation(otherPrincipal)).toBe(initial)
+        await principalReset
+
+        const globalReset = service.resetAll(async () => undefined)
+        expect(service.generation(context.principalId)).not.toBe(afterPrincipal)
+        expect(service.generation(otherPrincipal)).not.toBe(initial)
+        await globalReset
+    })
 })

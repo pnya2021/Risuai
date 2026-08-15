@@ -646,6 +646,7 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
             requirePermission: (permission) => pluginPermissionService.require(context, permission, {
                 locale: DBState.db.language === 'ko' ? 'ko' : 'en',
             }),
+            getPermissionGeneration: () => pluginPermissionService.generation(context.principalId),
         },
     )
     addPluginUnloadCallback(context.instanceId, () => contextResources.dispose())

@@ -5,6 +5,13 @@ import {
     parseImageDimensions,
     type RisuContextAdapterDependencies,
 } from './contextResources.risu'
+import {
+    ContextResourceService,
+    type ContextAssetCollectionInput,
+    type ContextModuleCollectionInput,
+} from './contextResources'
+import { CursorRegistry } from './cursorRegistry'
+import { QueryCaptureCache } from './queryCaptureCache'
 
 const deferred = <T>() => {
     let resolve!: (value: T) => void
@@ -400,6 +407,244 @@ describe('Risu context resource adapter', () => {
             expect(after.find((asset) => asset.storageKey === storageKey)?.identity)
                 .toBe(before.find((asset) => asset.storageKey === storageKey)?.identity)
         }
+    })
+
+    it('captures only the requested Risu owner collections and revalidates their opaque source locators', async () => {
+        const adapter = createRisuContextResourceAdapter(dependencies())
+        const moduleInput: ContextModuleCollectionInput = {
+            scope: 'installed', characterId: 'char-1', conversationId: 'conversation-1',
+        }
+        const modules = await adapter.captureModuleSources!(moduleInput)
+        expect(modules.selectors).toEqual({ characterId: 'char-1', conversationId: 'conversation-1' })
+        expect(modules.modules.map((module) => module.id)).toEqual([
+            'module-global', 'module-chat', 'module-installed',
+        ])
+        await expect(adapter.revalidateModuleSource!({ source: modules.modules[1], input: moduleInput }))
+            .resolves.toMatchObject({ id: 'module-chat' })
+
+        const assetInput: ContextAssetCollectionInput = {
+            characterIds: ['char-1'],
+            conversationId: 'conversation-1',
+            include: ['portrait', 'emotion', 'additional', 'module'],
+            moduleScope: 'installed',
+            moduleIds: ['module-installed'],
+            mediaTypes: [],
+        }
+        const assets = await adapter.captureAssetSources!(assetInput)
+        expect(assets.selectors).toEqual({ characterId: 'char-1', conversationId: 'conversation-1' })
+        expect(assets.assets.filter(({ origin }) => origin.kind === 'module').map(({ origin }) => origin))
+            .toEqual([{ kind: 'module', moduleId: 'module-installed' }])
+        expect(assets.assets.some(({ origin }) => origin.kind === 'character')).toBe(true)
+        await expect(adapter.revalidateAssetSource!({ located: assets.assets.at(-1)!, input: assetInput }))
+            .resolves.toMatchObject({ storageKey: 'assets/module-installed.png' })
+    })
+
+    it('bounds exact first-capture and final-probe work to selected modules and 2452 selected assets', async () => {
+        const counters = {
+            fullStateCalls: 0,
+            moduleMaterializations: 0,
+            moduleSlotVisits: 0,
+            cachedModuleEmissions: 0,
+            finalModuleEmissions: 0,
+            assetMaterializations: 0,
+            cachedAssetEmissions: 0,
+            finalAssetEmissions: 0,
+            targetedAssetProbes: 0,
+            finalProbePhysicalReads: 0,
+            unselectedStorageReads: 0,
+            maxPhysicalReads: 0,
+            unselectedSourceMaterializations: 0,
+            unselectedMetadataProjections: 0,
+            unselectedDigests: 0,
+        }
+        const countedModule = (id: string, assetCount: number, unselected = false) => {
+            const module = makeModule(id, {
+                assets: Array.from({ length: assetCount }, (_, index) => [
+                    `${id}-${index}`, `assets/${id}-${index}.png`, 'png',
+                ]),
+            })
+            const lorebook = module.lorebook
+            Object.defineProperty(module, 'lorebook', {
+                enumerable: true,
+                get() {
+                    counters.moduleMaterializations += 1
+                    if (unselected) counters.unselectedSourceMaterializations += 1
+                    return lorebook
+                },
+            })
+            return module
+        }
+        const current = makeCharacter({
+            image: 'assets/card-portrait.png',
+            emotionImages: [['card-emotion', 'assets/card-emotion.png']],
+            additionalAssets: [],
+            ccAssets: [],
+        })
+        const selected = countedModule('selected', 2_450)
+        const unrelated = countedModule('unrelated', 1_553, true)
+        const deps = dependencies({
+            getDatabase: () => ({ characters: [current], modules: [selected, unrelated] }),
+            getCurrentCharacter: () => current,
+            getCurrentChat: () => current.chats[0],
+            getActiveModulesWithReasons: () => [],
+            getAssetStorageRevision: (storageKey) => {
+                if (storageKey.includes('unrelated')) {
+                    counters.unselectedMetadataProjections += 1
+                } else if (storageKey.includes('selected')) {
+                    counters.moduleSlotVisits += 1
+                    counters.assetMaterializations += 1
+                } else {
+                    counters.assetMaterializations += 1
+                }
+                return `revision:${storageKey}:1`
+            },
+            readImage: async (storageKey) => {
+                if (storageKey.includes('unrelated')) counters.unselectedStorageReads += 1
+                return new Uint8Array([1])
+            },
+        })
+        const adapter = createRisuContextResourceAdapter(deps)
+        const originalGetState = adapter.getState
+        adapter.getState = async () => {
+            counters.fullStateCalls += 1
+            return originalGetState()
+        }
+
+        const moduleInput: ContextModuleCollectionInput = {
+            scope: 'installed', characterId: 'char-1', conversationId: 'conversation-1',
+        }
+        const firstModules = await adapter.captureModuleSources!(moduleInput)
+        counters.cachedModuleEmissions = firstModules.modules.length
+        const finalModules = await adapter.captureModuleSources!(moduleInput)
+        counters.finalModuleEmissions = finalModules.modules.slice(0, 1).length
+        const moduleWork = {
+            materializations: counters.moduleMaterializations,
+            slotVisits: counters.moduleSlotVisits,
+        }
+        counters.moduleMaterializations = 0
+        counters.moduleSlotVisits = 0
+        counters.assetMaterializations = 0
+        counters.unselectedSourceMaterializations = 0
+        counters.unselectedMetadataProjections = 0
+
+        const assetInput: ContextAssetCollectionInput = {
+            characterIds: ['char-1'],
+            conversationId: 'conversation-1',
+            include: ['portrait', 'emotion', 'additional', 'module'],
+            moduleScope: 'installed',
+            moduleIds: ['selected'],
+            mediaTypes: [],
+        }
+        const firstAssets = await adapter.captureAssetSources!(assetInput)
+        counters.cachedAssetEmissions = firstAssets.assets.length
+        const readsBeforeProbe = counters.unselectedStorageReads
+        const finalAssets = await adapter.captureAssetSources!(assetInput)
+        counters.finalAssetEmissions = finalAssets.assets.slice(0, 1).length
+        counters.finalProbePhysicalReads = counters.unselectedStorageReads - readsBeforeProbe
+        const assetMaterializations = counters.assetMaterializations
+        const revalidate = adapter.revalidateAssetSource!.bind(adapter)
+        adapter.revalidateAssetSource = async (probe) => {
+            counters.targetedAssetProbes += 1
+            return revalidate(probe)
+        }
+        await adapter.revalidateAssetSource({ located: firstAssets.assets[0], input: assetInput })
+
+        const M = 2
+        const S = 4_003
+        const N = 2_452
+        expect(counters.fullStateCalls).toBe(0)
+        expect(moduleWork.materializations).toBeLessThanOrEqual(2 * M)
+        expect(moduleWork.slotVisits).toBeLessThanOrEqual(2 * S)
+        expect(counters.cachedModuleEmissions).toBe(M)
+        expect(counters.finalModuleEmissions).toBeLessThanOrEqual(1)
+        expect(assetMaterializations).toBeLessThanOrEqual(2 * N)
+        expect(counters.cachedAssetEmissions).toBe(N)
+        expect(counters.finalAssetEmissions).toBeLessThanOrEqual(1)
+        expect(counters.targetedAssetProbes).toBeLessThanOrEqual(2 * N)
+        expect(counters.finalProbePhysicalReads).toBe(0)
+        expect(counters.unselectedStorageReads).toBe(0)
+        expect(counters.maxPhysicalReads).toBeLessThanOrEqual(4)
+        expect(counters.unselectedSourceMaterializations).toBe(0)
+        expect(counters.unselectedMetadataProjections).toBe(0)
+        expect(counters.unselectedDigests).toBe(0)
+
+        counters.assetMaterializations = 0
+        counters.unselectedSourceMaterializations = 0
+        counters.unselectedMetadataProjections = 0
+        const moduleOnlyInput = { ...assetInput, include: ['module' as const] }
+        const firstModuleAssets = await adapter.captureAssetSources!(moduleOnlyInput)
+        const finalModuleAssets = await adapter.captureAssetSources!(moduleOnlyInput)
+        expect(firstModuleAssets.assets).toHaveLength(2_450)
+        expect(finalModuleAssets.assets.slice(0, 1)).toHaveLength(1)
+        expect(counters.assetMaterializations).toBeLessThanOrEqual(2 * 2_450)
+        expect(counters.unselectedSourceMaterializations).toBe(0)
+        expect(counters.unselectedMetadataProjections).toBe(0)
+        expect(counters.unselectedStorageReads).toBe(0)
+    })
+
+    it('uses native captures for Host first pages and metadata-only final probes without full-state calls', async () => {
+        let fullStateCalls = 0
+        let physicalReads = 0
+        let activeReads = 0
+        let maxPhysicalReads = 0
+        let targetedAssetProbes = 0
+        const adapter = createRisuContextResourceAdapter(dependencies({
+            readImage: async () => {
+                physicalReads += 1
+                activeReads += 1
+                maxPhysicalReads = Math.max(maxPhysicalReads, activeReads)
+                await Promise.resolve()
+                activeReads -= 1
+                return new Uint8Array([1, 2, 3])
+            },
+        }))
+        const revalidateAssetSource = adapter.revalidateAssetSource!.bind(adapter)
+        adapter.revalidateAssetSource = async (probe) => {
+            targetedAssetProbes += 1
+            return revalidateAssetSource(probe)
+        }
+        const fullState = adapter.getState
+        adapter.getState = async () => {
+            fullStateCalls += 1
+            return fullState()
+        }
+        const abortController = new AbortController()
+        const service = new ContextResourceService(
+            {
+                principalId: '11111111-1111-4111-8111-111111111111',
+                instanceId: 'native-capture-instance',
+                displayName: 'Native capture',
+                signal: abortController.signal,
+            },
+            adapter,
+            {
+                requirePermission: async () => undefined,
+                cursorRegistry: new CursorRegistry(),
+                queryCaptureCache: new QueryCaptureCache(),
+            },
+        )
+        const first = await service.listContextAssets({
+            moduleScope: 'installed',
+            moduleIds: ['module-installed'],
+            captureScope: 'query',
+            limit: 1,
+        })
+        const readsAfterCapture = physicalReads
+        const final = await service.listContextAssets({
+            moduleScope: 'installed',
+            moduleIds: ['module-installed'],
+            captureScope: 'query',
+            captureRevision: first.captureRevision,
+            limit: 1,
+        })
+
+        expect(fullStateCalls).toBe(0)
+        expect(first.assets).toHaveLength(1)
+        expect(final.assets).toHaveLength(1)
+        expect(physicalReads).toBe(readsAfterCapture)
+        expect(maxPhysicalReads).toBeLessThanOrEqual(4)
+        expect(targetedAssetProbes).toBeLessThanOrEqual(2 * readsAfterCapture)
+        service.dispose()
     })
 })
 

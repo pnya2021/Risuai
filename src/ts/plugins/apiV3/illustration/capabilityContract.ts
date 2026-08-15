@@ -34,11 +34,11 @@ export const CAPABILITY_CONTRACT: Record<PluginCapabilityId, CapabilityContractE
     },
     'context.assets.v1': {
         version: 1, permission: 'contextAssets', additionalPermissions: ['installedModulesRead'], requiresCurrentContext: true,
-        limits: { maxSnapshotJsonBytes: 2097152, maxJsonDepth: 32, maxTextFieldUtf8Bytes: 524288, defaultPageSize: 50, maxPageSize: 100, cursorTtlMs: 300000, maxActiveCursorsPerPrincipal: 64, maxActiveModules: 100, defaultAssetReadBytes: 16777216, maxAssetReadBytes: 33554432, assetReadPolicy: 'backpressure', maxConcurrentAssetReadsPerPrincipal: 4, maxConcurrentOriginalAssetReadsPerPrincipal: 1, maxQueuedAssetReadsPerPrincipal: 128, assetReadCancellation: true, thumbnailLongEdge: 512, maxThumbnailPixels: 262144, maxThumbnailOutputBytes: 1048576, maxRpcBinaryValueBytes: 67108864, maxRpcAggregateBytes: 134217728 },
+        limits: { maxSnapshotJsonBytes: 2097152, maxJsonDepth: 32, maxTextFieldUtf8Bytes: 524288, defaultPageSize: 50, maxPageSize: 100, cursorTtlMs: 300000, maxActiveCursorsPerPrincipal: 64, maxActiveModules: 100, defaultAssetReadBytes: 16777216, maxAssetReadBytes: 33554432, assetReadPolicy: 'backpressure', maxConcurrentAssetReadsPerPrincipal: 4, maxConcurrentOriginalAssetReadsPerPrincipal: 1, maxQueuedAssetReadsPerPrincipal: 128, assetReadCancellation: true, thumbnailLongEdge: 512, maxThumbnailPixels: 262144, maxThumbnailOutputBytes: 1048576, maxRpcBinaryValueBytes: 67108864, maxRpcAggregateBytes: 134217728, moduleIdsFilter: true, maxModuleIdsPerAssetList: 100, captureFence: 'query-collection-v1', maxCapturedQueryItemsPerPrincipal: 20000, maxCapturedQueryMetadataBytesPerPrincipal: 16777216 },
     },
     'context.modules-installed.v1': {
         version: 1, permission: 'installedModulesRead', additionalPermissions: [],
-        limits: { maxSnapshotJsonBytes: 2097152, maxJsonDepth: 32, maxTextFieldUtf8Bytes: 524288, defaultPageSize: 50, maxPageSize: 100, cursorTtlMs: 300000, maxActiveCursorsPerPrincipal: 64 },
+        limits: { maxSnapshotJsonBytes: 2097152, maxJsonDepth: 32, maxTextFieldUtf8Bytes: 524288, defaultPageSize: 50, maxPageSize: 100, cursorTtlMs: 300000, maxActiveCursorsPerPrincipal: 64, moduleAssetCount: true, moduleAssetCollectionRevision: true, captureFence: 'query-collection-v1', maxCapturedQueryItemsPerPrincipal: 20000, maxCapturedQueryMetadataBytesPerPrincipal: 16777216 },
     },
     'secrets.write-only.v1': {
         version: 1, permission: 'secrets', additionalPermissions: [],
