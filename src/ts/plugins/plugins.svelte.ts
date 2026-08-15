@@ -4,7 +4,7 @@ import { getCurrentCharacter, getDatabase, setDatabase, setDatabaseLite, setData
 import { alertConfirm, alertError, alertPluginConfirm } from "../alert";
 import { selectSingleFile, sleep } from "../util";
 import type { OpenAIChat } from "../process/index.svelte";
-import { fetchNative, globalFetch, readImage, saveAsset, toGetter } from "../globalApi.svelte";
+import { fetchNative, globalFetch, readImage, requestDatabaseSaveNow, requiresFullEncoderReload, saveAsset, toGetter } from "../globalApi.svelte";
 import { DBState, hotReloading, pluginAlertModalStore, selectedCharID } from "../stores.svelte";
 import type { ScriptMode } from "../process/scripts";
 import { checkCodeSafety } from "./pluginSafety";
@@ -20,6 +20,7 @@ import { createPluginDatabaseBoundary } from './pluginDatabaseBoundary';
 import { createRevocableV2Api, createV2RuntimeAuthorization, resetPluginV2Runtime } from './pluginV2Runtime';
 import { ensureColdDatabaseWriteback, runAfterColdDatabaseWriteback } from '../storage/coldDatabaseHydration';
 import { runPrincipalBoundPluginUpdate } from './pluginUpdateAuthorization';
+import { databasePersistenceCoordinator } from '../storage/databasePersistenceCoordinator';
 
 export const customProviderStore = writable([] as string[])
 
@@ -499,16 +500,25 @@ export async function replaceDatabaseWithPluginRuntime(data: Database, options: 
     authorizeBeforeSuspend?: () => boolean
     authorizeAfterSuspend?: () => boolean
 } = {}) {
-    await runAuthorizedPluginRuntimeMutation({
-        prepare: () => options.transaction ?? preparePluginRuntimeReplacement(options.authorizeBeforeSuspend),
-        authorizeAfterSuspend: options.authorizeAfterSuspend,
-        mutate: async (markLive) => {
-            await setDatabaseLive(data, options.authorizeAfterSuspend, markLive)
-            await options.persist?.(getDatabase({ snapshot: true }))
-        },
-        reload: reloadCurrentPluginsUnlocked,
-        failClosed: failClosedPluginRuntime,
-    })
+    const transaction = options.transaction
+        ?? await preparePluginRuntimeReplacement(options.authorizeBeforeSuspend)
+    await databasePersistenceCoordinator.runExclusiveMutation(() =>
+        runAuthorizedPluginRuntimeMutation({
+            prepare: () => transaction,
+            authorizeAfterSuspend: options.authorizeAfterSuspend,
+            mutate: async (markLive) => {
+                await setDatabaseLive(data, options.authorizeAfterSuspend, markLive)
+                if (options.persist) {
+                    await options.persist(getDatabase({ snapshot: true }))
+                } else {
+                    requiresFullEncoderReload.state = true
+                    requestDatabaseSaveNow()
+                }
+            },
+            reload: reloadCurrentPluginsUnlocked,
+            failClosed: failClosedPluginRuntime,
+        }),
+    )
 }
 
 export async function replacePersistedDatabaseWithPluginRuntime<T>(

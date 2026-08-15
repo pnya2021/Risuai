@@ -28,9 +28,6 @@ import { normalizePluginDatabaseState } from '../plugins/pluginDatabaseNormaliza
 import { retirePluginPrincipals } from '../plugins/pluginRetirement';
 import { withAuthorizedPluginMutationLock } from '../plugins/pluginMutationCoordinator';
 import { normalizeContextRecordIds } from './contextRecordIds';
-import { setDatabaseLite as setDatabaseStateLite } from './databaseState.svelte';
-
-export { onDatabaseUpdate } from './databaseState.svelte';
 
 //APP_VERSION_POINT is to locate the app version in the database file for version bumping
 export let appVer = "2026.6.215" //<APP_VERSION_POINT>
@@ -741,7 +738,7 @@ export function setDatabaseLite(data:Database){
     }
     const pluginStateNormalization = normalizePluginDatabaseState(data)
     const contextIdNormalization = normalizeContextRecordIds(data)
-    setDatabaseStateLite(data)
+    DBState.db = data
     return { ...pluginStateNormalization, ...contextIdNormalization }
 }
 
@@ -1553,6 +1550,7 @@ export interface character{
     prebuiltAssetStyle?:string
     prebuiltAssetExclude?:string[]
     modules?:string[]
+    moduleNamespace?:string
     coldstorage?:string
     coldStoragedChats?:string[]
     customModuleToggle?:string

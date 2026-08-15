@@ -54,6 +54,27 @@ let globalApi: typeof import('../globalApi.svelte')
 let plugins: typeof import('../plugins/plugins.svelte')
 let saveFormat: typeof import('./risuSave')
 let stores: typeof import('../stores.svelte')
+let createRevision: typeof import('../plugins/apiV3/illustration/revision').createRevision
+let messageRevisionValue: typeof import('../plugins/apiV3/illustration/messageQuery').messageRevisionValue
+
+const messageTarget = {
+    characterId: 'character-1',
+    conversationId: 'conversation-1',
+    messageId: 'message-1',
+}
+
+const databaseWithMessage = (messageData: string, values: Partial<Database> = {}) => database({
+    characters: [{
+        type: 'character',
+        chaId: messageTarget.characterId,
+        chatPage: 0,
+        chats: [{
+            id: messageTarget.conversationId,
+            message: [{ role: 'char', data: messageData, chatId: messageTarget.messageId }],
+        }],
+    }] as Database['characters'],
+    ...values,
+})
 
 async function advanceUntil(predicate: () => boolean, message: string) {
     for (let attempt = 0; attempt < 30; attempt += 1) {
@@ -76,6 +97,8 @@ describe.sequential('database persistence consumer boundary', () => {
         plugins = await import('../plugins/plugins.svelte')
         saveFormat = await import('./risuSave')
         stores = await import('../stores.svelte')
+        ;({ createRevision } = await import('../plugins/apiV3/illustration/revision'))
+        ;({ messageRevisionValue } = await import('../plugins/apiV3/illustration/messageQuery'))
         databaseModule.setDatabaseLite(database())
         void globalApi.saveDb()
         await advanceUntil(() => durable.databaseWrites.length > 0, 'background save did not reach durable storage')
@@ -131,6 +154,122 @@ describe.sequential('database persistence consumer boundary', () => {
 
         const reloaded = await reload(durable.databaseWrites.at(-1)!)
         expect(reloaded.pluginCustomStorage.legacyPlugin.nested).toBe('descriptor value')
+    })
+
+    it('keeps a waiter that arrives during encoder reload for the next database snapshot', async () => {
+        stores.selectedCharID.set(0)
+        databaseModule.setDatabaseLite(databaseWithMessage('before reload'))
+        globalApi.requiresFullEncoderReload.state = true
+        globalApi.requestDatabaseSaveNow()
+        await advanceUntil(() => durable.databaseWrites.length > 0, 'waiter fixture did not reach durable storage')
+        durable.databaseWrites.length = 0
+
+        let releaseInitialization!: () => void
+        const initializationGate = new Promise<void>((resolve) => { releaseInitialization = resolve })
+        let markInitializationStarted!: () => void
+        const initializationStarted = new Promise<void>((resolve) => { markInitializationStarted = resolve })
+        const originalInit = saveFormat.RisuSaveEncoder.prototype.init
+        const init = vi.spyOn(saveFormat.RisuSaveEncoder.prototype, 'init')
+            .mockImplementationOnce(async function (...args) {
+                markInitializationStarted()
+                await initializationGate
+                return originalInit.apply(this, args)
+            })
+
+        let newerStatus: 'pending' | 'resolved' | 'rejected' = 'pending'
+        try {
+            const message = stores.DBState.db.characters[0].chats[0].message[0]
+            const beforeRevision = await createRevision(messageRevisionValue(message))
+            const beforePersistence = globalApi.waitForMessagePersistence(messageTarget, beforeRevision)
+            await vi.advanceTimersByTimeAsync(1_000)
+            await initializationStarted
+
+            message.data = 'after reload'
+            const afterRevision = await createRevision(messageRevisionValue(message))
+            const afterPersistence = globalApi.waitForMessagePersistence(messageTarget, afterRevision)
+                .then(() => { newerStatus = 'resolved' as const }, () => { newerStatus = 'rejected' as const })
+
+            releaseInitialization()
+            await advanceUntil(() => newerStatus !== 'pending', 'new waiter was not completed by a later save candidate')
+            await beforePersistence
+            await afterPersistence
+
+            expect(newerStatus).toBe('resolved')
+            const reloaded = await reload(durable.databaseWrites.at(-1)!)
+            expect(reloaded.characters[0].chats[0].message[0].data).toBe('after reload')
+        } finally {
+            releaseInitialization()
+            init.mockRestore()
+        }
+    })
+
+    it('orders V2 live replacement after an in-flight save and reloads every character block', async () => {
+        stores.selectedCharID.set(-1)
+        databaseModule.setDatabaseLite(databaseWithMessage('before replacement', { temperature: 80 }))
+        globalApi.requiresFullEncoderReload.state = true
+        globalApi.requestDatabaseSaveNow()
+        await advanceUntil(() => durable.databaseWrites.length > 0, 'replacement fixture did not reach durable storage')
+        await vi.advanceTimersByTimeAsync(2_000)
+        durable.databaseWrites.length = 0
+
+        let releaseWrite!: () => void
+        const writeGate = new Promise<void>((resolve) => { releaseWrite = resolve })
+        let markWriteStarted!: () => void
+        const writeStarted = new Promise<void>((resolve) => { markWriteStarted = resolve })
+        const originalSetItem = globalApi.forageStorage.setItem.bind(globalApi.forageStorage)
+        let blocked = false
+        const setItem = vi.spyOn(globalApi.forageStorage, 'setItem').mockImplementation(async (key, value) => {
+            if (!blocked && key === 'database/database.bin') {
+                blocked = true
+                markWriteStarted()
+                await writeGate
+            }
+            return originalSetItem(key, value)
+        })
+
+        let replacement: Promise<unknown> | undefined
+        try {
+            stores.DBState.db.temperature = 81
+            globalApi.requestDatabaseSaveNow()
+            await vi.advanceTimersByTimeAsync(1_000)
+            await writeStarted
+
+            const api = plugins.getV2PluginAPIs(() => true, () => true)
+            const next = api.getDatabase()
+            next.temperature = 42
+            next.characters[0].chats[0].message[0].data = 'winning V2 character bytes'
+            let replacementSettled = false
+            replacement = api.setDatabase(next).then(() => { replacementSettled = true })
+            await vi.advanceTimersByTimeAsync(0)
+            for (let attempt = 0; attempt < 20; attempt += 1) await Promise.resolve()
+            const observedBeforeWriteRelease = {
+                replacementSettled,
+                temperature: stores.DBState.db.temperature,
+                message: stores.DBState.db.characters[0].chats[0].message[0].data,
+            }
+
+            releaseWrite()
+            await replacement
+            await advanceUntil(() => durable.databaseWrites.length >= 2, 'V2 replacement did not publish a fresh database')
+
+            expect(observedBeforeWriteRelease).toEqual({
+                replacementSettled: false,
+                temperature: 81,
+                message: 'before replacement',
+            })
+            const reloaded = await reload(durable.databaseWrites.at(-1)!)
+            expect({
+                temperature: reloaded.temperature,
+                message: reloaded.characters[0].chats[0].message[0].data,
+            }).toEqual({
+                temperature: 42,
+                message: 'winning V2 character bytes',
+            })
+        } finally {
+            releaseWrite()
+            await replacement?.catch(() => undefined)
+            setItem.mockRestore()
+        }
     })
 
     it('does not publish a snapshot captured before a winning restore generation', async () => {
