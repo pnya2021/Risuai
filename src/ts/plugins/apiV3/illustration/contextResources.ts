@@ -9,6 +9,7 @@ import {
     illustrationQueryCaptureCache,
     type QueryCaptureOwner,
     type QueryCapturePreparation,
+    type QueryCaptureReservation,
 } from './queryCaptureCache'
 import {
     ContextAssetReadCoordinator,
@@ -1788,6 +1789,9 @@ export class ContextResourceService {
         let capturePreparation: QueryCapturePreparation
         const stagedHandles = new Map<string, IssuedAssetHandle>()
         let stagedCapture = false
+        let captureReservation: QueryCaptureReservation<ContextLocatedAssetSource> | undefined
+        const finalProbe = !options.cursor && options.captureRevision !== undefined
+        try {
         if (options.cursor) {
             const [cursorRecord, preparation] = await Promise.all([
                 this.cursorRegistry.read<CapturePageRecord>(
@@ -1836,11 +1840,9 @@ export class ContextResourceService {
                 if (options.captureRevision !== captureRevision) throw this.contextChanged()
                 sources = retained.items
             } else {
-                captureRevision = createSynchronousRevision({
-                    queryDigest: preparation.queryDigest,
-                    items: collection.assets,
-                })
-                sources = collection.assets
+                captureReservation = this.queryCaptureCache.reservePrepared(preparation, collection.assets)
+                captureRevision = captureReservation.captureRevision
+                sources = captureReservation.items
             }
             if (!options.captureRevision) {
                 stagedCapture = true
@@ -1879,7 +1881,7 @@ export class ContextResourceService {
             ? references.filter((reference) => reference.mediaType && mediaTypes.includes(reference.mediaType))
             : references
         const nextOffset = offset + pageSources.length
-        const nextCursorValue = !options.captureRevision && nextOffset < sources.length
+        const nextCursorValue = !finalProbe && nextOffset < sources.length
             ? { offset: nextOffset, captureRevision }
             : undefined
         const nextCursorPreparation = nextCursorValue
@@ -1897,7 +1899,7 @@ export class ContextResourceService {
         }
         const publicationSources = stagedCapture && this.adapter.revalidateAssetSource
             ? sources
-            : options.captureRevision
+            : finalProbe
                 ? []
                 : pageSources
         await this.boundedMap(
@@ -1914,9 +1916,11 @@ export class ContextResourceService {
         )
         this.refreshCaptureGeneration()
         this.assertActive(generation, signal)
-        await this.revalidateCapturedAssetCollection(
-            verificationSources, preflightSelectors, input, generation, signal,
-        )
+        if (stagedCapture || finalProbe) {
+            await this.revalidateCapturedAssetCollection(
+                verificationSources, preflightSelectors, input, generation, signal,
+            )
+        }
         this.refreshCaptureGeneration()
         this.assertActive(generation, signal)
         if (!stagedCapture) {
@@ -1933,7 +1937,7 @@ export class ContextResourceService {
         }
         assertContextSnapshotLimits(result)
         if (stagedCapture) {
-            this.queryCaptureCache.commitPrepared(capturePreparation, sources)
+            this.queryCaptureCache.commitReserved(captureReservation!)
             this.queryCaptureCache.readPrepared<ContextLocatedAssetSource>(capturePreparation, captureRevision)
         }
         for (const [assetId, issued] of stagedHandles) {
@@ -1943,6 +1947,9 @@ export class ContextResourceService {
             this.cursorRegistry.commitPrepared(nextCursorPreparation, nextCursorValue, nextCursorCommit)
         }
         return result
+        } finally {
+            if (captureReservation) this.queryCaptureCache.releaseReservation(captureReservation)
+        }
     }
 
     async listContextAssets(options: ContextAssetListOptions = {}): Promise<ContextAssetPage> {

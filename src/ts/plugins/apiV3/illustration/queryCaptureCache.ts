@@ -21,12 +21,23 @@ export interface QueryCapturePreparation {
     readonly lifecycle: readonly (readonly [string, number])[]
 }
 
+export interface QueryCaptureReservation<T> extends QueryCaptureRecord<T> {}
+
 interface StoredQueryCapture<T = unknown> extends QueryCaptureRecord<T> {
     owner: QueryCaptureOwner
     queryDigest: string
     itemCount: number
     metadataBytes: number
     expiresAt: number
+}
+
+interface StoredQueryCaptureReservation<T = unknown> {
+    reservation: QueryCaptureReservation<T>
+    preparation: QueryCapturePreparation
+    key: string
+    existing?: StoredQueryCapture<T>
+    itemCount: number
+    metadataBytes: number
 }
 
 const unavailable = () => new PluginApiError(
@@ -81,6 +92,7 @@ export function createSynchronousRevision(value: unknown): Revision {
 
 export class QueryCaptureCache {
     private readonly records = new Map<string, StoredQueryCapture>()
+    private readonly reservations = new Map<QueryCaptureReservation<unknown>, StoredQueryCaptureReservation>()
     private readonly lifecycleEpochs = new Map<string, number>()
     private readonly now: () => number
     private readonly ttlMs: number
@@ -118,6 +130,18 @@ export class QueryCaptureCache {
         preparation: QueryCapturePreparation,
         items: readonly T[],
     ): QueryCaptureRecord<T> {
+        const reservation = this.reservePrepared(preparation, items)
+        try {
+            return this.commitReserved(reservation)
+        } finally {
+            this.releaseReservation(reservation)
+        }
+    }
+
+    reservePrepared<T>(
+        preparation: QueryCapturePreparation,
+        items: readonly T[],
+    ): QueryCaptureReservation<T> {
         this.removeExpired()
         if (!this.isLifecycleCurrent(preparation.lifecycle)) throw unavailable()
         if (!Array.isArray(items)) throw new PluginApiError('INVALID_ARGUMENT', 'Context query capture items must be an array')
@@ -129,32 +153,81 @@ export class QueryCaptureCache {
         const existing = this.records.get(key) as StoredQueryCapture<T> | undefined
         if (existing) {
             if (existing.queryDigest !== preparation.queryDigest) throw mismatch()
-            if (!this.isLifecycleCurrent(preparation.lifecycle)) throw unavailable()
-            this.touch(key, existing)
-            return existing
         }
 
         const usage = this.principalUsage(preparation.owner.principalId)
+        const reservedItemCount = existing ? 0 : items.length
+        const reservedMetadataBytes = existing ? 0 : metadataBytes
         if (items.length > this.maxItemsPerPrincipal
             || metadataBytes > this.maxMetadataBytesPerPrincipal
-            || usage.items + items.length > this.maxItemsPerPrincipal
-            || usage.bytes + metadataBytes > this.maxMetadataBytesPerPrincipal) {
+            || usage.items + reservedItemCount > this.maxItemsPerPrincipal
+            || usage.bytes + reservedMetadataBytes > this.maxMetadataBytesPerPrincipal) {
             throw overBudget()
         }
 
-        const record = deepFreeze({
-            owner: { ...preparation.owner },
-            queryDigest: preparation.queryDigest,
+        const reservation = deepFreeze({
             captureRevision,
             items: [...items],
-            itemCount: items.length,
-            metadataBytes,
+        }) as QueryCaptureReservation<T>
+        if (!this.isLifecycleCurrent(preparation.lifecycle)) throw unavailable()
+        this.reservations.set(
+            reservation as QueryCaptureReservation<unknown>,
+            {
+                reservation,
+                preparation,
+                key,
+                existing,
+                itemCount: reservedItemCount,
+                metadataBytes: reservedMetadataBytes,
+            },
+        )
+        return reservation
+    }
+
+    commitReserved<T>(reservation: QueryCaptureReservation<T>): QueryCaptureRecord<T> {
+        this.removeExpired()
+        const stored = this.reservations.get(
+            reservation as QueryCaptureReservation<unknown>,
+        ) as StoredQueryCaptureReservation<T> | undefined
+        if (!stored || !this.isLifecycleCurrent(stored.preparation.lifecycle)) {
+            if (stored) this.reservations.delete(reservation as QueryCaptureReservation<unknown>)
+            throw unavailable()
+        }
+        const current = this.records.get(stored.key) as StoredQueryCapture<T> | undefined
+        if (stored.existing && current !== stored.existing) {
+            this.reservations.delete(reservation as QueryCaptureReservation<unknown>)
+            throw unavailable()
+        }
+        if (current) {
+            if (current.queryDigest !== stored.preparation.queryDigest) {
+                this.reservations.delete(reservation as QueryCaptureReservation<unknown>)
+                throw mismatch()
+            }
+            this.reservations.delete(reservation as QueryCaptureReservation<unknown>)
+            this.touch(stored.key, current)
+            return current
+        }
+        const record = deepFreeze({
+            owner: { ...stored.preparation.owner },
+            queryDigest: stored.preparation.queryDigest,
+            captureRevision: reservation.captureRevision,
+            items: reservation.items,
+            itemCount: stored.itemCount,
+            metadataBytes: stored.metadataBytes,
             expiresAt: this.now() + this.ttlMs,
         }) as StoredQueryCapture<T>
-        if (!this.isLifecycleCurrent(preparation.lifecycle)) throw unavailable()
-        this.records.set(key, record)
-        this.evictPrincipalLru(preparation.owner.principalId)
+        if (!this.isLifecycleCurrent(stored.preparation.lifecycle)) {
+            this.reservations.delete(reservation as QueryCaptureReservation<unknown>)
+            throw unavailable()
+        }
+        this.reservations.delete(reservation as QueryCaptureReservation<unknown>)
+        this.records.set(stored.key, record)
+        this.evictPrincipalLru(stored.preparation.owner.principalId)
         return record
+    }
+
+    releaseReservation(reservation: QueryCaptureReservation<unknown>) {
+        this.reservations.delete(reservation)
     }
 
     async read<T>(
@@ -190,6 +263,9 @@ export class QueryCaptureCache {
         for (const [key, record] of this.records) {
             if (record.owner.principalId === principalId) this.records.delete(key)
         }
+        for (const [reservation, stored] of this.reservations) {
+            if (stored.preparation.owner.principalId === principalId) this.reservations.delete(reservation)
+        }
     }
 
     clearInstance(principalId: string, instanceId: string) {
@@ -199,6 +275,10 @@ export class QueryCaptureCache {
                 this.records.delete(key)
             }
         }
+        for (const [reservation, stored] of this.reservations) {
+            if (stored.preparation.owner.principalId === principalId
+                && stored.preparation.owner.instanceId === instanceId) this.reservations.delete(reservation)
+        }
     }
 
     clearService(principalId: string, service: string) {
@@ -207,6 +287,10 @@ export class QueryCaptureCache {
             if (record.owner.principalId === principalId && record.owner.service === service) {
                 this.records.delete(key)
             }
+        }
+        for (const [reservation, stored] of this.reservations) {
+            if (stored.preparation.owner.principalId === principalId
+                && stored.preparation.owner.service === service) this.reservations.delete(reservation)
         }
     }
 
@@ -252,6 +336,11 @@ export class QueryCaptureCache {
             captures += 1
             items += record.itemCount
             bytes += record.metadataBytes
+        }
+        for (const stored of this.reservations.values()) {
+            if (stored.preparation.owner.principalId !== principalId) continue
+            items += stored.itemCount
+            bytes += stored.metadataBytes
         }
         return { captures, items, bytes }
     }

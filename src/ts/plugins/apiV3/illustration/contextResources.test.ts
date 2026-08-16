@@ -16,6 +16,17 @@ import { QueryCaptureCache } from './queryCaptureCache'
 
 const encoder = new TextEncoder()
 
+const canonicalFixtureBytes = (value: unknown) => {
+    const normalize = (current: unknown): unknown => {
+        if (Array.isArray(current)) return current.map(normalize)
+        if (!current || typeof current !== 'object') return current
+        return Object.fromEntries(Object.entries(current as Record<string, unknown>)
+            .sort(([left], [right]) => left.localeCompare(right))
+            .map(([key, item]) => [key, normalize(item)]))
+    }
+    return encoder.encode(JSON.stringify(normalize(value))).byteLength
+}
+
 const deferred = <T>() => {
     let resolve!: (value: T) => void
     let reject!: (reason?: unknown) => void
@@ -2450,6 +2461,175 @@ describe('captured context count, filter, and fence security', () => {
         )).rejects.toMatchObject({ code: 'CONFLICT' })
     })
 
+    it('rejects a per-capture item overflow before any asset read or publication', async () => {
+        const principalId = '11111111-1111-4111-8111-111111111111'
+        const captures = new QueryCaptureCache({ maxItemsPerPrincipal: 2 })
+        const cursors = new CursorRegistry()
+        const unrelatedOwner = {
+            principalId: '22222222-2222-4222-8222-222222222222',
+            service: 'context-assets' as const,
+            instanceId: 'unrelated-item-capture',
+        }
+        const unrelatedQuery = { kind: 'unrelated-item-capture' }
+        const unrelated = await captures.create(unrelatedOwner, unrelatedQuery, [{ id: 'retained' }])
+        const h = harness({ principalId, queryCaptureCache: captures, cursorRegistry: cursors })
+
+        await expect(h.service.listContextAssets({
+            moduleScope: 'none', captureScope: 'query', limit: 1,
+        })).rejects.toMatchObject({ code: 'RESOURCE_LIMIT' })
+
+        expect(h.reads).not.toHaveBeenCalled()
+        expect(cursors.activeCount(principalId)).toBe(0)
+        expect((h.service as any).issuedHandles.size).toBe(0)
+        expect((captures as any).records.size).toBe(1)
+        await expect(captures.read(unrelatedOwner, unrelatedQuery, unrelated.captureRevision))
+            .resolves.toEqual(unrelated)
+    })
+
+    it('rejects an exact canonical metadata-byte overflow before any asset read', async () => {
+        const principalId = '11111111-1111-4111-8111-111111111111'
+        const state = makeState()
+        const capturedItems = state.characters[0].assets.map((source) => ({
+            source: { ...source },
+            origin: { kind: 'character', characterId: 'char-1' },
+        }))
+        const exactBytes = canonicalFixtureBytes(capturedItems)
+        const captures = new QueryCaptureCache({ maxMetadataBytesPerPrincipal: exactBytes - 1 })
+        const cursors = new CursorRegistry()
+        const h = harness({ state, principalId, queryCaptureCache: captures, cursorRegistry: cursors })
+
+        await expect(h.service.listContextAssets({
+            moduleScope: 'none', captureScope: 'query', limit: 1,
+        })).rejects.toMatchObject({ code: 'RESOURCE_LIMIT' })
+
+        expect(exactBytes).toBeGreaterThan(1)
+        expect(h.reads).not.toHaveBeenCalled()
+        expect(cursors.activeCount(principalId)).toBe(0)
+        expect((h.service as any).issuedHandles.size).toBe(0)
+        expect((captures as any).records.size).toBe(0)
+    })
+
+    it('reserves residual per-principal item and byte capacity before asset reads', async () => {
+        const principalId = '11111111-1111-4111-8111-111111111111'
+        const state = makeState()
+        const capturedItems = state.characters[0].assets.map((source) => ({
+            source: { ...source },
+            origin: { kind: 'character', characterId: 'char-1' },
+        }))
+        const retainedItems = [{ retained: 'r'.repeat(64) }]
+        const cases = [
+            {
+                label: 'items',
+                cache: () => new QueryCaptureCache({ maxItemsPerPrincipal: capturedItems.length }),
+            },
+            {
+                label: 'bytes',
+                cache: () => new QueryCaptureCache({
+                    maxMetadataBytesPerPrincipal:
+                        canonicalFixtureBytes(retainedItems) + canonicalFixtureBytes(capturedItems) - 1,
+                }),
+            },
+        ]
+
+        for (const { label, cache } of cases) {
+            const captures = cache()
+            const cursors = new CursorRegistry()
+            const retainedOwner = {
+                principalId,
+                service: 'context-modules' as const,
+                instanceId: `retained-residual-${label}`,
+            }
+            const retainedQuery = { kind: `retained-residual-${label}` }
+            const retained = await captures.create(retainedOwner, retainedQuery, retainedItems)
+            const h = harness({
+                state, principalId, instanceId: `residual-${label}`,
+                queryCaptureCache: captures, cursorRegistry: cursors,
+            })
+
+            await expect(h.service.listContextAssets({
+                moduleScope: 'none', captureScope: 'query', limit: 1,
+            })).rejects.toMatchObject({ code: 'RESOURCE_LIMIT' })
+
+            expect(h.reads, label).not.toHaveBeenCalled()
+            expect(cursors.activeCount(principalId), label).toBe(0)
+            expect((h.service as any).issuedHandles.size, label).toBe(0)
+            expect((captures as any).records.size, label).toBe(1)
+            await expect(captures.read(retainedOwner, retainedQuery, retained.captureRevision))
+                .resolves.toEqual(retained)
+        }
+    })
+
+    it('atomically awards one remaining reservation to concurrent captures', async () => {
+        const principalId = '11111111-1111-4111-8111-111111111111'
+        const captures = new QueryCaptureCache({ maxItemsPerPrincipal: 4 })
+        const cursors = new CursorRegistry()
+        const retainedOwner = {
+            principalId,
+            service: 'context-modules' as const,
+            instanceId: 'retained-concurrent-capacity',
+        }
+        const retainedQuery = { kind: 'retained-concurrent-capacity' }
+        const retained = await captures.create(retainedOwner, retainedQuery, [{ id: 'retained' }])
+        const readGate = deferred<Uint8Array>()
+        const first = harness({
+            principalId, instanceId: 'reservation-winner', queryCaptureCache: captures,
+            cursorRegistry: cursors, readAsset: async () => readGate.promise,
+        })
+        const second = harness({
+            principalId, instanceId: 'reservation-loser', queryCaptureCache: captures,
+            cursorRegistry: cursors,
+        })
+        const firstPending = first.service.listContextAssets({
+            moduleScope: 'none', captureScope: 'query', limit: 1,
+        }).then(
+            (value) => ({ ok: true as const, value }),
+            (error: PluginApiError) => ({ ok: false as const, error }),
+        )
+        await waitFor(() => first.reads.mock.calls.length > 0)
+        const secondOutcome = await second.service.listContextAssets({
+            moduleScope: 'none', captureScope: 'query', limit: 1,
+        }).then(
+            (value) => ({ ok: true as const, value }),
+            (error: PluginApiError) => ({ ok: false as const, error }),
+        )
+        readGate.resolve(encoder.encode('winner bytes'))
+        const firstOutcome = await firstPending
+
+        expect(firstOutcome.ok).toBe(true)
+        expect(secondOutcome).toMatchObject({ ok: false, error: { code: 'RESOURCE_LIMIT' } })
+        expect(second.reads).not.toHaveBeenCalled()
+        expect((second.service as any).issuedHandles.size).toBe(0)
+        expect(cursors.activeCount(principalId)).toBe(1)
+        await expect(captures.read(retainedOwner, retainedQuery, retained.captureRevision))
+            .resolves.toEqual(retained)
+    })
+
+    it('releases a reservation when prospective cursor capacity rejects publication', async () => {
+        const principalId = '11111111-1111-4111-8111-111111111111'
+        const captures = new QueryCaptureCache({ maxItemsPerPrincipal: 3 })
+        const saturatedCursors = new CursorRegistry({ maxPerPrincipal: 0 })
+        const failed = harness({
+            principalId, instanceId: 'cursor-capacity-failure',
+            queryCaptureCache: captures, cursorRegistry: saturatedCursors,
+        })
+
+        await expect(failed.service.listContextAssets({
+            moduleScope: 'none', captureScope: 'query', limit: 1,
+        })).rejects.toMatchObject({ code: 'RESOURCE_LIMIT', retryable: true })
+        expect(failed.reads).toHaveBeenCalledTimes(3)
+        expect((failed.service as any).issuedHandles.size).toBe(0)
+        expect((captures as any).records.size).toBe(0)
+        expect((captures as any).reservations.size).toBe(0)
+
+        const retry = harness({
+            principalId, instanceId: 'cursor-capacity-retry',
+            queryCaptureCache: captures, cursorRegistry: new CursorRegistry(),
+        })
+        await expect(retry.service.listContextAssets({
+            moduleScope: 'none', captureScope: 'query', limit: 100,
+        })).resolves.toMatchObject({ assets: expect.arrayContaining([expect.any(Object)]) })
+    })
+
     it('rolls back staged asset handles and captures when first-capture materialization fails or is cancelled', async () => {
         let fail = true
         let probes = 0
@@ -2459,9 +2639,11 @@ describe('captured context count, filter, and fence security', () => {
             origin: { kind: 'character' as const, characterId: 'char-1' },
         }))
         const abortController = new AbortController()
+        const captures = new QueryCaptureCache({ maxItemsPerPrincipal: located.length })
         const h = harness({
             state,
             abortController,
+            queryCaptureCache: captures,
             adapterOverrides: {
                 captureAssetSources: async () => ({
                     selectors: { characterId: 'char-1', conversationId: 'conversation-1' },
@@ -2480,6 +2662,7 @@ describe('captured context count, filter, and fence security', () => {
             moduleScope: 'none', captureScope: 'query', limit: 1,
         })).rejects.toMatchObject({ code: 'PERMISSION_DENIED' })
         expect((h.service as any).issuedHandles.size).toBe(0)
+        expect((captures as any).reservations.size).toBe(0)
 
         fail = false
         probes = 0
@@ -2488,8 +2671,10 @@ describe('captured context count, filter, and fence security', () => {
         })).resolves.toMatchObject({ assets: [expect.any(Object)] })
         expect((h.service as any).issuedHandles.size).toBeGreaterThan(0)
 
+        const cancelledCaptures = new QueryCaptureCache({ maxItemsPerPrincipal: 3 })
         const cancelled = harness({
             abortController: new AbortController(),
+            queryCaptureCache: cancelledCaptures,
             readAsset: async () => {
                 cancelled.service.dispose()
                 return new Uint8Array([1])
@@ -2499,6 +2684,7 @@ describe('captured context count, filter, and fence security', () => {
             moduleScope: 'none', captureScope: 'query', limit: 1,
         })).rejects.toMatchObject({ code: 'ABORTED' })
         expect((cancelled.service as any).issuedHandles.size).toBe(0)
+        expect((cancelledCaptures as any).reservations.size).toBe(0)
     })
 
     it('fails a queued capture on permission-generation drift before physical I/O', async () => {

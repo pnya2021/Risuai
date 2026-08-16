@@ -17,6 +17,102 @@ const deferred = <T>() => {
 }
 
 describe('query capture cache', () => {
+    it('atomically reserves exact canonical capacity and consumes a reservation once', async () => {
+        const cache = new QueryCaptureCache({
+            maxItemsPerPrincipal: 2,
+            maxMetadataBytesPerPrincipal: 12,
+        })
+        const query = { scope: 'exact-byte-reservation' }
+        const items = [{ a: 'é' }]
+        // UTF-8 canonical JSON is exactly: [{"a":"é"}] (12 bytes).
+        expect(new TextEncoder().encode('[{"a":"é"}]').byteLength).toBe(12)
+        const firstPreparation = await cache.prepareCreate(owner(), query)
+        const first = cache.reservePrepared(firstPreparation, items)
+        expect(first.captureRevision).toMatch(/^sha256:[0-9a-f]{64}$/)
+        expect(first.items).toEqual(items)
+        await expect(cache.read(owner(), query, first.captureRevision))
+            .rejects.toMatchObject({ code: 'CONFLICT', retryable: true })
+        const competingPreparation = await cache.prepareCreate(
+            owner({ service: 'context-modules' }), { second: true },
+        )
+        expect(() => cache.reservePrepared(
+            competingPreparation, items,
+        )).toThrowError(expect.objectContaining({ code: 'RESOURCE_LIMIT' }))
+
+        cache.releaseReservation(first)
+        cache.releaseReservation(first)
+        const secondPreparation = await cache.prepareCreate(owner(), query)
+        const second = cache.reservePrepared(secondPreparation, items)
+        const committed = cache.commitReserved(second)
+        expect(committed.captureRevision).toBe(second.captureRevision)
+        expect(() => cache.commitReserved(second))
+            .toThrowError(expect.objectContaining({ code: 'CONFLICT', retryable: true }))
+        await expect(cache.read(owner(), query, committed.captureRevision)).resolves.toEqual(committed)
+
+        const secretPreparation = await cache.prepareCreate(owner(), { secret: true })
+        expect(() => cache.reservePrepared(
+            secretPreparation, [{ authorization: { pluginSecret: 'api-key' } }],
+        )).toThrowError(expect.objectContaining({ code: 'INVALID_ARGUMENT' }))
+    })
+
+    it.each(['principal', 'service', 'instance'] as const)(
+        'releases %s reservations and rejects their stale commits at lifecycle clear',
+        async (boundary) => {
+            const cache = new QueryCaptureCache({ maxItemsPerPrincipal: 1 })
+            const captureOwner = owner()
+            const stalePreparation = await cache.prepareCreate(captureOwner, { boundary })
+            const stale = cache.reservePrepared(stalePreparation, [{ id: 'stale' }])
+            if (boundary === 'principal') cache.clearPrincipal(captureOwner.principalId)
+            if (boundary === 'service') cache.clearService(captureOwner.principalId, captureOwner.service)
+            if (boundary === 'instance') cache.clearInstance(captureOwner.principalId, captureOwner.instanceId)
+            expect(() => cache.commitReserved(stale))
+                .toThrowError(expect.objectContaining({ code: 'CONFLICT', retryable: true }))
+
+            const currentPreparation = await cache.prepareCreate(captureOwner, { boundary, current: true })
+            const current = cache.reservePrepared(currentPreparation, [{ id: 'current' }])
+            expect(() => cache.commitReserved(current)).not.toThrow()
+        },
+    )
+
+    it('rejects a zero-cost duplicate reservation when its exact record expires', async () => {
+        let now = 0
+        const cache = new QueryCaptureCache({ now: () => now, ttlMs: 1, maxItemsPerPrincipal: 1 })
+        const captureOwner = owner()
+        const query = { scope: 'expiring-duplicate' }
+        await cache.create(captureOwner, query, [{ id: 'existing' }])
+        const preparation = await cache.prepareCreate(captureOwner, query)
+        const duplicate = cache.reservePrepared(preparation, [{ id: 'existing' }])
+
+        now = 2
+        expect(() => cache.commitReserved(duplicate))
+            .toThrowError(expect.objectContaining({ code: 'CONFLICT', retryable: true }))
+
+        const replacement = await cache.create(captureOwner, { scope: 'replacement' }, [{ id: 'replacement' }])
+        await expect(cache.read(
+            captureOwner, { scope: 'replacement' }, replacement.captureRevision,
+        )).resolves.toEqual(replacement)
+        expect((cache as any).records.size).toBe(1)
+        expect((cache as any).reservations.size).toBe(0)
+    })
+
+    it('rejects a zero-cost duplicate reservation when LRU evicts its exact record', async () => {
+        const cache = new QueryCaptureCache({ maxCapturesPerPrincipal: 1, maxItemsPerPrincipal: 2 })
+        const captureOwner = owner()
+        const query = { scope: 'lru-duplicate' }
+        await cache.create(captureOwner, query, [{ id: 'existing' }])
+        const preparation = await cache.prepareCreate(captureOwner, query)
+        const duplicate = cache.reservePrepared(preparation, [{ id: 'existing' }])
+        const retainedQuery = { scope: 'lru-winner' }
+        const retained = await cache.create(captureOwner, retainedQuery, [{ id: 'retained' }])
+
+        expect(() => cache.commitReserved(duplicate))
+            .toThrowError(expect.objectContaining({ code: 'CONFLICT', retryable: true }))
+        await expect(cache.read(captureOwner, retainedQuery, retained.captureRevision))
+            .resolves.toEqual(retained)
+        expect((cache as any).records.size).toBe(1)
+        expect((cache as any).reservations.size).toBe(0)
+    })
+
     it('produces byte-exact synchronous revisions matching the canonical async revision', async () => {
         const synchronousRevision = (queryCaptureCacheExports as {
             createSynchronousRevision?: (value: unknown) => string
