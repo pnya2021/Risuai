@@ -233,6 +233,16 @@ describe('principal permission service', () => {
         }
     })
 
+    it('uses the exact least-privilege card catalogue consent copy', () => {
+        expect(ALL_PLUGIN_PERMISSIONS).toContain('cardCatalogRead')
+        expect(permissionCopy('en', 'cardCatalogRead', 'Demo', 'demo').description).toBe(
+            'Demo (demo) requests permission to read normal character and group card names, types, representative images, card settings, global lorebooks, and card-owned images; chat messages and trash are excluded.',
+        )
+        expect(permissionCopy('ko', 'cardCatalogRead', 'Demo', 'demo').description).toBe(
+            'Demo (demo) 플러그인이 다음 권한을 요청합니다: 일반 캐릭터와 그룹 카드의 이름, 유형, 대표 이미지, 카드 설정, 전역 로어북, 카드 소유 이미지를 읽기(채팅 메시지와 휴지통 제외).',
+        )
+    })
+
     it('creates one unique abortable execution context per plugin load', () => {
         const plugin = { principalId: context.principalId, name: 'demo', displayName: 'Demo' }
         const first = createPluginExecutionContext(plugin)

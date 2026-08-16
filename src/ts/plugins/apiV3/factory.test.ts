@@ -3,6 +3,7 @@ import { parse } from 'acorn'
 
 import { cancelSandboxCallbackInvocation, invokeSandboxCleanupCallback, SandboxHost } from './factory'
 import { serializePluginApiError } from './illustration/errors'
+import * as capabilityContract from './illustration/capabilityContract'
 
 vi.stubGlobal('ImageBitmap', class ImageBitmap {})
 
@@ -92,6 +93,26 @@ afterEach(() => {
 })
 
 describe('SandboxHost structured errors', () => {
+  it('registers the Studio card capability only for one complete eight-method API surface', () => {
+    const expectedMethods = [
+      'listStudioCards',
+      'releaseStudioCardCatalogue',
+      'captureStudioCardSource',
+      'releaseStudioCardTarget',
+      'listStudioCardAssets',
+      'resolveStudioCardAssetHandles',
+      'releaseStudioCardAssetAccess',
+      'releaseStudioCardSource',
+    ]
+    const factory = (capabilityContract as any).studioCardCapabilityIdsForApi
+    const complete = Object.fromEntries(expectedMethods.map((method) => [method, () => undefined]))
+    expect((capabilityContract as any).STUDIO_CARD_API_METHODS).toEqual(expectedMethods)
+    expect(factory(complete)).toEqual(['context.cards-catalog.v1'])
+    for (const missing of expectedMethods) {
+      expect(factory({ ...complete, [missing]: undefined })).toEqual([])
+    }
+  })
+
   it('emits a syntactically valid guest bootstrap script', () => {
     const { iframe } = createHarness({})
     const parsed = new DOMParser().parseFromString(iframe.srcdoc, 'text/html')

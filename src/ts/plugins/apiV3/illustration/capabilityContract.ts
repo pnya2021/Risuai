@@ -4,6 +4,7 @@ export const CAPABILITY_IDS = [
     'context.current.v1',
     'context.assets.v1',
     'context.modules-installed.v1',
+    'context.cards-catalog.v1',
     'secrets.write-only.v1',
     'chat.message-events.v1',
     'chat.message-query.v1',
@@ -27,6 +28,24 @@ export interface CapabilityContractEntry {
     requiresCurrentContext?: boolean
 }
 
+export const STUDIO_CARD_API_METHODS = [
+    'listStudioCards',
+    'releaseStudioCardCatalogue',
+    'captureStudioCardSource',
+    'releaseStudioCardTarget',
+    'listStudioCardAssets',
+    'resolveStudioCardAssetHandles',
+    'releaseStudioCardAssetAccess',
+    'releaseStudioCardSource',
+] as const
+
+export const studioCardCapabilityIdsForApi = (api: unknown): PluginCapabilityId[] => {
+    if (typeof api !== 'object' || api === null) return []
+    return STUDIO_CARD_API_METHODS.every((method) => typeof (api as Record<string, unknown>)[method] === 'function')
+        ? ['context.cards-catalog.v1']
+        : []
+}
+
 export const CAPABILITY_CONTRACT: Record<PluginCapabilityId, CapabilityContractEntry> = {
     'context.current.v1': {
         version: 1, permission: 'contextAssets', additionalPermissions: [], requiresCurrentContext: true,
@@ -39,6 +58,35 @@ export const CAPABILITY_CONTRACT: Record<PluginCapabilityId, CapabilityContractE
     'context.modules-installed.v1': {
         version: 1, permission: 'installedModulesRead', additionalPermissions: [],
         limits: { maxSnapshotJsonBytes: 2097152, maxJsonDepth: 32, maxTextFieldUtf8Bytes: 524288, defaultPageSize: 50, maxPageSize: 100, cursorTtlMs: 300000, maxActiveCursorsPerPrincipal: 64, moduleAssetCount: true, moduleAssetCollectionRevision: true, captureFence: 'query-collection-v1', maxCapturedQueryItemsPerPrincipal: 20000, maxCapturedQueryMetadataBytesPerPrincipal: 16777216 },
+    },
+    'context.cards-catalog.v1': {
+        version: 1, permission: 'cardCatalogRead', additionalPermissions: [],
+        limits: {
+            defaultPageSize: 24,
+            maxPageSize: 100,
+            searchMaxUtf8Bytes: 256,
+            cursorTtlMs: 300000,
+            sourceCaptureTtlMs: 300000,
+            assetAccessTtlMs: 300000,
+            maxActiveCursorsPerPrincipal: 64,
+            maxConcurrentAssetReadsPerPrincipal: 4,
+            maxQueuedAssetReadsPerPrincipal: 128,
+            maxActiveCataloguesPerPrincipal: 4,
+            maxActiveTargetsPerPrincipal: 4,
+            maxActiveCapturesPerPrincipal: 4,
+            targetTtlMs: 1800000,
+            maxCandidateAccessIds: 24,
+            maxSelectedAccessIds: 3,
+            maxLogicalAssetIdUtf8Bytes: 256,
+            maxAccessBatchUtf8Bytes: 6144,
+            maxCandidateAccessBatchesPerCapture: 2,
+            maxSelectedAccessBatchesPerCapture: 1,
+            maxCatalogueMetadataBytesPerPrincipal: 4194304,
+            maxCapturedItemsPerPrincipal: 20000,
+            maxCapturedMetadataBytesPerPrincipal: 16777216,
+            maxGroupMembersPerCapture: 100,
+            maxAggregateCaptureBytes: 16777216,
+        },
     },
     'secrets.write-only.v1': {
         version: 1, permission: 'secrets', additionalPermissions: [],

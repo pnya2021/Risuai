@@ -16,8 +16,8 @@ const context = {
 }
 
 describe('V3 capability discovery', () => {
-    it('contains all fourteen version-one descriptors and exact registry data', () => {
-        expect(CAPABILITY_IDS).toHaveLength(14)
+    it('contains all fifteen version-one descriptors and exact registry data', () => {
+        expect(CAPABILITY_IDS).toHaveLength(15)
         expect(Object.values(CAPABILITY_CONTRACT).every((entry) => entry.version === 1)).toBe(true)
         expect(CAPABILITY_CONTRACT['context.assets.v1'].permission).toBe('contextAssets')
         expect(CAPABILITY_CONTRACT['context.assets.v1'].additionalPermissions).toEqual(['installedModulesRead'])
@@ -61,14 +61,45 @@ describe('V3 capability discovery', () => {
         expect(CAPABILITY_CONTRACT['context.current.v1'].limits).toEqual({
             maxSnapshotJsonBytes: 2097152, maxJsonDepth: 32, maxTextFieldUtf8Bytes: 524288,
         })
+        expect((CAPABILITY_CONTRACT as any)['context.cards-catalog.v1']).toEqual({
+            version: 1,
+            permission: 'cardCatalogRead',
+            additionalPermissions: [],
+            limits: {
+                defaultPageSize: 24,
+                maxPageSize: 100,
+                searchMaxUtf8Bytes: 256,
+                cursorTtlMs: 300000,
+                sourceCaptureTtlMs: 300000,
+                assetAccessTtlMs: 300000,
+                maxActiveCursorsPerPrincipal: 64,
+                maxConcurrentAssetReadsPerPrincipal: 4,
+                maxQueuedAssetReadsPerPrincipal: 128,
+                maxActiveCataloguesPerPrincipal: 4,
+                maxActiveTargetsPerPrincipal: 4,
+                maxActiveCapturesPerPrincipal: 4,
+                targetTtlMs: 1800000,
+                maxCandidateAccessIds: 24,
+                maxSelectedAccessIds: 3,
+                maxLogicalAssetIdUtf8Bytes: 256,
+                maxAccessBatchUtf8Bytes: 6144,
+                maxCandidateAccessBatchesPerCapture: 2,
+                maxSelectedAccessBatchesPerCapture: 1,
+                maxCatalogueMetadataBytesPerPrincipal: 4194304,
+                maxCapturedItemsPerPrincipal: 20000,
+                maxCapturedMetadataBytesPerPrincipal: 16777216,
+                maxGroupMembersPerCapture: 100,
+                maxAggregateCaptureBytes: 16777216,
+            },
+        })
     })
 
     it('locks every exact capability limit key and value to the reviewed registry', async () => {
         const serialized = JSON.stringify(CAPABILITY_CONTRACT)
         const digest = [...new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(serialized)))]
             .map((value) => value.toString(16).padStart(2, '0')).join('')
-        expect(new TextEncoder().encode(serialized).byteLength).toBe(5737)
-        expect(digest).toBe('d752071c7a94ec0f38749106e905f4177a0475975b3a615cf56394e6c63c940c')
+        expect(new TextEncoder().encode(serialized).byteLength).toBe(6619)
+        expect(digest).toBe('7240d4a8ee9ce7f8d4f330f4e097840ee83987d61bdc12d991b7fd58093cba65')
     })
 
     it('returns an explicit descriptor for unknown IDs', async () => {
@@ -92,6 +123,7 @@ describe('V3 capability discovery', () => {
             'context.current.v1': { permission: 'contextAssets', additionalPermissions: [] },
             'context.assets.v1': { permission: 'contextAssets', additionalPermissions: ['installedModulesRead'] },
             'context.modules-installed.v1': { permission: 'installedModulesRead', additionalPermissions: [] },
+            'context.cards-catalog.v1': { permission: 'cardCatalogRead', additionalPermissions: [] },
             'secrets.write-only.v1': { permission: 'secrets', additionalPermissions: [] },
             'chat.message-events.v1': { permission: 'chatObserve', additionalPermissions: ['chatObserveAll'] },
             'chat.message-query.v1': { permission: 'chatObserve', additionalPermissions: ['chatObserveAll'] },
@@ -142,6 +174,19 @@ describe('V3 capability discovery', () => {
 
     it('returns all known descriptors when IDs are omitted', async () => {
         expect(Object.keys(await getCapabilities(context))).toEqual(CAPABILITY_IDS)
+    })
+
+    it('discovers the card catalogue independently of current chat state', async () => {
+        const descriptor = await getCapabilities(context, ['context.cards-catalog.v1'], {
+            permissionState: async () => 'granted',
+            runtime: { registeredServices: new Set(['context.cards-catalog.v1']), hasCurrentContext: false },
+        })
+        expect(descriptor['context.cards-catalog.v1']).toMatchObject({
+            supported: true,
+            available: true,
+            permission: 'cardCatalogRead',
+            permissionState: 'granted',
+        })
     })
 
     it('registers only the usable owned Inlay lifecycle and still gates it on inlayWrite', async () => {

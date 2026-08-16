@@ -4,7 +4,7 @@ import { replacePluginV3RuntimeSnapshot } from "../pluginV3Reload";
 import { getCurrentCharacter, getCurrentChat, getDatabase } from "src/ts/storage/database.svelte";
 import { SafeLocalPluginStorage, tagWhitelist } from "../pluginSafeClass";
 import DOMPurify from 'dompurify';
-import { additionalChatMenu, additionalFloatingActionButtons, additionalHamburgerMenu, additionalSettingsMenu, bodyIntercepterStore, chatPanelStore, DBState, selectedCharID, type MenuDef } from "src/ts/stores.svelte";
+import { additionalChatMenu, additionalFloatingActionButtons, additionalHamburgerMenu, additionalSettingsMenu, bodyIntercepterStore, chatPanelStore, DBState, selectedCharID, selIdState, type MenuDef } from "src/ts/stores.svelte";
 import { v4 } from "uuid";
 import { sleep } from "src/ts/util";
 import { alertConfirm, alertError, alertNormal } from "src/ts/alert";
@@ -49,6 +49,11 @@ import { invokePermissionCheckedProvider } from './providerPermission';
 import { isCurrentPluginRuntimeRecord } from '../pluginRuntimeReplacement';
 import { ContextResourceService } from './illustration/contextResources';
 import { createRisuContextResourceAdapter } from './illustration/contextResources.risu';
+import { createRisuStudioCardResourceAdapter } from './illustration/studioCardResources.risu';
+import { createStudioCardResourceService } from './illustration/studioCardResources';
+import { contextAssetAuthorityRegistry } from './illustration/contextAssetAuthorityRegistry';
+import { contextAssetReadCoordinator } from './illustration/contextAssetReadCoordinator';
+import { studioCardCapabilityIdsForApi } from './illustration/capabilityContract';
 import { PluginSecretService, protectedPluginSecretBackend } from './illustration/pluginSecretStore';
 import { PluginNativeFetchService } from './illustration/nativeFetch';
 import { PluginApiError } from './illustration/errors';
@@ -650,6 +655,23 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
         },
     )
     addPluginUnloadCallback(context.instanceId, () => contextResources.dispose())
+    const studioCardResources = createStudioCardResourceService({
+        context,
+        adapter: createRisuStudioCardResourceAdapter({
+            getDatabase,
+            getSelectedCharacterIndex: () => selIdState.selId,
+            readImage,
+            getAssetStorageRevision,
+            reactiveCatalogueIndex: true,
+        }),
+        assetAuthorityRegistry: contextAssetAuthorityRegistry,
+        readCoordinator: contextAssetReadCoordinator,
+        permissionGeneration: () => pluginPermissionService.generation(context.principalId),
+        requirePermission: () => pluginPermissionService.require(context, 'cardCatalogRead', {
+            locale: DBState.db.language === 'ko' ? 'ko' : 'en',
+        }),
+    })
+    addPluginUnloadCallback(context.instanceId, () => studioCardResources.dispose())
     const inlayLifecycle = new InlayLifecycleService(
         context,
         createRisuInlayLifecycleAdapter({
@@ -1392,6 +1414,7 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
                     'context.current.v1',
                     'context.assets.v1',
                     'context.modules-installed.v1',
+                    ...studioCardCapabilityIdsForApi(studioCardResources),
                     'secrets.write-only.v1',
                     ...MESSAGE_EVENT_CAPABILITY_IDS,
                     ...MESSAGE_QUERY_CAPABILITY_IDS,
@@ -1436,6 +1459,18 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
         getActiveModules: (options) => contextResources.getActiveModules(options),
         listContextModules: (options) => contextResources.listContextModules(options),
         readContextAsset: (assetId: string, options) => contextResources.readContextAsset(assetId, options),
+        listStudioCards: (options) => studioCardResources.listStudioCards(options),
+        releaseStudioCardCatalogue: (catalogueRevision: string) =>
+            studioCardResources.releaseStudioCardCatalogue(catalogueRevision),
+        captureStudioCardSource: (input) => studioCardResources.captureStudioCardSource(input),
+        releaseStudioCardTarget: (targetRevision: string) =>
+            studioCardResources.releaseStudioCardTarget(targetRevision),
+        listStudioCardAssets: (options) => studioCardResources.listStudioCardAssets(options),
+        resolveStudioCardAssetHandles: (options) => studioCardResources.resolveStudioCardAssetHandles(options),
+        releaseStudioCardAssetAccess: (accessRevision: string) =>
+            studioCardResources.releaseStudioCardAssetAccess(accessRevision),
+        releaseStudioCardSource: (captureRevision: string) =>
+            studioCardResources.releaseStudioCardSource(captureRevision),
         onMessageCommitted: async (
             listener: (event: MessageCommittedEvent) => void | Promise<void>,
             options?: MessageEventOptions,

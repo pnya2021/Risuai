@@ -6,6 +6,7 @@ import { PluginApiError } from './errors'
 export const ALL_PLUGIN_PERMISSIONS = [
     'fetchLogs', 'db', 'mainDom', 'replacer', 'provider', 'sendChat',
     'contextAssets', 'installedModulesRead', 'chatObserve', 'chatObserveAll',
+    'cardCatalogRead',
     'chatWrite', 'chatWriteAll', 'inlayWrite', 'inlayRead', 'inlayManage',
     'secrets', 'localModelInference', 'pluginJobs',
 ] as const
@@ -88,6 +89,7 @@ const EN: Record<PluginPermissionId, string> = {
     sendChat: 'send chat messages and trigger model responses',
     contextAssets: 'read the current card, conversation, and active assets',
     installedModulesRead: 'read descriptive data and assets from installed modules',
+    cardCatalogRead: 'read normal character and group card names, types, representative images, card settings, global lorebooks, and card-owned images; chat messages and trash are excluded',
     chatObserve: 'observe committed messages in the current conversation',
     chatObserveAll: 'observe committed messages across conversations',
     chatWrite: 'apply restricted changes to the current conversation',
@@ -105,6 +107,7 @@ const KO: Record<PluginPermissionId, string> = {
     mainDom: '앱의 기본 화면에 접근하기', replacer: '채팅에 표시되는 내용을 치환하기',
     provider: 'AI 제공자를 등록하고 사용하기', sendChat: '채팅 메시지를 보내고 모델 응답을 실행하기',
     contextAssets: '현재 카드, 대화, 활성 에셋을 읽기', installedModulesRead: '설치된 모듈의 설명과 에셋을 읽기',
+    cardCatalogRead: '일반 캐릭터와 그룹 카드의 이름, 유형, 대표 이미지, 카드 설정, 전역 로어북, 카드 소유 이미지를 읽기(채팅 메시지와 휴지통 제외)',
     chatObserve: '현재 대화의 확정된 메시지를 관찰하기', chatObserveAll: '모든 대화의 확정된 메시지를 관찰하기',
     chatWrite: '현재 대화를 제한적으로 변경하기', chatWriteAll: '권한이 있는 다른 대화를 제한적으로 변경하기',
     inlayWrite: '자신의 Inlay를 생성·읽기·삭제하기', inlayRead: '다른 플러그인 또는 레거시 Inlay를 읽기',

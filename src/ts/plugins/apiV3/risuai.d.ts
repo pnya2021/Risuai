@@ -1233,6 +1233,7 @@ interface ProviderOptions {
 type PluginPermissionId =
     | 'fetchLogs' | 'db' | 'mainDom' | 'replacer' | 'provider' | 'sendChat'
     | 'contextAssets' | 'installedModulesRead' | 'chatObserve' | 'chatObserveAll'
+    | 'cardCatalogRead'
     | 'chatWrite' | 'chatWriteAll' | 'inlayWrite' | 'inlayRead' | 'inlayManage'
     | 'secrets' | 'localModelInference' | 'pluginJobs';
 
@@ -1554,6 +1555,104 @@ interface ContextAssetRef {
     origin:
         | { kind: 'character'; characterId: CharacterId }
         | { kind: 'module'; moduleId: string };
+}
+
+type StudioCardKind = 'character' | 'group';
+
+interface StudioCardPortraitDescriptor {
+    assetId: string;
+    revision: Revision;
+    name: string;
+    mediaType: string;
+}
+
+interface StudioCardSummary {
+    cardId: CharacterId;
+    catalogueItemRevision: Revision;
+    kind: StudioCardKind;
+    name: string;
+    groupMemberCount: number;
+    portrait?: StudioCardPortraitDescriptor;
+}
+
+interface StudioCardCataloguePage {
+    catalogueRevision: Revision;
+    total: number;
+    hostActiveCard?: StudioCardSummary;
+    items: StudioCardSummary[];
+    nextCursor?: string;
+}
+
+interface StudioCardLogicalAssetDescriptor {
+    logicalAssetId: string;
+    assetRevision: Revision;
+    ownerCardId: CharacterId;
+    name: string;
+    mediaType: string;
+    role: ContextAssetRole;
+}
+
+interface StudioCardAssetPage {
+    captureRevision: Revision;
+    assets: StudioCardLogicalAssetDescriptor[];
+    nextCursor?: string;
+}
+
+interface StudioCardAssetAccessBatch {
+    captureRevision: Revision;
+    accessRevision: Revision;
+    purpose: 'candidate-page' | 'selected';
+    assets: Array<{ logicalAssetId: string; asset: ContextAssetRef }>;
+}
+
+interface StudioCardSourceCapture {
+    targetRevision: Revision;
+    captureRevision: Revision;
+    sourceRevision: Revision;
+    card: CharacterCardSnapshot;
+    groupMembers: CharacterCardSnapshot[];
+}
+
+interface StudioCardCatalogueOptions {
+    search?: string;
+    kind?: 'all' | StudioCardKind;
+    cursor?: string;
+    limit?: number;
+    catalogueRevision?: Revision;
+    signal?: AbortSignal;
+}
+
+type StudioCardSourceCaptureInput =
+    | {
+        cardId: CharacterId;
+        expectedCatalogueItemRevision: Revision;
+        catalogueRevision: Revision;
+        signal?: AbortSignal;
+    }
+    | {
+        targetRevision: Revision;
+        expectedSourceRevision: Revision;
+        signal?: AbortSignal;
+    }
+    | {
+        targetRevision: Revision;
+        acceptCurrentSourceRevision: true;
+        signal?: AbortSignal;
+    };
+
+interface StudioCardAssetListOptions {
+    captureRevision: Revision;
+    cursor?: string;
+    limit?: number;
+    mediaTypes?: string[];
+    signal?: AbortSignal;
+}
+
+interface StudioCardAssetAccessOptions {
+    captureRevision: Revision;
+    logicalAssetIds: string[];
+    purpose: 'candidate-page' | 'selected';
+    signal?: AbortSignal;
 }
 
 type ModuleActivationReason = 'global' | 'chat' | 'character' | 'persona' | 'integration';
@@ -2583,6 +2682,30 @@ interface RisuaiPluginAPI {
         name: string;
         mediaType: string;
     }>;
+
+    /** Lists bounded safe summaries for normal and group cards without chats or trash. */
+    listStudioCards?(options?: StudioCardCatalogueOptions): Promise<StudioCardCataloguePage>;
+
+    /** Releases one retained Studio card catalogue and its page/portrait authority. */
+    releaseStudioCardCatalogue?(catalogueRevision: Revision): Promise<void>;
+
+    /** Captures one selected card and direct group members without changing Host navigation. */
+    captureStudioCardSource?(input: StudioCardSourceCaptureInput): Promise<StudioCardSourceCapture>;
+
+    /** Releases one retained Studio target and all descendant source authority. */
+    releaseStudioCardTarget?(targetRevision: Revision): Promise<void>;
+
+    /** Lists bounded logical card-owned asset descriptors without granting read authority. */
+    listStudioCardAssets?(options: StudioCardAssetListOptions): Promise<StudioCardAssetPage>;
+
+    /** Resolves an exact bounded logical-ID batch into short-lived readable handles. */
+    resolveStudioCardAssetHandles?(options: StudioCardAssetAccessOptions): Promise<StudioCardAssetAccessBatch>;
+
+    /** Releases one candidate-page or selected asset-access batch. */
+    releaseStudioCardAssetAccess?(accessRevision: Revision): Promise<void>;
+
+    /** Releases one retained selected-card source capture. */
+    releaseStudioCardSource?(captureRevision: Revision): Promise<void>;
 
     /** Subscribes to live A1 character-message commits. Events are not replayed. */
     onMessageCommitted(
