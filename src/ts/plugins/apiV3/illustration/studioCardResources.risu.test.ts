@@ -561,6 +561,7 @@ describe('Risu Studio card native projection', () => {
     it('rejects final descriptor structure beyond 16 MiB before mapping an exact 20,000-item source', async () => {
         const cardId = 'c'.repeat(300)
         const alice = character(cardId, 'Alice')
+        alice.image = 'assets/portrait.png'
         let firstEntryReads = 0
         alice.additionalAssets = new Proxy(
             Array.from({ length: 19_998 }, (_, index) => [
