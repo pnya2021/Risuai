@@ -139,7 +139,63 @@ async function select(h: ReturnType<typeof harness>, cardId: string) {
     })
 }
 
+const canonicalSourceBytes = (source: {
+    card: unknown
+    groupMembers: unknown[]
+    assets: unknown[]
+}) => new TextEncoder().encode(JSON.stringify({
+    card: source.card,
+    groupMembers: source.groupMembers,
+    assets: source.assets,
+})).byteLength
+
+const captureBoundaryFixture = () => {
+    const source = character('boundary', 'Boundary')
+    source.image = ''
+    for (const field of [
+        'desc', 'personality', 'scenario', 'firstMessage', 'exampleMessage',
+        'creatorNotes', 'systemPrompt', 'postHistoryInstructions', 'notes', 'additionalText',
+    ]) source[field] = ''
+    source.globalLore = []
+    const storageRevisions = new Map<string, string>()
+    source.additionalAssets = Array.from({ length: 19_999 }, (_, index) => {
+        const storageKey = `assets/a-${index}.png`
+        storageRevisions.set(storageKey, 'r')
+        return ['x'.repeat(index < 62 ? 457 : 456), storageKey, 'png']
+    })
+    return { source, storageRevisions }
+}
+
 describe('Risu Studio card native projection', () => {
+    it('accepts the exact 20,000-item canonical capture envelope', async () => {
+        const fixture = captureBoundaryFixture()
+        const h = harness([fixture.source], 0, fixture.storageRevisions)
+
+        const captured = await h.adapter.captureSource('boundary')
+
+        expect(captured).not.toBeNull()
+        expect(1 + captured!.groupMembers.length + captured!.assets.length).toBe(20_000)
+        expect(canonicalSourceBytes(captured!)).toBe(16_777_211)
+    }, 120_000)
+
+    it('rejects a 20,000-item canonical capture envelope above 16 MiB', async () => {
+        const fixture = captureBoundaryFixture()
+        const h = harness([fixture.source], 0, fixture.storageRevisions)
+        const exact = await h.adapter.captureSource('boundary')
+        expect(exact).not.toBeNull()
+        const oversizedEnvelope = {
+            card: exact!.card,
+            groupMembers: exact!.groupMembers,
+            assets: exact!.assets.map((asset, index) => index === 0
+                ? { ...asset, name: `${asset.name}xxxxxx` }
+                : asset),
+        }
+        expect(canonicalSourceBytes(oversizedEnvelope)).toBe(16_777_217)
+        fixture.source.additionalAssets[0][0] += 'xxxxxx'
+
+        await expect(h.adapter.captureSource('boundary')).rejects.toMatchObject({ code: 'RESOURCE_LIMIT' })
+    }, 120_000)
+
     it('reuses the reactive scalar index without reprojecting unchanged cards', () => {
         const raw = character('alice', 'Alice')
         let scalarReads = 0
