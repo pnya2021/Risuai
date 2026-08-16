@@ -874,6 +874,8 @@ export class ContextResourceService {
         this.permissionGeneration = permissionGeneration
         this.captureGeneration += 1
         this.generation += 1
+        this.issuedHandles.clear()
+        this.assetAuthorityRegistry.clearInstance(this.context.principalId, this.context.instanceId)
         this.queryCaptureCache.clearInstance(this.context.principalId, this.context.instanceId)
         this.cursorRegistry.clearInstance(this.context.principalId, this.context.instanceId)
         this.readCoordinator.cancelInstance({
@@ -1504,13 +1506,13 @@ export class ContextResourceService {
         }
         lruSet(this.digestCache, this.digestKey(source), digest, MAX_DIGEST_RECORDS)
         const assetId = await this.fenced(this.handleFor(source, origin, digest.revision), generation, signal)
-        lruSet(
-            stagedHandles ?? this.issuedHandles,
-            assetId,
-            { identity: source.identity, origin },
-            MAX_ISSUED_HANDLES,
-        )
-        if (!stagedHandles) this.registerIssuedAuthority(assetId, { identity: source.identity, origin })
+        const issued = { identity: source.identity, origin }
+        if (stagedHandles) {
+            stagedHandles.set(assetId, issued)
+        } else {
+            this.assetAuthorityRegistry.register(this.issuedAuthority(assetId, issued))
+            lruSet(this.issuedHandles, assetId, issued, MAX_ISSUED_HANDLES)
+        }
         const reference: ContextAssetRef = {
             assetId,
             revision: digest.revision,
@@ -1883,6 +1885,12 @@ export class ContextResourceService {
                                     signal,
                                     stagedHandles,
                                 ))
+                            } else {
+                                const projection = this.assetCaptureProjections.get(located)!
+                                stagedHandles.set(projection.assetId, {
+                                    identity: located.source.identity,
+                                    origin: located.origin,
+                                })
                             }
                             return undefined
                         },
@@ -1962,18 +1970,25 @@ export class ContextResourceService {
             ...(options.captureScope === 'query' ? { captureRevision } : {}),
         }
         assertContextSnapshotLimits(result)
-        if (stagedCapture) {
-            this.queryCaptureCache.commitReserved(captureReservation!)
-            this.queryCaptureCache.readPrepared<ContextLocatedAssetSource>(capturePreparation, captureRevision)
+        const authorityRegistration = this.assetAuthorityRegistry.registerBatch(
+            [...stagedHandles].map(([assetId, issued]) => this.issuedAuthority(assetId, issued)),
+        )
+        try {
+            if (stagedCapture) {
+                this.queryCaptureCache.commitReserved(captureReservation!)
+                this.queryCaptureCache.readPrepared<ContextLocatedAssetSource>(capturePreparation, captureRevision)
+            }
+            for (const [assetId, issued] of stagedHandles) {
+                lruSet(this.issuedHandles, assetId, issued, MAX_ISSUED_HANDLES)
+            }
+            if (nextCursorValue && nextCursorPreparation && nextCursorCommit) {
+                this.cursorRegistry.commitPrepared(nextCursorPreparation, nextCursorValue, nextCursorCommit)
+            }
+            return result
+        } catch (error) {
+            authorityRegistration.rollback()
+            throw error
         }
-        for (const [assetId, issued] of stagedHandles) {
-            lruSet(this.issuedHandles, assetId, issued, MAX_ISSUED_HANDLES)
-            this.registerIssuedAuthority(assetId, issued)
-        }
-        if (nextCursorValue && nextCursorPreparation && nextCursorCommit) {
-            this.cursorRegistry.commitPrepared(nextCursorPreparation, nextCursorValue, nextCursorCommit)
-        }
-        return result
         } finally {
             if (captureReservation) this.queryCaptureCache.releaseReservation(captureReservation)
         }
@@ -2019,6 +2034,7 @@ export class ContextResourceService {
             source: ContextAssetSource
             origin: ContextAssetRef['origin']
         }> = []
+        const stagedHandles = new Map<string, IssuedAssetHandle>()
         const page = await this.page(
             'context-assets',
             query,
@@ -2046,6 +2062,7 @@ export class ContextResourceService {
                         ),
                         generation,
                         signal,
+                        stagedHandles,
                     ),
                 )
                 const nextOffset = offset + pageSources.length
@@ -2076,7 +2093,14 @@ export class ContextResourceService {
                 throw this.contextChanged()
             }
             assertContextSnapshotLimits(result)
+            this.refreshCaptureGeneration()
             this.assertActive(generation, signal)
+            this.assetAuthorityRegistry.registerBatch(
+                [...stagedHandles].map(([assetId, issued]) => this.issuedAuthority(assetId, issued)),
+            )
+            for (const [assetId, issued] of stagedHandles) {
+                lruSet(this.issuedHandles, assetId, issued, MAX_ISSUED_HANDLES)
+            }
             return result
         } catch (error) {
             if (page.nextCursor) this.cursorRegistry.clear(page.nextCursor)
@@ -2121,8 +2145,8 @@ export class ContextResourceService {
             : left.moduleId === (right as { kind: 'module'; moduleId: string }).moduleId)
     }
 
-    private registerIssuedAuthority(assetId: string, issued: IssuedAssetHandle) {
-        this.assetAuthorityRegistry.register({
+    private issuedAuthority(assetId: string, issued: IssuedAssetHandle): CurrentContextAssetAuthority {
+        return {
             principalId: this.context.principalId,
             instanceId: this.context.instanceId,
             assetId,
@@ -2131,7 +2155,11 @@ export class ContextResourceService {
                 : 'current-context-installed-module',
             identity: issued.identity,
             origin: { ...issued.origin },
-        })
+        }
+    }
+
+    private registerIssuedAuthority(assetId: string, issued: IssuedAssetHandle) {
+        this.assetAuthorityRegistry.register(this.issuedAuthority(assetId, issued))
     }
 
     private authorizedScanAssets(state: ContextHostState) {
@@ -2232,7 +2260,13 @@ export class ContextResourceService {
                         maxOutputBytes: MAX_THUMBNAIL_OUTPUT_BYTES,
                     }, physicalSignal)
                     this.assertActive(generation, physicalSignal)
-                    if (!(thumbnail.data instanceof Uint8Array) || thumbnail.data.byteLength > maxBytes
+                    if (!(thumbnail.data instanceof Uint8Array)
+                        || !Number.isInteger(thumbnail.width) || thumbnail.width <= 0
+                        || !Number.isInteger(thumbnail.height) || thumbnail.height <= 0
+                        || !Number.isInteger(thumbnail.decodedPixels) || thumbnail.decodedPixels <= 0) {
+                        throw new PluginApiError('DECODE_FAILED', 'Thumbnail backend returned invalid output')
+                    }
+                    if (thumbnail.data.byteLength > maxBytes
                         || thumbnail.data.byteLength > MAX_THUMBNAIL_OUTPUT_BYTES
                         || thumbnail.decodedPixels > MAX_THUMBNAIL_PIXELS
                         || Math.max(thumbnail.width, thumbnail.height) > THUMBNAIL_LONG_EDGE) {
@@ -2243,6 +2277,7 @@ export class ContextResourceService {
                 }
                 await authority.validate(physicalSignal)
                 this.assertActive(generation, physicalSignal)
+                authority.touch?.()
                 return { data: result.slice(), revision: authority.revision, name: authority.name, mediaType }
             },
         })
@@ -2409,6 +2444,7 @@ export class ContextResourceService {
                         details: { expectedRevision: options.ifRevision, actualRevision: digest.revision },
                     })
                 }
+                this.refreshCaptureGeneration()
                 this.assertActive(generation, physicalSignal)
                 lruSet(this.digestCache, this.digestKey(located.source), digest, MAX_DIGEST_RECORDS)
                 lruSet(

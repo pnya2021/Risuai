@@ -23,6 +23,7 @@ export interface CursorCommitPreparation<T> {
     readonly cursor: string
     readonly value: T
     readonly expiresAt: number
+    readonly replacement?: { readonly cursor: string; readonly record: object }
 }
 
 export class CursorRegistry {
@@ -64,12 +65,26 @@ export class CursorRegistry {
         return { principalId, service, instanceId, queryDigest, lifecycle }
     }
 
-    prepareCommit<T>(preparation: CursorPreparation, value: T): CursorCommitPreparation<T> {
+    prepareCommit<T>(
+        preparation: CursorPreparation,
+        value: T,
+        replacingCursor?: string,
+    ): CursorCommitPreparation<T> {
         if (!this.isLifecycleCurrent(preparation.lifecycle)) {
             throw new PluginApiError('ABORTED', 'Plugin cursor owner is no longer active')
         }
         this.removeExpired()
-        if (this.activeCount(preparation.principalId) >= this.maxPerPrincipal) {
+        const replacement = replacingCursor ? this.records.get(replacingCursor) : undefined
+        if (replacingCursor && (!replacement
+            || replacement.principalId !== preparation.principalId
+            || replacement.service !== preparation.service
+            || replacement.instanceId !== preparation.instanceId
+            || replacement.queryDigest !== preparation.queryDigest)) {
+            throw new PluginApiError('INVALID_ARGUMENT', 'Invalid or expired cursor')
+        }
+        const active = [...this.records.values()].filter((record) =>
+            record.principalId === preparation.principalId).length
+        if (active - (replacement ? 1 : 0) >= this.maxPerPrincipal) {
             throw new PluginApiError('RESOURCE_LIMIT', 'Too many active cursors', { retryable: true })
         }
         let cursor: string
@@ -87,6 +102,9 @@ export class CursorRegistry {
             cursor,
             value,
             expiresAt,
+            ...(replacement && replacingCursor ? {
+                replacement: { cursor: replacingCursor, record: replacement },
+            } : {}),
         })
     }
 
@@ -101,9 +119,14 @@ export class CursorRegistry {
         if (!this.isLifecycleCurrent(preparation.lifecycle)) {
             throw new PluginApiError('ABORTED', 'Plugin cursor owner is no longer active')
         }
+        const replacement = commit.replacement
+        if (replacement && this.records.get(replacement.cursor) !== replacement.record) {
+            throw new PluginApiError('INVALID_ARGUMENT', 'Invalid or expired cursor')
+        }
+        const active = [...this.records.values()].filter((record) =>
+            record.principalId === preparation.principalId).length
         if (this.records.has(commit.cursor)
-            || [...this.records.values()].filter((record) =>
-                record.principalId === preparation.principalId).length >= this.maxPerPrincipal) {
+            || active - (replacement ? 1 : 0) >= this.maxPerPrincipal) {
             throw new PluginApiError('RESOURCE_LIMIT', 'Too many active cursors', { retryable: true })
         }
         this.records.set(commit.cursor, {
@@ -114,6 +137,7 @@ export class CursorRegistry {
             value,
             expiresAt: commit.expiresAt,
         })
+        if (replacement) this.records.delete(replacement.cursor)
         return commit.cursor
     }
 

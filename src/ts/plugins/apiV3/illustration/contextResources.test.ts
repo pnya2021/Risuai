@@ -13,6 +13,7 @@ import {
 } from './contextResources'
 import { resolveModuleActivations } from './moduleActivation'
 import { QueryCaptureCache } from './queryCaptureCache'
+import { ContextAssetAuthorityRegistry } from './contextAssetAuthorityRegistry'
 
 const encoder = new TextEncoder()
 
@@ -187,7 +188,7 @@ function harness(options: {
     instanceId?: string
     queryCaptureCache?: QueryCaptureCache
     getPermissionGeneration?: () => number
-    assetAuthorityRegistry?: unknown
+    assetAuthorityRegistry?: ContextAssetAuthorityRegistry | unknown
     adapterOverrides?: Partial<ContextResourceAdapter>
 } = {}) {
     let state = options.state ?? makeState()
@@ -546,6 +547,47 @@ describe('module activation and module resources', () => {
 })
 
 describe('opaque context assets', () => {
+    it('rejects a new current-handle page atomically and preserves prior readable handles at registry capacity', async () => {
+        const state = makeState()
+        state.characters[0].assets = [
+            asset('pressure-a', 'alice-portrait', 'portrait'),
+            asset('pressure-b', 'alice-happy', 'emotion'),
+            asset('pressure-c', 'alice-uniform', 'additional'),
+        ]
+        const registry = new ContextAssetAuthorityRegistry({ maxPerPrincipal: 2 })
+        const h = harness({ state, assetAuthorityRegistry: registry })
+        const first = await h.service.listContextAssets({ moduleScope: 'none', limit: 2 })
+        expect(first.assets).toHaveLength(2)
+        const before = registry.size()
+
+        await expect(h.service.listContextAssets({
+            moduleScope: 'none', limit: 2, cursor: first.nextCursor,
+        })).rejects.toMatchObject({ code: 'RESOURCE_LIMIT' })
+        expect(registry.size()).toBe(before)
+        await expect(h.service.readContextAsset(first.assets[0].assetId, {
+            ifRevision: first.assets[0].revision,
+        })).resolves.toMatchObject({ revision: first.assets[0].revision })
+        await expect(h.service.readContextAsset(first.assets[1].assetId, {
+            ifRevision: first.assets[1].revision,
+        })).resolves.toMatchObject({ revision: first.assets[1].revision })
+    })
+
+    it('rejects an over-cap query capture without publishing any staged current handle', async () => {
+        const state = makeState()
+        state.characters[0].assets = [
+            asset('capture-pressure-a', 'alice-portrait', 'portrait'),
+            asset('capture-pressure-b', 'alice-happy', 'emotion'),
+            asset('capture-pressure-c', 'alice-uniform', 'additional'),
+        ]
+        const registry = new ContextAssetAuthorityRegistry({ maxPerPrincipal: 2 })
+        const h = harness({ state, assetAuthorityRegistry: registry })
+
+        await expect(h.service.listContextAssets({
+            moduleScope: 'none', captureScope: 'query', limit: 2,
+        })).rejects.toMatchObject({ code: 'RESOURCE_LIMIT' })
+        expect(registry.size()).toBe(0)
+    })
+
     it('dispatches a registered Studio handle without probing current-context state', async () => {
         const authority = {
             lookup: vi.fn(() => ({
@@ -1377,7 +1419,7 @@ describe('opaque context assets', () => {
         expect(unknown.reads).not.toHaveBeenCalled()
     })
 
-    it('bounds digest and issued-handle metadata at 8192 and fails closed for evicted handles', async () => {
+    it('rejects an over-cap page without evicting previously returned current handles', async () => {
         const state = makeState()
         state.characters[0].assets = Array.from({ length: 8_194 }, (_, index) => asset(
             `lru-${index}`,
@@ -1391,22 +1433,25 @@ describe('opaque context assets', () => {
         })
         const references: Array<{ assetId: string; revision: string }> = []
         let cursor: string | undefined
+        let admissionError: unknown
         do {
-            const page = await h.service.listContextAssets({ moduleScope: 'none', limit: 100, cursor })
-            references.push(...page.assets.map(({ assetId, revision }) => ({ assetId, revision })))
-            cursor = page.nextCursor
+            try {
+                const page = await h.service.listContextAssets({ moduleScope: 'none', limit: 100, cursor })
+                references.push(...page.assets.map(({ assetId, revision }) => ({ assetId, revision })))
+                cursor = page.nextCursor
+            } catch (error) {
+                admissionError = error
+                break
+            }
         } while (cursor)
-        expect(references).toHaveLength(8_194)
+        expect(admissionError).toMatchObject({ code: 'RESOURCE_LIMIT' })
+        expect(references).toHaveLength(8_100)
         h.reads.mockClear()
 
         await expect(h.service.readContextAsset(references[0].assetId, {
             ifRevision: references[0].revision,
-        })).rejects.toMatchObject({ code: 'NOT_FOUND' })
-        expect(h.reads).not.toHaveBeenCalled()
-
-        await expect(h.service.readContextAsset(references[1].assetId))
-            .rejects.toMatchObject({ code: 'NOT_FOUND' })
-        expect(h.reads).not.toHaveBeenCalled()
+        })).resolves.toMatchObject({ revision: references[0].revision })
+        expect(h.reads).toHaveBeenCalledTimes(1)
     }, 60_000)
 
     it('rejects known and returned sources over 32 MiB before digest cache or handle publication', async () => {
@@ -2285,6 +2330,57 @@ describe('captured context count, filter, and fence security', () => {
         expect(reset).toBe(true)
         expect(cursors.activeCount((h.service as any).context.principalId)).toBe(0)
         expect((h.service as any).issuedHandles.size).toBe(0)
+    })
+
+    it('never revives a current-context handle after permission revoke and regrant', async () => {
+        const registry = new ContextAssetAuthorityRegistry()
+        let permissionGeneration = 0
+        const h = harness({
+            getPermissionGeneration: () => permissionGeneration,
+            assetAuthorityRegistry: registry,
+        })
+        const page = await h.service.listContextAssets({
+            moduleScope: 'none',
+            captureScope: 'query',
+            limit: 1,
+        })
+        const assetId = page.assets[0].assetId
+        h.reads.mockClear()
+        permissionGeneration = 2
+
+        await expect(h.service.readContextAsset(assetId)).rejects.toMatchObject({ code: 'ABORTED' })
+        await expect(h.service.readContextAsset(assetId)).rejects.toMatchObject({ code: 'NOT_FOUND' })
+        expect(h.reads).not.toHaveBeenCalled()
+        expect(registry.size((h.service as any).context.principalId)).toBe(0)
+    })
+
+    it('rejects current-handle publication when permission changes during final handle hashing', async () => {
+        const registry = new ContextAssetAuthorityRegistry()
+        let permissionGeneration = 0
+        const h = harness({
+            getPermissionGeneration: () => permissionGeneration,
+            assetAuthorityRegistry: registry,
+        })
+        const page = await h.service.listContextAssets({ moduleScope: 'none', limit: 1 })
+        const digest = crypto.subtle.digest.bind(crypto.subtle)
+        const gate = deferred<ArrayBuffer>()
+        let digestCalls = 0
+        let heldDigest: Parameters<SubtleCrypto['digest']> | undefined
+        vi.spyOn(crypto.subtle, 'digest').mockImplementation((...args) => {
+            digestCalls += 1
+            if (digestCalls === 2) {
+                heldDigest = args
+                return gate.promise
+            }
+            return digest(...args)
+        })
+        const pending = h.service.readContextAsset(page.assets[0].assetId)
+        await waitFor(() => heldDigest !== undefined)
+        permissionGeneration = 2
+        gate.resolve(await digest(...heldDigest!))
+
+        await expect(pending).rejects.toMatchObject({ code: 'ABORTED' })
+        expect(registry.size((h.service as any).context.principalId)).toBe(0)
     })
 
     it('publishes no module cache or cursor when the aggregate first-page result exceeds its limit', async () => {

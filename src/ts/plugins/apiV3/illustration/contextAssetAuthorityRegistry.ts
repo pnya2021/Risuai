@@ -31,12 +31,39 @@ export interface StudioContextAssetAuthority extends ContextAssetAuthorityBase {
     byteLength?: number
     validate(signal?: AbortSignal): Promise<void>
     read(signal?: AbortSignal): Promise<Uint8Array | null>
+    touch?(): void
 }
 
 export type ContextAssetAuthority = CurrentContextAssetAuthority | StudioContextAssetAuthority
 
 const keyOf = (principalId: string, instanceId: string, assetId: string) =>
     JSON.stringify([principalId, instanceId, assetId])
+
+const sameOrigin = (
+    left: CurrentContextAssetAuthority['origin'],
+    right: CurrentContextAssetAuthority['origin'],
+) => left.kind === right.kind && (left.kind === 'character'
+    ? left.characterId === (right as { kind: 'character'; characterId: string }).characterId
+    : left.moduleId === (right as { kind: 'module'; moduleId: string }).moduleId)
+
+const compatibleAuthority = (left: ContextAssetAuthority, right: ContextAssetAuthority) => {
+    if (left.authorityKind !== right.authorityKind || left.parentRevision !== right.parentRevision) return false
+    if (left.authorityKind === 'current-context-card'
+        || left.authorityKind === 'current-context-installed-module') {
+        const currentRight = right as CurrentContextAssetAuthority
+        return left.identity === currentRight.identity && sameOrigin(left.origin, currentRight.origin)
+    }
+    const studioLeft = left as StudioContextAssetAuthority
+    const studioRight = right as StudioContextAssetAuthority
+    return studioLeft.revision === studioRight.revision
+        && studioLeft.name === studioRight.name
+        && studioLeft.mediaType === studioRight.mediaType
+        && studioLeft.byteLength === studioRight.byteLength
+}
+
+export interface ContextAssetAuthorityBatchRegistration {
+    rollback(): void
+}
 
 export class ContextAssetAuthorityRegistry {
     private readonly records = new Map<string, ContextAssetAuthority>()
@@ -48,24 +75,55 @@ export class ContextAssetAuthorityRegistry {
     }
 
     register(record: ContextAssetAuthority) {
-        const key = keyOf(record.principalId, record.instanceId, record.assetId)
-        const existing = this.records.get(key)
-        if (existing && (existing.authorityKind !== record.authorityKind
-            || existing.parentRevision !== record.parentRevision
-            || ('revision' in existing && 'revision' in record && existing.revision !== record.revision))) {
-            throw new PluginApiError('CONFLICT', 'Context asset authority collision')
-        }
-        if (!existing && this.size(record.principalId) >= this.maxPerPrincipal) {
-            const evictable = [...this.records].find(([, candidate]) =>
-                candidate.principalId === record.principalId
-                && (candidate.authorityKind === 'current-context-card'
-                    || candidate.authorityKind === 'current-context-installed-module'))
-            if (!evictable) {
-                throw new PluginApiError('RESOURCE_LIMIT', 'Too many context asset authorities', { retryable: true })
+        this.registerBatch([record])
+    }
+
+    registerBatch(records: readonly ContextAssetAuthority[]): ContextAssetAuthorityBatchRegistration {
+        const staged = new Map<string, ContextAssetAuthority>()
+        for (const record of records) {
+            const key = keyOf(record.principalId, record.instanceId, record.assetId)
+            const duplicate = staged.get(key)
+            if (duplicate && !compatibleAuthority(duplicate, record)) {
+                throw new PluginApiError('CONFLICT', 'Context asset authority collision')
             }
-            this.records.delete(evictable[0])
+            if (!duplicate) staged.set(key, record)
         }
-        this.records.set(key, record)
+
+        const additions = new Map<string, number>()
+        for (const [key, record] of staged) {
+            const existing = this.records.get(key)
+            if (existing && !compatibleAuthority(existing, record)) {
+                throw new PluginApiError('CONFLICT', 'Context asset authority collision')
+            }
+            if (!existing) additions.set(
+                record.principalId,
+                (additions.get(record.principalId) ?? 0) + 1,
+            )
+        }
+        for (const [principalId, added] of additions) {
+            if (this.size(principalId) + added > this.maxPerPrincipal) {
+                throw new PluginApiError('RESOURCE_LIMIT', 'Too many context asset authorities', {
+                    retryable: true,
+                })
+            }
+        }
+
+        const inserted: Array<[string, ContextAssetAuthority]> = []
+        for (const [key, record] of staged) {
+            if (this.records.has(key)) continue
+            this.records.set(key, record)
+            inserted.push([key, record])
+        }
+        let active = true
+        return {
+            rollback: () => {
+                if (!active) return
+                active = false
+                for (const [key, record] of inserted) {
+                    if (this.records.get(key) === record) this.records.delete(key)
+                }
+            },
+        }
     }
 
     lookup(assetId: string, owner: ContextAssetAuthorityOwner): ContextAssetAuthority {

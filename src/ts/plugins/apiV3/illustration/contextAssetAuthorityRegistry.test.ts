@@ -1,6 +1,64 @@
 import { describe, expect, it } from 'vitest'
+import { ContextAssetAuthorityRegistry } from './contextAssetAuthorityRegistry'
 
 describe('ContextAssetAuthorityRegistry', () => {
+    it('rejects capacity pressure without evicting already-issued current handles', () => {
+        const registry = new ContextAssetAuthorityRegistry({ maxPerPrincipal: 2 })
+        const owner = { principalId: 'pressure-principal', instanceId: 'pressure-instance' }
+        const current = (suffix: string) => ({
+            ...owner,
+            assetId: `ctxasset_${suffix.repeat(64)}`,
+            authorityKind: 'current-context-card' as const,
+            identity: `identity-${suffix}`,
+            origin: { kind: 'character' as const, characterId: 'card-a' },
+        })
+        const first = current('1')
+        const second = current('2')
+        registry.register(first)
+        registry.register(second)
+
+        expect(() => registry.register({
+            ...owner,
+            assetId: `ctxasset_${'3'.repeat(64)}`,
+            authorityKind: 'studio-card-capture',
+            parentRevision: 'access-a',
+            revision: `sha256:${'4'.repeat(64)}`,
+            name: 'new.png',
+            mediaType: 'image/png',
+            validate: async () => undefined,
+            read: async () => new Uint8Array([3]),
+        })).toThrow(expect.objectContaining({ code: 'RESOURCE_LIMIT' }))
+        expect(registry.lookup(first.assetId, owner)).toBe(first)
+        expect(registry.lookup(second.assetId, owner)).toBe(second)
+        expect(registry.size(owner.principalId, owner.instanceId)).toBe(2)
+    })
+
+    it('validates duplicate and conflicting batches before publishing any new authority', () => {
+        const registry = new ContextAssetAuthorityRegistry({ maxPerPrincipal: 2 })
+        const owner = { principalId: 'batch-principal', instanceId: 'batch-instance' }
+        const current = {
+            ...owner,
+            assetId: `ctxasset_${'a'.repeat(64)}`,
+            authorityKind: 'current-context-card' as const,
+            identity: 'identity-a',
+            origin: { kind: 'character' as const, characterId: 'card-a' },
+        }
+        registry.register(current)
+        registry.registerBatch([current, current, {
+            ...current,
+            assetId: `ctxasset_${'b'.repeat(64)}`,
+            identity: 'identity-b',
+        }])
+        expect(registry.size(owner.principalId)).toBe(2)
+
+        expect(() => registry.registerBatch([current, {
+            ...current,
+            identity: 'conflicting-identity',
+        }])).toThrow(expect.objectContaining({ code: 'CONFLICT' }))
+        expect(registry.lookup(current.assetId, owner)).toBe(current)
+        expect(registry.size(owner.principalId)).toBe(2)
+    })
+
     it('does one owner-bound lookup and never falls through between authority kinds', async () => {
         const subjectPath = './contextAssetAuthorityRegistry'
         const subject = await import(/* @vite-ignore */ subjectPath).catch(() => undefined)
