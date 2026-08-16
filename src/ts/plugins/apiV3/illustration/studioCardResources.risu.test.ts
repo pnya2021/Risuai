@@ -558,6 +558,31 @@ describe('Risu Studio card native projection', () => {
         expect(h.readImage).not.toHaveBeenCalled()
     })
 
+    it('rejects final descriptor structure beyond 16 MiB before mapping an exact 20,000-item source', async () => {
+        const cardId = 'c'.repeat(300)
+        const alice = character(cardId, 'Alice')
+        let firstEntryReads = 0
+        alice.additionalAssets = new Proxy(
+            Array.from({ length: 19_998 }, (_, index) => [
+                `asset-${index}.png`, `assets/asset-${index}.png`, 'png',
+            ]),
+            {
+                getOwnPropertyDescriptor(target, property) {
+                    if (property === '0') {
+                        firstEntryReads += 1
+                        if (firstEntryReads > 1) throw new Error('source descriptor mapping entered')
+                    }
+                    return Reflect.getOwnPropertyDescriptor(target, property)
+                },
+            },
+        )
+        const h = harness([alice], 0)
+
+        await expect(select(h, cardId)).rejects.toMatchObject({ code: 'RESOURCE_LIMIT' })
+        expect(firstEntryReads).toBe(1)
+        expect(h.readImage).not.toHaveBeenCalled()
+    }, 30_000)
+
     it('enumerates 4,902 logical descriptors without authority and reads only exact resolved batches', async () => {
         const alice = character('alice', 'Alice')
         alice.additionalAssets = Array.from({ length: 4_902 }, (_, index) => [
