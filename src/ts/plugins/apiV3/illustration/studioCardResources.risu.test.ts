@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { SvelteMap } from 'svelte/reactivity'
+import { proxy as deepState } from 'svelte/internal/client'
 import { ContextAssetAuthorityRegistry } from './contextAssetAuthorityRegistry'
 import { ContextAssetReadCoordinator } from './contextAssetReadCoordinator'
 import { ContextResourceService, type ContextHostState } from './contextResources'
@@ -66,18 +67,29 @@ afterEach(() => {
     vi.restoreAllMocks()
 })
 
-function harness(cards: unknown[], selectedIndex = -1, storageRevisions = new Map<string, string>()) {
+function harness(
+    cards: unknown[],
+    selectedIndex = -1,
+    storageRevisions = new Map<string, string>(),
+    catalogueReactivity: {
+        reactive?: boolean
+        getAssetStorageMutationGeneration?: () => string | number
+    } = {},
+) {
     const database = { characters: cards }
     const selected = { value: selectedIndex }
     const readImage = vi.fn(async () => new Uint8Array([1, 2, 3, 4]))
     const getAssetStorageRevision = vi.fn((storageKey: string) =>
         storageRevisions.get(storageKey) ?? `storage:${storageKey}:1`)
-    const adapter = createRisuStudioCardResourceAdapter({
+    const adapterDependencies = {
         getDatabase: () => database,
         getSelectedCharacterIndex: () => selected.value,
         readImage,
         getAssetStorageRevision,
-    })
+        reactiveCatalogueIndex: catalogueReactivity.reactive,
+        getAssetStorageMutationGeneration: catalogueReactivity.getAssetStorageMutationGeneration,
+    }
+    const adapter = createRisuStudioCardResourceAdapter(adapterDependencies)
     const registry = new ContextAssetAuthorityRegistry()
     const coordinator = new ContextAssetReadCoordinator()
     const context = {
@@ -158,6 +170,122 @@ describe('Risu Studio card native projection', () => {
         expect(scalarReads).toBeGreaterThan(readsAfterColdBuild)
     })
 
+    it.each([
+        {
+            change: 'card id',
+            mutate: (cards: RawCard[]) => { cards[0].chaId = 'renamed' },
+            assertSnapshot: (snapshot: ReturnType<ReturnType<typeof createStudioCardCatalogueIndex>['current']>) => {
+                expect(snapshot.byId.has('party')).toBe(false)
+                expect(snapshot.byId.has('renamed')).toBe(true)
+            },
+        },
+        {
+            change: 'card type',
+            mutate: (cards: RawCard[]) => { cards[0].type = 'character' },
+            assertSnapshot: (snapshot: ReturnType<ReturnType<typeof createStudioCardCatalogueIndex>['current']>) => {
+                expect(snapshot.records[0].native).toMatchObject({ kind: 'character', groupMemberIds: [] })
+            },
+        },
+        {
+            change: 'card name',
+            mutate: (cards: RawCard[]) => { cards[0].name = 'Renamed party' },
+            assertSnapshot: (snapshot: ReturnType<ReturnType<typeof createStudioCardCatalogueIndex>['current']>) => {
+                expect(snapshot.records[0].native.name).toBe('Renamed party')
+            },
+        },
+        {
+            change: 'portrait key',
+            mutate: (cards: RawCard[]) => { cards[0].image = 'assets/replacement.png' },
+            assertSnapshot: (snapshot: ReturnType<ReturnType<typeof createStudioCardCatalogueIndex>['current']>) => {
+                expect(snapshot.records[0].native.portrait?.name).toBe('Party.png')
+                expect(snapshot.records[0].native.portrait?.locator.storageRevision)
+                    .toBe('storage:assets/replacement.png:1')
+            },
+        },
+        {
+            change: 'direct member element',
+            mutate: (cards: RawCard[]) => { cards[0].characters[0] = 'member-b' },
+            assertSnapshot: (snapshot: ReturnType<ReturnType<typeof createStudioCardCatalogueIndex>['current']>) => {
+                expect(snapshot.records[0].native.groupMemberIds).toEqual(['member-b'])
+            },
+        },
+        {
+            change: 'direct member array',
+            mutate: (cards: RawCard[]) => { cards[0].characters = ['member-b'] },
+            assertSnapshot: (snapshot: ReturnType<ReturnType<typeof createStudioCardCatalogueIndex>['current']>) => {
+                expect(snapshot.records[0].native.groupMemberIds).toEqual(['member-b'])
+            },
+        },
+        {
+            change: 'trash state',
+            mutate: (cards: RawCard[]) => { cards[0].trashTime = 1 },
+            assertSnapshot: (snapshot: ReturnType<ReturnType<typeof createStudioCardCatalogueIndex>['current']>) => {
+                expect(snapshot.byId.has('party')).toBe(false)
+            },
+        },
+        {
+            change: 'array slot identity',
+            mutate: (cards: RawCard[]) => {
+                cards[0] = { chaId: 'replacement', type: 'character', name: 'Replacement', image: 'assets/replacement.png' }
+            },
+            assertSnapshot: (snapshot: ReturnType<ReturnType<typeof createStudioCardCatalogueIndex>['current']>) => {
+                expect(snapshot.byId.has('party')).toBe(false)
+                expect(snapshot.byId.has('replacement')).toBe(true)
+            },
+        },
+    ])('invalidates the actual deep rune scalar index after an in-place $change mutation', ({ mutate, assertSnapshot }) => {
+        const state = deepState({
+            characters: [
+                { chaId: 'party', type: 'group', name: 'Party', image: 'assets/party.png', characters: ['member-a'] },
+                { chaId: 'member-a', type: 'character', name: 'Member A', image: 'assets/member-a.png' },
+                { chaId: 'member-b', type: 'character', name: 'Member B', image: 'assets/member-b.png' },
+            ] as RawCard[],
+        })
+        const index = createStudioCardCatalogueIndex({
+            getCharacters: () => state.characters,
+            getSelectedCharacterIndex: () => 0,
+            getAssetStorageRevision: (storageKey) => `storage:${storageKey}:1`,
+            reactive: true,
+        })
+        const initial = index.current()
+
+        mutate(state.characters)
+
+        const changed = index.current()
+        expect(changed).not.toBe(initial)
+        expect(index.isCurrent(initial)).toBe(false)
+        assertSnapshot(changed)
+    })
+
+    it('invalidates a warm portrait catalogue after an authoritative same-key storage replacement', async () => {
+        const state = deepState({
+            characters: [character('alice', 'Alice')],
+            storageGeneration: 0,
+        })
+        const revisions = new Map([['assets/alice.png', 'storage:alice:1']])
+        const h = harness(state.characters, 0, revisions, {
+            reactive: true,
+            getAssetStorageMutationGeneration: () => state.storageGeneration,
+        })
+        const reader = h.reader()
+        const first = await h.studio.listStudioCards({ limit: 24 })
+        const firstSummary = first.items[0]
+
+        revisions.set('assets/alice.png', 'storage:alice:2')
+        state.storageGeneration += 1
+
+        const replacement = await h.studio.listStudioCards({ limit: 24 })
+        const replacementSummary = replacement.items[0]
+        expect(replacement.catalogueRevision).not.toBe(first.catalogueRevision)
+        expect(replacementSummary.catalogueItemRevision).not.toBe(firstSummary.catalogueItemRevision)
+        expect(replacementSummary.portrait?.revision).not.toBe(firstSummary.portrait?.revision)
+        await expect(reader.readContextAsset(firstSummary.portrait!.assetId, { variant: 'original' }))
+            .rejects.toMatchObject({ code: 'CONFLICT' })
+        await expect(reader.readContextAsset(replacementSummary.portrait!.assetId, { variant: 'original' }))
+            .resolves.toMatchObject({ data: new Uint8Array([1, 2, 3, 4]) })
+        expect(h.readImage).toHaveBeenCalledTimes(1)
+    })
+
     it('projects a bounded scalar catalogue without evaluating chat, executable, or secret fields', async () => {
         const alice = character('alice', 'Alice')
         const party = group('party', ['member-b', 'member-a', 'member-a'], 'Party')
@@ -189,6 +317,22 @@ describe('Risu Studio card native projection', () => {
         const portrait = await h.reader().readContextAsset(page.items[0].portrait!.assetId, { variant: 'original' })
         expect(portrait.data).toEqual(new Uint8Array([1, 2, 3, 4]))
         expect(h.readImage).toHaveBeenCalledWith('assets/alice.png')
+    })
+
+    it('excludes an over-limit group before enumerating its direct-member array', async () => {
+        let memberReads = 0
+        const members = new Proxy(Array.from({ length: 101 }, (_, index) => `member-${index}`), {
+            getOwnPropertyDescriptor(target, property) {
+                if (/^\d+$/u.test(String(property))) memberReads += 1
+                return Reflect.getOwnPropertyDescriptor(target, property)
+            },
+        })
+        const h = harness([group('oversized-group', members, 'Oversized group'), character('alice')], 1)
+
+        const page = await h.studio.listStudioCards({ limit: 24 })
+
+        expect(page.items.map(({ cardId }) => cardId)).toEqual(['alice'])
+        expect(memberReads).toBe(0)
     })
 
     it('captures the latest non-current normal and group card-only sources with stable direct members', async () => {
@@ -240,10 +384,14 @@ describe('Risu Studio card native projection', () => {
         const rawRoot = group('party', ['member-a'], 'Party')
         let armed = false
         let tripped = false
+        let rootTriggerReads = 0
+        let memberTriggerReads = 0
         const root = new Proxy(rawRoot, {
             getOwnPropertyDescriptor(target, property) {
                 const descriptor = Reflect.getOwnPropertyDescriptor(target, property)
-                if (armed && !tripped && trigger === 'root' && property === 'additionalAssets') {
+                if (armed && trigger === 'root' && property === 'additionalAssets') rootTriggerReads += 1
+                if (armed && !tripped && trigger === 'root' && property === 'additionalAssets'
+                    && rootTriggerReads === 3) {
                     tripped = true
                     mutate(target, rawMember, revisions)
                 }
@@ -253,7 +401,9 @@ describe('Risu Studio card native projection', () => {
         const member = new Proxy(rawMember, {
             getOwnPropertyDescriptor(target, property) {
                 const descriptor = Reflect.getOwnPropertyDescriptor(target, property)
-                if (armed && !tripped && trigger === 'member' && property === 'additionalText') {
+                if (armed && trigger === 'member' && property === 'additionalText') memberTriggerReads += 1
+                if (armed && !tripped && trigger === 'member' && property === 'additionalText'
+                    && memberTriggerReads === 2) {
                     tripped = true
                     mutate(rawRoot, target, revisions)
                 }
@@ -287,6 +437,84 @@ describe('Risu Studio card native projection', () => {
         })).rejects.toMatchObject({ code: 'CONFLICT' })
         expect(h.readImage).not.toHaveBeenCalled()
     })
+
+    it('rejects an over-limit raw asset collection before enumerating any asset entry', async () => {
+        const alice = character('alice', 'Alice')
+        let projectedEntries = 0
+        alice.additionalAssets = new Proxy(
+            Array.from({ length: 20_000 }, (_, index) => [
+                `asset-${index}.png`, `assets/asset-${index}.png`, 'png',
+            ]),
+            {
+                getOwnPropertyDescriptor(target, property) {
+                    if (/^\d+$/u.test(String(property))) projectedEntries += 1
+                    return Reflect.getOwnPropertyDescriptor(target, property)
+                },
+            },
+        )
+        const h = harness([alice], 0)
+
+        await expect(select(h, 'alice')).rejects.toMatchObject({ code: 'RESOURCE_LIMIT' })
+        expect(projectedEntries).toBe(0)
+        expect(h.readImage).not.toHaveBeenCalled()
+    })
+
+    it('rejects an oversized first text field before projecting later card fields', async () => {
+        const raw = character('alice', 'Alice')
+        raw.desc = 'x'.repeat(524_289)
+        let laterFieldReads = 0
+        const alice = new Proxy(raw, {
+            getOwnPropertyDescriptor(target, property) {
+                if (property === 'personality') laterFieldReads += 1
+                return Reflect.getOwnPropertyDescriptor(target, property)
+            },
+        })
+        const h = harness([alice], 0)
+
+        await expect(select(h, 'alice')).rejects.toMatchObject({ code: 'RESOURCE_LIMIT' })
+        expect(laterFieldReads).toBe(0)
+        expect(h.readImage).not.toHaveBeenCalled()
+    })
+
+    it('rejects oversized lore metadata before copying later lore entries', async () => {
+        const alice = character('alice', 'Alice')
+        let laterLoreReads = 0
+        alice.globalLore = new Proxy([
+            { id: 'oversized', comment: 'Oversized', content: 'x'.repeat(524_289), mode: 'normal' },
+            { id: 'later', comment: 'Later', content: 'must not be projected', mode: 'normal' },
+        ], {
+            getOwnPropertyDescriptor(target, property) {
+                if (property === '1') laterLoreReads += 1
+                return Reflect.getOwnPropertyDescriptor(target, property)
+            },
+        })
+        const h = harness([alice], 0)
+
+        await expect(select(h, 'alice')).rejects.toMatchObject({ code: 'RESOURCE_LIMIT' })
+        expect(laterLoreReads).toBe(0)
+        expect(h.readImage).not.toHaveBeenCalled()
+    })
+
+    it('rejects aggregate source metadata before projecting fields beyond the 16 MiB boundary', async () => {
+        const memberIds = Array.from({ length: 12 }, (_, index) => `member-${index}`)
+        const members = memberIds.map((id) => Object.assign(character(id, id), {
+            desc: 'd'.repeat(500_000),
+            personality: 'p'.repeat(500_000),
+            scenario: 's'.repeat(500_000),
+        }))
+        let beyondBoundaryReads = 0
+        members[9] = new Proxy(members[9], {
+            getOwnPropertyDescriptor(target, property) {
+                if (property === 'personality') beyondBoundaryReads += 1
+                return Reflect.getOwnPropertyDescriptor(target, property)
+            },
+        })
+        const h = harness([group('party', memberIds, 'Party'), ...members], 0)
+
+        await expect(select(h, 'party')).rejects.toMatchObject({ code: 'RESOURCE_LIMIT' })
+        expect(beyondBoundaryReads).toBe(0)
+        expect(h.readImage).not.toHaveBeenCalled()
+    }, 30_000)
 
     it('enumerates 4,902 logical descriptors without authority and reads only exact resolved batches', async () => {
         const alice = character('alice', 'Alice')

@@ -225,14 +225,19 @@ export async function getFileSrc(loc: string) {
 
 let appDataDirPath = ''
 const assetStorageEpochs = new Map<string, number>()
+const assetStorageMutationState = $state({ generation: 0 })
 
 const markAssetStorageMutation = (storageKey: string) => {
     assetStorageEpochs.set(storageKey, (assetStorageEpochs.get(storageKey) ?? 0) + 1)
+    assetStorageMutationState.generation += 1
 }
 
 /** Cache version for Host asset readers; the storage key remains opaque to plugins. */
 export const getAssetStorageRevision = (storageKey: string) =>
     `${storageKey}:${assetStorageEpochs.get(storageKey) ?? 0}`
+
+/** Reactive aggregate generation for consumers that cache per-key storage revisions. */
+export const getAssetStorageMutationGeneration = () => assetStorageMutationState.generation
 
 /**
  * Reads an image file and returns its data.

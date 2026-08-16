@@ -16,6 +16,7 @@ export interface RisuStudioCardAdapterDependencies {
     getSelectedCharacterIndex(): number
     readImage(storageKey: string): Promise<Uint8Array | ArrayBuffer | ArrayBufferView | null | undefined>
     getAssetStorageRevision?(storageKey: string): string
+    getAssetStorageMutationGeneration?(): string | number
     reactiveCatalogueIndex?: boolean
 }
 
@@ -79,6 +80,12 @@ const canonicalStorageKey = (value: unknown): value is string => {
 }
 
 const malformed = (message: string) => new PluginApiError('CONFLICT', message, { retryable: true })
+const resourceLimit = (message: string) => new PluginApiError('RESOURCE_LIMIT', message)
+
+const MAX_TEXT_FIELD_UTF8_BYTES = 524_288
+const MAX_SNAPSHOT_JSON_BYTES = 2_097_152
+const MAX_CAPTURE_ITEMS = 20_000
+const MAX_CAPTURE_METADATA_BYTES = 16_777_216
 
 const rawCodePointCompare = (leftValue: string, rightValue: string) => {
     const left = [...leftValue]
@@ -107,6 +114,163 @@ const textFields: Array<{ key: string; label: string; source: string }> = [
     { key: 'notes', label: 'Notes', source: 'notes' },
     { key: 'additionalText', label: 'Additional text', source: 'additionalText' },
 ]
+
+const utf8BytesAtMost = (value: string, maximum: number) => {
+    let bytes = 0
+    for (let index = 0; index < value.length; index++) {
+        const code = value.charCodeAt(index)
+        if (code <= 0x7f) bytes += 1
+        else if (code <= 0x7ff) bytes += 2
+        else if (code >= 0xd800 && code <= 0xdbff
+            && index + 1 < value.length
+            && value.charCodeAt(index + 1) >= 0xdc00
+            && value.charCodeAt(index + 1) <= 0xdfff) {
+            bytes += 4
+            index += 1
+        } else bytes += 3
+        if (bytes > maximum) return null
+    }
+    return bytes
+}
+
+const boundedMetadataStringBytes = (value: unknown) => {
+    if (typeof value !== 'string') return 0
+    const bytes = utf8BytesAtMost(value, MAX_TEXT_FIELD_UTF8_BYTES)
+    if (bytes === null) throw resourceLimit('Studio card text field exceeds the advertised limit')
+    return bytes
+}
+
+const preflightArrayLength = (value: unknown, label: string) => {
+    if (value === undefined) return 0
+    if (!Array.isArray(value)) throw malformed(`Studio card ${label} is malformed`)
+    const length = ownData(value, 'length')
+    if (!length.valid || !Number.isSafeInteger(length.value) || length.value < 0) {
+        throw malformed(`Studio card ${label} is malformed`)
+    }
+    return length.value as number
+}
+
+const preflightAssetCount = (raw: UnknownRecord) => {
+    let assetCount = 0
+    const image = ownData(raw, 'image')
+    if (!image.valid) throw malformed('Studio card image is accessor-backed')
+    if (canonicalStorageKey(image.value)) assetCount += 1
+    for (const collection of ['emotionImages', 'additionalAssets', 'ccAssets'] as const) {
+        const field = ownData(raw, collection)
+        if (!field.valid) throw malformed(`Studio card ${collection} is accessor-backed`)
+        assetCount += preflightArrayLength(field.value, collection)
+        if (assetCount > MAX_CAPTURE_ITEMS) {
+            throw resourceLimit('Studio card capture item limit exceeded')
+        }
+    }
+    return assetCount
+}
+
+const preflightCardMetadata = (
+    raw: UnknownRecord,
+    cardId: string,
+    groupMemberIds: string[],
+    storageRevision: (storageKey: string) => string,
+    captureBudget: { bytes: number },
+) => {
+    let cardBytes = 0
+    const addCaptureBytes = (bytes: number) => {
+        captureBudget.bytes += bytes
+        if (captureBudget.bytes > MAX_CAPTURE_METADATA_BYTES) {
+            throw resourceLimit('Studio card capture metadata limit exceeded')
+        }
+    }
+    const addCardBytes = (bytes: number) => {
+        cardBytes += bytes
+        if (cardBytes > MAX_SNAPSHOT_JSON_BYTES) {
+            throw resourceLimit('Studio card snapshot exceeds the advertised limit')
+        }
+        addCaptureBytes(bytes)
+    }
+    addCardBytes(256 + boundedMetadataStringBytes(cardId))
+    const name = ownData(raw, 'name')
+    if (!name.valid) throw malformed('Studio card name is accessor-backed')
+    addCardBytes(boundedMetadataStringBytes(name.value))
+    for (const memberId of groupMemberIds) addCardBytes(boundedMetadataStringBytes(memberId) + 8)
+    for (const { source } of textFields) {
+        const field = ownData(raw, source)
+        if (!field.valid) throw malformed('Studio card text field is accessor-backed')
+        if (typeof field.value === 'string' && field.value.length > 0) {
+            addCardBytes(boundedMetadataStringBytes(field.value) + 64)
+        }
+    }
+    const lore = ownData(raw, 'globalLore')
+    if (!lore.valid) throw malformed('Studio card lore is accessor-backed')
+    const loreLength = preflightArrayLength(lore.value, 'lore')
+    if (Array.isArray(lore.value)) {
+        for (let index = 0; index < loreLength; index++) {
+            const item = ownData(lore.value, index)
+            if (!item.valid || !isRecord(item.value)) throw malformed('Studio card lore is malformed')
+            const values = Object.fromEntries(
+                ['id', 'comment', 'key', 'content', 'mode'].map((key) => [key, ownData(item.value, key)]),
+            ) as Record<string, ReturnType<typeof ownData>>
+            if (Object.values(values).some((value) => !value.valid)) {
+                throw malformed('Studio card lore is accessor-backed')
+            }
+            const id = nonEmptyString(values.id.value) ? values.id.value : `lore:${index}`
+            const name = nonEmptyString(values.comment.value) ? values.comment.value
+                : nonEmptyString(values.key.value) ? values.key.value : id
+            const content = typeof values.content.value === 'string' ? values.content.value : ''
+            addCardBytes(boundedMetadataStringBytes(id)
+                + boundedMetadataStringBytes(name)
+                + boundedMetadataStringBytes(content)
+                + 64)
+        }
+    }
+
+    const image = ownData(raw, 'image')
+    if (!image.valid) throw malformed('Studio card image is accessor-backed')
+    const accountAsset = (storageKey: unknown, assetName: unknown, extension: unknown) => {
+        if (!canonicalStorageKey(storageKey)) return
+        const revision = storageRevision(storageKey)
+        addCaptureBytes(boundedMetadataStringBytes(storageKey)
+            + boundedMetadataStringBytes(revision)
+            + boundedMetadataStringBytes(assetName)
+            + boundedMetadataStringBytes(extension)
+            + 192)
+    }
+    accountAsset(image.value, name.value, extensionOf(typeof image.value === 'string' ? image.value : ''))
+    for (const collection of ['emotionImages', 'additionalAssets'] as const) {
+        const field = ownData(raw, collection)
+        if (!field.valid) throw malformed(`Studio card ${collection} is accessor-backed`)
+        const length = preflightArrayLength(field.value, collection)
+        if (!Array.isArray(field.value)) continue
+        for (let index = 0; index < length; index++) {
+            const entry = ownData(field.value, index)
+            if (!entry.valid || !Array.isArray(entry.value)) {
+                throw malformed(`Studio card ${collection} is malformed`)
+            }
+            const assetName = ownData(entry.value, 0)
+            const storageKey = ownData(entry.value, 1)
+            const extension = ownData(entry.value, 2)
+            if (!assetName.valid || !storageKey.valid || !extension.valid) {
+                throw malformed(`Studio card ${collection} is accessor-backed`)
+            }
+            accountAsset(storageKey.value, assetName.value, extension.value)
+        }
+    }
+    const ccAssets = ownData(raw, 'ccAssets')
+    if (!ccAssets.valid) throw malformed('Studio card ccAssets is accessor-backed')
+    const ccAssetLength = preflightArrayLength(ccAssets.value, 'ccAssets')
+    if (Array.isArray(ccAssets.value)) {
+        for (let index = 0; index < ccAssetLength; index++) {
+            const entry = ownData(ccAssets.value, index)
+            if (!entry.valid || !isRecord(entry.value)) throw malformed('Studio card ccAssets is malformed')
+            const uri = ownData(entry.value, 'uri')
+            const assetName = ownData(entry.value, 'name')
+            const extension = ownData(entry.value, 'ext')
+            if (!uri.valid || !assetName.valid || !extension.valid) {
+                throw malformed('Studio card ccAssets is accessor-backed')
+            }
+            accountAsset(uri.value, assetName.value, extension.value)
+        }
+    }
+}
 
 const mapText = (raw: UnknownRecord): CharacterTextSection[] => textFields.flatMap(({ key, label, source }) => {
     const field = ownData(raw, source)
@@ -243,6 +407,7 @@ export function createRisuStudioCardResourceAdapter(
         getCharacters: () => dependencies.getDatabase().characters,
         getSelectedCharacterIndex: dependencies.getSelectedCharacterIndex,
         getAssetStorageRevision: (storageKey) => dependencies.getAssetStorageRevision?.(storageKey) ?? storageKey,
+        getAssetStorageMutationGeneration: dependencies.getAssetStorageMutationGeneration,
         reactive: dependencies.reactiveCatalogueIndex,
     })
     const catalogueAuthorities = new WeakMap<object, StudioCardCatalogueIndexSnapshot>()
@@ -264,6 +429,27 @@ export function createRisuStudioCardResourceAdapter(
             throw malformed('Studio group membership is missing, nested, or malformed')
         }
         return { rootRecord, rootMembers, memberRecords: memberRecords as typeof rootRecord[] }
+    }
+
+    const preflightRecords = (records: NonNullable<ReturnType<typeof sourceRecords>>) => {
+        const allRecords = [records.rootRecord, ...records.memberRecords]
+        let itemCount = 1 + records.memberRecords.length
+        for (const record of allRecords) {
+            itemCount += preflightAssetCount(record.raw)
+            if (itemCount > MAX_CAPTURE_ITEMS) {
+                throw resourceLimit('Studio card capture item limit exceeded')
+            }
+        }
+        const captureBudget = { bytes: 0 }
+        for (const record of allRecords) {
+            preflightCardMetadata(
+                record.raw,
+                record.native.cardId,
+                record === records.rootRecord ? records.rootMembers : [],
+                (storageKey) => dependencies.getAssetStorageRevision?.(storageKey) ?? storageKey,
+                captureBudget,
+            )
+        }
     }
 
     const projectSnapshot = (
@@ -288,6 +474,7 @@ export function createRisuStudioCardResourceAdapter(
         const records = sourceRecords(cardId)
         if (!records) return null
         const { rootRecord, rootMembers, memberRecords } = records
+        preflightRecords(records)
         const projectCard = (record: NonNullable<(typeof memberRecords)[number]> | typeof rootRecord) => {
             const snapshot = projectSnapshot(record, rootMembers)
             const assets = mapAssets(
@@ -336,6 +523,7 @@ export function createRisuStudioCardResourceAdapter(
         const records = sourceRecords(cardId)
         if (!records) return false
         const { rootRecord, rootMembers, memberRecords } = records
+        preflightRecords(records)
         const snapshots = [
             projectSnapshot(rootRecord, rootMembers),
             ...memberRecords.map((record) => projectSnapshot(record, rootMembers)),

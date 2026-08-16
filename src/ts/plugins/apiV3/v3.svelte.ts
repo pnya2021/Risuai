@@ -9,7 +9,7 @@ import { v4 } from "uuid";
 import { sleep } from "src/ts/util";
 import { alertConfirm, alertError, alertNormal } from "src/ts/alert";
 import { language } from "src/lang";
-import { checkCharOrder, fetchPluginPolicyNative, forageStorage, getAssetStorageRevision, getFetchLogs, readImage, requestDatabaseSaveNow, waitForMessagePersistence } from "src/ts/globalApi.svelte";
+import { checkCharOrder, fetchPluginPolicyNative, forageStorage, getAssetStorageMutationGeneration, getAssetStorageRevision, getFetchLogs, readImage, requestDatabaseSaveNow, waitForMessagePersistence } from "src/ts/globalApi.svelte";
 import { changeColorScheme, updateColorScheme, updateTextThemeAndCSS, type ColorScheme } from "src/ts/gui/colorscheme";
 import { isNodeServer, isTauri } from "src/ts/platform";
 import { get } from "svelte/store";
@@ -662,6 +662,7 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
             getSelectedCharacterIndex: () => selIdState.selId,
             readImage,
             getAssetStorageRevision,
+            getAssetStorageMutationGeneration,
             reactiveCatalogueIndex: true,
         }),
         assetAuthorityRegistry: contextAssetAuthorityRegistry,

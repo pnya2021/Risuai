@@ -4,12 +4,16 @@ import type { StudioCardNativeRecord } from './studioCardResources'
 type UnknownRecord = Record<PropertyKey, unknown>
 
 const RESERVED_CARD_IDS = new Set(['§temp', '§playground'])
+const MAX_GROUP_MEMBERS = 100
 
 const ownData = (record: object, key: PropertyKey) => {
     const descriptor = Object.getOwnPropertyDescriptor(record, key)
-    if (!descriptor) return { valid: true as const, value: undefined }
+    if (!descriptor) {
+        if (!Reflect.has(record, key)) Reflect.get(record, key)
+        return { valid: true as const, value: undefined }
+    }
     if (!('value' in descriptor)) return { valid: false as const, value: undefined }
-    return { valid: true as const, value: descriptor.value }
+    return { valid: true as const, value: Reflect.get(record, key) }
 }
 
 const isRecord = (value: unknown): value is UnknownRecord =>
@@ -51,6 +55,7 @@ const arrayData = (value: unknown): { valid: boolean; values: unknown[] } => {
     if (!length.valid || !Number.isSafeInteger(length.value) || (length.value as number) < 0) {
         return { valid: false, values: [] }
     }
+    if ((length.value as number) > MAX_GROUP_MEMBERS) return { valid: false, values: [] }
     const values: unknown[] = []
     for (let index = 0; index < (length.value as number); index++) {
         const item = ownData(value, index)
@@ -64,6 +69,7 @@ export interface StudioCardCatalogueIndexDependencies {
     getCharacters(): unknown[] | undefined
     getSelectedCharacterIndex(): number
     getAssetStorageRevision(storageKey: string): string
+    getAssetStorageMutationGeneration?(): string | number
     reactive?: boolean
 }
 
@@ -143,6 +149,7 @@ export class StudioCardCatalogueIndex {
     constructor(private readonly dependencies: StudioCardCatalogueIndexDependencies) {}
 
     current(): StudioCardCatalogueIndexSnapshot {
+        this.dependencies.getAssetStorageMutationGeneration?.()
         const rawCharacters = this.dependencies.getCharacters()
         const characters = Array.isArray(rawCharacters) ? rawCharacters : []
         const candidates: Candidate[] = []
