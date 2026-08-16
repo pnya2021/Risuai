@@ -2604,6 +2604,63 @@ describe('captured context count, filter, and fence security', () => {
             .resolves.toEqual(retained)
     })
 
+    it('rejects a cold concurrent resident duplicate before asset reads when active metadata fills capacity', async () => {
+        const principalId = '11111111-1111-4111-8111-111111111111'
+        const instanceId = 'resident-duplicate-capacity'
+        const captures = new QueryCaptureCache({ maxItemsPerPrincipal: 2 })
+        const cursors = new CursorRegistry()
+        const capture = {
+            moduleScope: 'none' as const,
+            include: ['portrait' as const],
+            captureScope: 'query' as const,
+            limit: 100,
+        }
+        const seeder = harness({ principalId, instanceId, queryCaptureCache: captures, cursorRegistry: cursors })
+        const seeded = await seeder.service.listContextAssets(capture)
+        const residentRecord = [...(captures as any).records.values()][0]
+        const winnerGate = deferred<Uint8Array>()
+        const winner = harness({
+            principalId, instanceId, queryCaptureCache: captures, cursorRegistry: cursors,
+            readAsset: async () => winnerGate.promise,
+        })
+        const loser = harness({
+            principalId, instanceId, queryCaptureCache: captures, cursorRegistry: cursors,
+        })
+        const loserAssetReference = vi.spyOn(loser.service as any, 'assetReference')
+        const winnerPending = winner.service.listContextAssets(capture).then(
+            (value) => ({ ok: true as const, value }),
+            (error: PluginApiError) => ({ ok: false as const, error }),
+        )
+        await waitFor(() => winner.reads.mock.calls.length === 1)
+        expect((captures as any).reservations.size).toBe(1)
+
+        const loserOutcome = await loser.service.listContextAssets(capture).then(
+            (value) => ({ ok: true as const, value }),
+            (error: PluginApiError) => ({ ok: false as const, error }),
+        )
+        winnerGate.resolve(encoder.encode('winner bytes'))
+        const winnerOutcome = await winnerPending
+
+        expect(winnerOutcome).toMatchObject({
+            ok: true,
+            value: { captureRevision: seeded.captureRevision },
+        })
+        expect(loserOutcome).toMatchObject({ ok: false, error: { code: 'RESOURCE_LIMIT' } })
+        expect(loserAssetReference).not.toHaveBeenCalled()
+        expect(loser.reads).not.toHaveBeenCalled()
+        expect((loser.service as any).digestCache.size).toBe(0)
+        expect((loser.service as any).digestAttempts.size).toBe(0)
+        expect((loser.service as any).issuedHandles.size).toBe(0)
+        expect(cursors.activeCount(principalId)).toBe(0)
+        expect((captures as any).records.size).toBe(1)
+        expect([...(captures as any).records.values()][0]).toBe(residentRecord)
+        expect((captures as any).reservations.size).toBe(0)
+
+        seeder.service.dispose()
+        winner.service.dispose()
+        loser.service.dispose()
+    })
+
     it('releases a reservation when prospective cursor capacity rejects publication', async () => {
         const principalId = '11111111-1111-4111-8111-111111111111'
         const captures = new QueryCaptureCache({ maxItemsPerPrincipal: 3 })

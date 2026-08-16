@@ -139,6 +139,12 @@ export interface ContextAssetCollectionProbe {
     input: ContextAssetCollectionInput
 }
 
+export interface ContextAssetPageProbe {
+    selectors: { characterId: CharacterId; conversationId: ConversationId }
+    pageSources: readonly ContextLocatedAssetSource[]
+    input: ContextAssetCollectionInput
+}
+
 export interface ContextHostState {
     current?: {
         characterId: CharacterId
@@ -177,6 +183,7 @@ export interface ContextResourceAdapter {
     revalidateModuleCollection?(input: ContextModuleCollectionProbe): Promise<void>
     revalidateModulePageSynchronously?(input: ContextModulePageProbe): void
     revalidateAssetCollection?(input: ContextAssetCollectionProbe): Promise<void>
+    revalidateAssetPageSynchronously?(input: ContextAssetPageProbe): void
     readAsset(source: ContextAssetSource, signal?: AbortSignal): Promise<Uint8Array>
     createThumbnail(
         source: ContextAssetSource,
@@ -1916,6 +1923,13 @@ export class ContextResourceService {
         )
         this.refreshCaptureGeneration()
         this.assertActive(generation, signal)
+        if (options.cursor && this.adapter.revalidateAssetPageSynchronously) {
+            this.adapter.revalidateAssetPageSynchronously({
+                selectors: preflightSelectors, pageSources, input,
+            })
+            this.refreshCaptureGeneration()
+            this.assertActive(generation, signal)
+        }
         if (stagedCapture || finalProbe) {
             await this.revalidateCapturedAssetCollection(
                 verificationSources, preflightSelectors, input, generation, signal,

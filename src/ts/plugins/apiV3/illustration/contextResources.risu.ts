@@ -6,6 +6,7 @@ import type {
     ContextAssetSource,
     ContextAssetCollectionInput,
     ContextAssetCollectionProbe,
+    ContextAssetPageProbe,
     ContextAssetSourceProbe,
     ContextCharacterSource,
     ContextHostState,
@@ -600,6 +601,71 @@ export function createRisuContextResourceAdapter(
         assertNotAborted(probe.input.signal)
     }
 
+    const assetRevalidationState = (
+        input: ContextAssetCollectionInput,
+        pageSources: readonly ContextAssetSourceProbe['located'][],
+    ) => ({
+        database: dependencies.getDatabase(),
+        currentCharacter: dependencies.getCurrentCharacter(),
+        activeModuleRecords: input.moduleScope === 'active'
+            && pageSources.some(({ origin }) => origin.kind === 'module')
+            ? dependencies.getActiveModulesWithReasons()
+            : undefined,
+    })
+
+    const revalidateAssetRecord = (
+        probe: ContextAssetSourceProbe,
+        state: ReturnType<typeof assetRevalidationState>,
+    ) => {
+        const locator = assetLocators.get(probe.located.source)
+        if (!locator
+            || locator.ownerKind !== probe.located.origin.kind
+            || locator.ownerId !== (probe.located.origin.kind === 'character'
+                ? probe.located.origin.characterId : probe.located.origin.moduleId)
+            || locator.storageKey !== probe.located.source.storageKey
+            || locator.storageRevision !== (probe.located.source.storageRevision ?? probe.located.source.storageKey)) {
+            throw changed()
+        }
+        let current: ContextAssetSource | null = null
+        if (locator.ownerKind === 'module') {
+            if (probe.input.moduleScope === 'none'
+                || (probe.input.moduleIdsSpecified && !probe.input.moduleIds.includes(locator.ownerId))) {
+                throw changed()
+            }
+            const raw = probe.input.moduleScope === 'installed'
+                ? state.database.modules?.[locator.ownerRawSlotIndex]
+                : state.activeModuleRecords?.[locator.ownerRawSlotIndex]?.module
+            if (!raw || raw.id !== locator.ownerId) throw changed()
+            current = mapModuleAssetAt(raw, locator.ownerRawSlotIndex, locator.rawSlotIndex, projectionContext)
+        } else {
+            if (probe.input.characterIds.length > 0
+                && !probe.input.characterIds.includes(locator.ownerId)) throw changed()
+            const raw = locator.ownerRawSlotIndex >= 0
+                ? state.database.characters?.[locator.ownerRawSlotIndex]
+                : state.currentCharacter
+            if (!raw || raw.chaId !== locator.ownerId) throw changed()
+            current = mapCharacterAssetAt(raw, locator, projectionContext)
+        }
+        if (!current || !sameSource(current, probe.located.source)) throw changed()
+        return current
+    }
+
+    const revalidateAssetPage = (probe: ContextAssetPageProbe) => {
+        assertNotAborted(probe.input.signal)
+        const selectors = selectorsFor(
+            probe.input.characterIds[0],
+            probe.input.conversationId || undefined,
+            false,
+        ) as { characterId: string; conversationId: string }
+        if (!sameSelectors(selectors, probe.selectors)) throw changed()
+        const state = assetRevalidationState(probe.input, probe.pageSources)
+        for (const located of probe.pageSources) {
+            assertNotAborted(probe.input.signal)
+            revalidateAssetRecord({ located, input: probe.input }, state)
+        }
+        assertNotAborted(probe.input.signal)
+    }
+
     return {
         async resolveCollectionSelectors(input) {
             assertNotAborted(input.signal)
@@ -773,42 +839,15 @@ export function createRisuContextResourceAdapter(
         },
         async revalidateAssetSource(probe: ContextAssetSourceProbe) {
             assertNotAborted(probe.input.signal)
-            const locator = assetLocators.get(probe.located.source)
-            if (!locator
-                || locator.ownerKind !== probe.located.origin.kind
-                || locator.ownerId !== (probe.located.origin.kind === 'character'
-                    ? probe.located.origin.characterId : probe.located.origin.moduleId)
-                || locator.storageKey !== probe.located.source.storageKey
-                || locator.storageRevision !== (probe.located.source.storageRevision ?? probe.located.source.storageKey)) {
-                throw changed()
-            }
             selectorsFor(
                 probe.input.characterIds[0],
                 probe.input.conversationId || undefined,
                 false,
             )
-            const database = dependencies.getDatabase()
-            let current: ContextAssetSource | null = null
-            if (locator.ownerKind === 'module') {
-                if (probe.input.moduleScope === 'none'
-                    || (probe.input.moduleIdsSpecified && !probe.input.moduleIds.includes(locator.ownerId))) {
-                    throw changed()
-                }
-                const records = probe.input.moduleScope === 'installed'
-                    ? database.modules ?? []
-                    : dependencies.getActiveModulesWithReasons().map(({ module }) => module)
-                const raw = records[locator.ownerRawSlotIndex]
-                if (!raw || raw.id !== locator.ownerId) throw changed()
-                current = mapModuleAssetAt(raw, locator.ownerRawSlotIndex, locator.rawSlotIndex, projectionContext)
-            } else {
-                if (probe.input.characterIds.length > 0 && !probe.input.characterIds.includes(locator.ownerId)) throw changed()
-                const raw = locator.ownerRawSlotIndex >= 0
-                    ? database.characters?.[locator.ownerRawSlotIndex]
-                    : dependencies.getCurrentCharacter()
-                if (!raw || raw.chaId !== locator.ownerId) throw changed()
-                current = mapCharacterAssetAt(raw, locator, projectionContext)
-            }
-            if (!current || !sameSource(current, probe.located.source)) throw changed()
+            const current = revalidateAssetRecord(
+                probe,
+                assetRevalidationState(probe.input, [probe.located]),
+            )
             assertNotAborted(probe.input.signal)
             return current
         },
@@ -818,6 +857,9 @@ export function createRisuContextResourceAdapter(
             const current = currentAssetShape(probe)
             if (JSON.stringify(current) !== JSON.stringify(expected)) throw changed()
             assertNotAborted(probe.input.signal)
+        },
+        revalidateAssetPageSynchronously(probe: ContextAssetPageProbe) {
+            revalidateAssetPage(probe)
         },
         async readAsset(source, signal) {
             assertNotAborted(signal)

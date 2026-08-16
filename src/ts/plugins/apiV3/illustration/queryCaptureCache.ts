@@ -156,8 +156,8 @@ export class QueryCaptureCache {
         }
 
         const usage = this.principalUsage(preparation.owner.principalId)
-        const reservedItemCount = existing ? 0 : items.length
-        const reservedMetadataBytes = existing ? 0 : metadataBytes
+        const reservedItemCount = items.length
+        const reservedMetadataBytes = metadataBytes
         if (items.length > this.maxItemsPerPrincipal
             || metadataBytes > this.maxMetadataBytesPerPrincipal
             || usage.items + reservedItemCount > this.maxItemsPerPrincipal

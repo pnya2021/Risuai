@@ -74,9 +74,76 @@ describe('query capture cache', () => {
         },
     )
 
-    it('rejects a zero-cost duplicate reservation when its exact record expires', async () => {
+    it.each([
+        ['item', () => new QueryCaptureCache({ maxItemsPerPrincipal: 2 })],
+        ['metadata-byte', () => new QueryCaptureCache({ maxMetadataBytesPerPrincipal: 24 })],
+    ])('charges full active %s capacity for resident duplicate reservations', async (_budget, makeCache) => {
+        const cache = makeCache()
+        const captureOwner = owner()
+        const query = { scope: 'resident-duplicate-capacity' }
+        const items = [{ a: 'é' }]
+        // Each retained projection is one item and exactly 12 canonical UTF-8 bytes.
+        expect(new TextEncoder().encode('[{"a":"é"}]').byteLength).toBe(12)
+        const committed = await cache.create(captureOwner, query, items)
+        const firstPreparation = await cache.prepareCreate(captureOwner, query)
+        const first = cache.reservePrepared(firstPreparation, items)
+        expect((cache as any).reservations.get(first)).toMatchObject({
+            itemCount: 1,
+            metadataBytes: 12,
+        })
+        const competingPreparation = await cache.prepareCreate(captureOwner, query)
+
+        expect(() => cache.reservePrepared(competingPreparation, items))
+            .toThrowError(expect.objectContaining({ code: 'RESOURCE_LIMIT' }))
+        expect((cache as any).records.size).toBe(1)
+        expect((cache as any).reservations.size).toBe(1)
+        await expect(cache.read(captureOwner, query, committed.captureRevision)).resolves.toEqual(committed)
+
+        cache.releaseReservation(first)
+        expect((cache as any).reservations.size).toBe(0)
+    })
+
+    it('touches a committed resident duplicate without extending its original expiry', async () => {
         let now = 0
-        const cache = new QueryCaptureCache({ now: () => now, ttlMs: 1, maxItemsPerPrincipal: 1 })
+        const cache = new QueryCaptureCache({
+            now: () => now,
+            ttlMs: 10,
+            maxCapturesPerPrincipal: 2,
+            maxItemsPerPrincipal: 3,
+        })
+        const captureOwner = owner()
+        const firstQuery = { scope: 'duplicate-lru-first' }
+        const firstItems = [{ id: 'first' }]
+        const first = await cache.create(captureOwner, firstQuery, firstItems)
+        const originalExpiry = (first as any).expiresAt
+        now = 1
+        const secondQuery = { scope: 'duplicate-lru-second' }
+        const second = await cache.create(captureOwner, secondQuery, [{ id: 'second' }])
+        now = 2
+        const duplicatePreparation = await cache.prepareCreate(captureOwner, firstQuery)
+        const duplicate = cache.reservePrepared(duplicatePreparation, firstItems)
+        const recommitted = cache.commitReserved(duplicate)
+
+        expect(recommitted).toBe(first)
+        expect((recommitted as any).expiresAt).toBe(originalExpiry)
+
+        now = 3
+        const thirdQuery = { scope: 'duplicate-lru-third' }
+        const third = await cache.create(captureOwner, thirdQuery, [{ id: 'third' }])
+        await expect(cache.read(captureOwner, secondQuery, second.captureRevision))
+            .rejects.toMatchObject({ code: 'CONFLICT', retryable: true })
+        await expect(cache.read(captureOwner, firstQuery, first.captureRevision)).resolves.toBe(first)
+        await expect(cache.read(captureOwner, thirdQuery, third.captureRevision)).resolves.toBe(third)
+
+        now = originalExpiry + 1
+        await expect(cache.read(captureOwner, firstQuery, first.captureRevision))
+            .rejects.toMatchObject({ code: 'CONFLICT', retryable: true })
+        await expect(cache.read(captureOwner, thirdQuery, third.captureRevision)).resolves.toBe(third)
+    })
+
+    it('rejects a resident duplicate reservation when its exact record expires', async () => {
+        let now = 0
+        const cache = new QueryCaptureCache({ now: () => now, ttlMs: 1, maxItemsPerPrincipal: 2 })
         const captureOwner = owner()
         const query = { scope: 'expiring-duplicate' }
         await cache.create(captureOwner, query, [{ id: 'existing' }])
@@ -95,8 +162,8 @@ describe('query capture cache', () => {
         expect((cache as any).reservations.size).toBe(0)
     })
 
-    it('rejects a zero-cost duplicate reservation when LRU evicts its exact record', async () => {
-        const cache = new QueryCaptureCache({ maxCapturesPerPrincipal: 1, maxItemsPerPrincipal: 2 })
+    it('rejects a resident duplicate reservation when LRU evicts its exact record', async () => {
+        const cache = new QueryCaptureCache({ maxCapturesPerPrincipal: 1, maxItemsPerPrincipal: 3 })
         const captureOwner = owner()
         const query = { scope: 'lru-duplicate' }
         await cache.create(captureOwner, query, [{ id: 'existing' }])

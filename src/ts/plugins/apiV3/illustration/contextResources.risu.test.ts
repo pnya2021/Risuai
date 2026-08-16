@@ -12,6 +12,7 @@ import {
 } from './contextResources'
 import { CursorRegistry } from './cursorRegistry'
 import { ContextAssetReadCoordinator } from './contextAssetReadCoordinator'
+import type { PluginApiError } from './errors'
 import { QueryCaptureCache } from './queryCaptureCache'
 
 const deferred = <T>() => {
@@ -576,6 +577,7 @@ describe('Risu context resource adapter', () => {
                 assetMaterializations: 0,
                 cachedAssetEmissions: 0,
                 fullCollectionFenceModuleProjections: 0,
+                pageFenceModuleProjections: 0,
                 finalAssetEmissions: 0,
                 targetedAssetProbes: 0,
                 physicalReads: 0,
@@ -589,6 +591,7 @@ describe('Risu context resource adapter', () => {
                 unselectedStorageReads: 0,
             }
             let fullCollectionFenceActive = false
+            let pageFenceActive = false
             const queryCurrent = makeCharacter({
                 image: 'assets/card-portrait.png',
                 emotionImages: [['card-emotion', 'assets/card-emotion.png']],
@@ -620,6 +623,11 @@ describe('Risu context resource adapter', () => {
                         && typeof property === 'string'
                         && /^(0|[1-9][0-9]*)$/.test(property)) {
                         queryCounters.fullCollectionFenceModuleProjections += 1
+                    }
+                    if (pageFenceActive
+                        && typeof property === 'string'
+                        && /^(0|[1-9][0-9]*)$/.test(property)) {
+                        queryCounters.pageFenceModuleProjections += 1
                     }
                     return Reflect.get(target, property, receiver)
                 },
@@ -670,6 +678,15 @@ describe('Risu context resource adapter', () => {
             queryAdapter.revalidateAssetSource = async (probe) => {
                 queryCounters.targetedAssetProbes += 1
                 return revalidateAsset(probe)
+            }
+            const revalidateAssetPage = queryAdapter.revalidateAssetPageSynchronously.bind(queryAdapter)
+            queryAdapter.revalidateAssetPageSynchronously = (probe) => {
+                pageFenceActive = true
+                try {
+                    revalidateAssetPage(probe)
+                } finally {
+                    pageFenceActive = false
+                }
             }
             const revalidateAssetCollection = queryAdapter.revalidateAssetCollection!.bind(queryAdapter)
             queryAdapter.revalidateAssetCollection = async (probe) => {
@@ -726,6 +743,7 @@ describe('Risu context resource adapter', () => {
             expect(queryCounters.assetMaterializations).toBe(2 * N)
             expect(pageCount).toBeGreaterThan(1)
             expect(queryCounters.fullCollectionFenceModuleProjections).toBe(2 * 2_450)
+            expect(queryCounters.pageFenceModuleProjections).toBe(N - first.assets.length)
             expect(queryCounters.cachedAssetEmissions).toBe(N)
             expect(queryCounters.finalAssetEmissions).toBeLessThanOrEqual(1)
             expect(queryCounters.targetedAssetProbes).toBe(3 * N - first.assets.length)
@@ -745,6 +763,77 @@ describe('Risu context resource adapter', () => {
         )
         await runAssetQuery(['module'], 2_450, 'real-size-module-assets')
     }, 30_000)
+
+    it('projects only active-module records represented on a later asset page', async () => {
+        const current = makeCharacter()
+        const selected = makeModule('selected', {
+            assets: [
+                ['selected-0', 'assets/selected-0.png', 'png'],
+                ['selected-1', 'assets/selected-1.png', 'png'],
+                ['selected-2', 'assets/selected-2.png', 'png'],
+            ],
+        })
+        const unrelated = makeModule('unrelated', {
+            assets: [['unrelated-0', 'assets/unrelated-0.png', 'png']],
+        })
+        let pageFenceActive = false
+        let selectedRecordReads = 0
+        let offPageRecordReads = 0
+        const activeRecords = new Proxy([
+            { module: selected, activatedBy: [] },
+            { module: unrelated, activatedBy: [] },
+        ], {
+            get(target, property, receiver) {
+                if (pageFenceActive && property === '0') selectedRecordReads += 1
+                if (pageFenceActive && property === '1') offPageRecordReads += 1
+                return Reflect.get(target, property, receiver)
+            },
+        })
+        const adapter = createRisuContextResourceAdapter(dependencies({
+            getDatabase: () => ({ characters: [current], modules: [] }),
+            getCurrentCharacter: () => current,
+            getCurrentChat: () => current.chats[0],
+            getActiveModulesWithReasons: () => activeRecords,
+        }))
+        const revalidatePage = adapter.revalidateAssetPageSynchronously.bind(adapter)
+        adapter.revalidateAssetPageSynchronously = (probe) => {
+            pageFenceActive = true
+            try {
+                revalidatePage(probe)
+            } finally {
+                pageFenceActive = false
+            }
+        }
+        const service = new ContextResourceService(
+            {
+                principalId: '11111111-1111-4111-8111-111111111111',
+                instanceId: 'active-asset-page-record-workload',
+                displayName: 'Active asset page record workload',
+                signal: new AbortController().signal,
+            },
+            adapter,
+            {
+                requirePermission: async () => undefined,
+                cursorRegistry: new CursorRegistry(),
+                queryCaptureCache: new QueryCaptureCache(),
+            },
+        )
+        const first = await service.listContextAssets({
+            moduleScope: 'active', include: ['module'], captureScope: 'query', limit: 1,
+        })
+        expect(first.nextCursor).toBeTypeOf('string')
+
+        const second = await service.listContextAssets({
+            moduleScope: 'active', include: ['module'], captureScope: 'query',
+            captureRevision: first.captureRevision, cursor: first.nextCursor, limit: 1,
+        })
+
+        expect(second.assets).toHaveLength(1)
+        expect(second.nextCursor).toBeTypeOf('string')
+        expect(selectedRecordReads).toBe(1)
+        expect(offPageRecordReads).toBe(0)
+        service.dispose()
+    })
 
     it('bounds a later module cursor page to its selected nested slots', async () => {
         const current = makeCharacter()
@@ -1148,6 +1237,145 @@ describe('Risu context resource adapter', () => {
             moduleScope: 'none', captureScope: 'query', captureRevision: first.captureRevision,
             cursor: first.nextCursor, limit: 1,
         })).rejects.toMatchObject({ code: 'CONFLICT', retryable: true })
+        service.dispose()
+    })
+
+    it('rejects a later asset page whose asynchronous item probes pass at different source states', async () => {
+        const principalId = '11111111-1111-4111-8111-111111111111'
+        const character = makeCharacter()
+        const storageRevisions = new Map<string, number>()
+        const cursorRegistry = new CursorRegistry()
+        const adapter = createRisuContextResourceAdapter(dependencies({
+            getDatabase: () => ({ characters: [character], modules: [] }),
+            getCurrentCharacter: () => character,
+            getCurrentChat: () => character.chats[0],
+            getActiveModulesWithReasons: () => [],
+            getAssetStorageRevision: (storageKey) =>
+                `revision:${storageKey}:${storageRevisions.get(storageKey) ?? 1}`,
+        }))
+        type AssetProbe = Parameters<NonNullable<typeof adapter.revalidateAssetSource>>[0]
+        const nativeAdapter = adapter as typeof adapter & {
+            revalidateAssetPageSynchronously?: (probe: {
+                selectors: { characterId: string; conversationId: string }
+                pageSources: readonly AssetProbe['located'][]
+                input: AssetProbe['input']
+            }) => void
+        }
+        const service = new ContextResourceService(
+            {
+                principalId,
+                instanceId: 'asset-page-source-linearization',
+                displayName: 'Asset page source linearization',
+                signal: new AbortController().signal,
+            },
+            adapter,
+            {
+                requirePermission: async () => undefined,
+                cursorRegistry,
+                queryCaptureCache: new QueryCaptureCache(),
+            },
+        )
+        const first = await service.listContextAssets({
+            moduleScope: 'none', captureScope: 'query', limit: 1,
+        })
+        expect(first.captureRevision).toMatch(/^sha256:[0-9a-f]{64}$/)
+        expect(first.nextCursor).toBeTypeOf('string')
+        const issuedHandleCount = (service as any).issuedHandles.size
+        const cursorCommit = vi.spyOn(cursorRegistry, 'commitPrepared')
+        const secondProbeGate = deferred<void>()
+        const firstPageStorageKey = 'assets/happy.webp'
+        const secondPageStorageKey = 'assets/uniform.jpg'
+        let firstProbePassed = false
+        let secondProbeEntered = false
+        const revalidate = adapter.revalidateAssetSource!.bind(adapter)
+        adapter.revalidateAssetSource = async (probe) => {
+            if (probe.located.source.storageKey === secondPageStorageKey) {
+                secondProbeEntered = true
+                await secondProbeGate.promise
+            }
+            const current = await revalidate(probe)
+            if (probe.located.source.storageKey === firstPageStorageKey) firstProbePassed = true
+            return current
+        }
+        storageRevisions.set(secondPageStorageKey, 2)
+
+        const pending = service.listContextAssets({
+            moduleScope: 'none', captureScope: 'query', captureRevision: first.captureRevision,
+            cursor: first.nextCursor, limit: 2,
+        }).then(
+            (value) => ({ ok: true as const, value }),
+            (error: PluginApiError) => ({ ok: false as const, error }),
+        )
+        await waitFor(() => firstProbePassed && secondProbeEntered)
+        storageRevisions.set(firstPageStorageKey, 2)
+        storageRevisions.delete(secondPageStorageKey)
+        secondProbeGate.resolve()
+        const outcome = await pending
+
+        expect.soft(outcome).toMatchObject({
+            ok: false,
+            error: { code: 'CONFLICT', retryable: true },
+        })
+        expect.soft(cursorCommit).not.toHaveBeenCalled()
+        expect.soft(cursorRegistry.activeCount(principalId)).toBe(0)
+        expect.soft((service as any).issuedHandles.size).toBe(issuedHandleCount)
+        expect.soft(nativeAdapter.revalidateAssetPageSynchronously).toBeTypeOf('function')
+        service.dispose()
+    })
+
+    it('commits a later asset cursor before microtasks queued by the final synchronous probe', async () => {
+        const principalId = '11111111-1111-4111-8111-111111111111'
+        const character = makeCharacter()
+        const cursorRegistry = new CursorRegistry()
+        const adapter = createRisuContextResourceAdapter(dependencies({
+            getDatabase: () => ({ characters: [character], modules: [] }),
+            getCurrentCharacter: () => character,
+            getCurrentChat: () => character.chats[0],
+            getActiveModulesWithReasons: () => [],
+        }))
+        const service = new ContextResourceService(
+            {
+                principalId,
+                instanceId: 'asset-page-hook-commit-order',
+                displayName: 'Asset page hook commit order',
+                signal: new AbortController().signal,
+            },
+            adapter,
+            {
+                requirePermission: async () => undefined,
+                cursorRegistry,
+                queryCaptureCache: new QueryCaptureCache(),
+            },
+        )
+        const first = await service.listContextAssets({
+            moduleScope: 'none', captureScope: 'query', limit: 1,
+        })
+        expect(first.nextCursor).toBeTypeOf('string')
+        expect(adapter.revalidateAssetPageSynchronously).toBeTypeOf('function')
+        if (!adapter.revalidateAssetPageSynchronously) return
+
+        let queuedMutationRan = false
+        let mutationObservedAtCursorCommit: boolean | undefined
+        const revalidate = adapter.revalidateAssetPageSynchronously.bind(adapter)
+        adapter.revalidateAssetPageSynchronously = (probe) => {
+            revalidate(probe)
+            queueMicrotask(() => { queuedMutationRan = true })
+        }
+        const commitPrepared = cursorRegistry.commitPrepared.bind(cursorRegistry)
+        vi.spyOn(cursorRegistry, 'commitPrepared').mockImplementation((preparation, value, commit) => {
+            mutationObservedAtCursorCommit = queuedMutationRan
+            return commitPrepared(preparation, value, commit)
+        })
+
+        const second = await service.listContextAssets({
+            moduleScope: 'none', captureScope: 'query', captureRevision: first.captureRevision,
+            cursor: first.nextCursor, limit: 1,
+        })
+
+        expect(second.assets).toHaveLength(1)
+        expect(second.nextCursor).toBeTypeOf('string')
+        expect(mutationObservedAtCursorCommit).toBe(false)
+        expect(queuedMutationRan).toBe(true)
         service.dispose()
     })
 
