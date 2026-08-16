@@ -16,6 +16,13 @@ import {
     contextAssetReadCoordinator,
     type ContextAssetLogicalQueueToken,
 } from './contextAssetReadCoordinator'
+import {
+    contextAssetAuthorityRegistry,
+    type ContextAssetAuthority,
+    type ContextAssetAuthorityRegistry,
+    type CurrentContextAssetAuthority,
+    type StudioContextAssetAuthority,
+} from './contextAssetAuthorityRegistry'
 
 export type CharacterId = string
 export type ConversationId = string
@@ -289,6 +296,7 @@ export interface ContextResourceServiceDependencies {
     readCoordinator?: ContextAssetReadCoordinator
     queryCaptureCache?: QueryCaptureCache
     getPermissionGeneration?: () => string | number
+    assetAuthorityRegistry?: ContextAssetAuthorityRegistry
 }
 
 export interface ContextModulePage extends CursorPage<ContextModuleSnapshot> {
@@ -523,6 +531,7 @@ export class ContextResourceService {
     private readonly cursorRegistry: CursorRegistry
     private readonly readCoordinator: ContextAssetReadCoordinator
     private readonly queryCaptureCache: QueryCaptureCache
+    private readonly assetAuthorityRegistry: ContextAssetAuthorityRegistry
     private readonly moduleCaptureProjections = new WeakMap<ContextModuleSource, ContextModuleSnapshot>()
     private readonly assetCaptureProjections = new WeakMap<ContextLocatedAssetSource, ContextAssetRef>()
     private readonly digestCache = new Map<string, AssetDigestRecord>()
@@ -542,6 +551,7 @@ export class ContextResourceService {
         this.cursorRegistry = dependencies.cursorRegistry ?? illustrationCursorRegistry
         this.readCoordinator = dependencies.readCoordinator ?? contextAssetReadCoordinator
         this.queryCaptureCache = dependencies.queryCaptureCache ?? illustrationQueryCaptureCache
+        this.assetAuthorityRegistry = dependencies.assetAuthorityRegistry ?? contextAssetAuthorityRegistry
         this.permissionGeneration = dependencies.getPermissionGeneration?.() ?? 0
         this.abortCleanup = () => this.dispose()
         context.signal.addEventListener('abort', this.abortCleanup, { once: true })
@@ -560,6 +570,7 @@ export class ContextResourceService {
         this.digestAttempts.clear()
         this.digestCache.clear()
         this.issuedHandles.clear()
+        this.assetAuthorityRegistry.clearInstance(this.context.principalId, this.context.instanceId)
         this.cursorRegistry.clearInstance(this.context.principalId, this.context.instanceId)
         this.queryCaptureCache.clearInstance(this.context.principalId, this.context.instanceId)
         this.readCoordinator.cancelInstance({
@@ -1499,6 +1510,7 @@ export class ContextResourceService {
             { identity: source.identity, origin },
             MAX_ISSUED_HANDLES,
         )
+        if (!stagedHandles) this.registerIssuedAuthority(assetId, { identity: source.identity, origin })
         const reference: ContextAssetRef = {
             assetId,
             revision: digest.revision,
@@ -1956,6 +1968,7 @@ export class ContextResourceService {
         }
         for (const [assetId, issued] of stagedHandles) {
             lruSet(this.issuedHandles, assetId, issued, MAX_ISSUED_HANDLES)
+            this.registerIssuedAuthority(assetId, issued)
         }
         if (nextCursorValue && nextCursorPreparation && nextCursorCommit) {
             this.cursorRegistry.commitPrepared(nextCursorPreparation, nextCursorValue, nextCursorCommit)
@@ -2108,6 +2121,19 @@ export class ContextResourceService {
             : left.moduleId === (right as { kind: 'module'; moduleId: string }).moduleId)
     }
 
+    private registerIssuedAuthority(assetId: string, issued: IssuedAssetHandle) {
+        this.assetAuthorityRegistry.register({
+            principalId: this.context.principalId,
+            instanceId: this.context.instanceId,
+            assetId,
+            authorityKind: issued.origin.kind === 'character'
+                ? 'current-context-card'
+                : 'current-context-installed-module',
+            identity: issued.identity,
+            origin: { ...issued.origin },
+        })
+    }
+
     private authorizedScanAssets(state: ContextHostState) {
         const authorized = this.authorizedCharacterIds(state)
         return this.allAssets({
@@ -2141,53 +2167,85 @@ export class ContextResourceService {
 
     private async locateAsset(
         state: ContextHostState,
-        assetId: string,
+        authority: CurrentContextAssetAuthority,
         expectedSelectors: { characterId: string; conversationId: string },
         expectedRevision: Revision | undefined,
         generation: number,
         signal?: AbortSignal,
     ) {
         this.assertActive(generation, signal)
-        const issued = lruGet(this.issuedHandles, assetId)
-        if (issued) {
-            const candidate = this.findIssuedAsset(state, issued)
-            if (candidate) return candidate
-            throw new PluginApiError('NOT_FOUND', 'Context asset was not found')
+        const issued = { identity: authority.identity, origin: authority.origin }
+        lruSet(this.issuedHandles, authority.assetId, issued, MAX_ISSUED_HANDLES)
+        const candidate = this.findIssuedAsset(state, issued)
+        if (!candidate) throw new PluginApiError('NOT_FOUND', 'Context asset was not found')
+        if (expectedRevision) {
+            const currentHandle = await this.fenced(
+                this.handleFor(candidate.source, candidate.origin, expectedRevision), generation, signal,
+            )
+            if (currentHandle !== authority.assetId) throw new PluginApiError('CONFLICT', 'Context asset revision changed')
         }
+        return candidate
+    }
 
-        const candidates = this.authorizedScanAssets(state)
-        for (const candidate of candidates) {
-            this.assertActive(generation, signal)
-            let revision = expectedRevision
-            if (!revision) {
-                const digest = await this.assetDigest(
-                    candidate.source,
-                    () => this.reauthorizeAssetOrigin(candidate, expectedSelectors, generation, signal),
-                    generation,
-                    signal,
-                )
-                await this.reauthorizeAssetOrigin(candidate, expectedSelectors, generation, signal)
-                this.assertActive(generation, signal)
-                lruSet(this.digestCache, this.digestKey(candidate.source), digest, MAX_DIGEST_RECORDS)
-                revision = digest.revision
-            }
-            if (await this.fenced(this.handleFor(candidate.source, candidate.origin, revision), generation, signal) === assetId) {
-                await this.reauthorizeAssetOrigin(candidate, expectedSelectors, generation, signal)
-                this.assertActive(generation, signal)
-                lruSet(
-                    this.issuedHandles,
-                    assetId,
-                    { identity: candidate.source.identity, origin: candidate.origin },
-                    MAX_ISSUED_HANDLES,
-                )
-                return {
-                    ...candidate,
-                    source: { ...candidate.source },
-                    origin: { ...candidate.origin },
-                }
-            }
+    private async readStudioAuthority(
+        authority: StudioContextAssetAuthority,
+        options: ContextAssetReadOptions,
+        generation: number,
+        maxBytes: number,
+        variant: 'original' | 'thumbnail',
+    ) {
+        const signal = options.signal
+        if (options.ifRevision !== undefined && options.ifRevision !== authority.revision) {
+            throw new PluginApiError('CONFLICT', 'Context asset revision changed', {
+                details: { expectedRevision: options.ifRevision, actualRevision: authority.revision },
+            })
         }
-        throw new PluginApiError('NOT_FOUND', 'Context asset was not found')
+        if (authority.byteLength !== undefined && authority.byteLength > maxBytes) {
+            throw new PluginApiError('RESOURCE_LIMIT', 'Context asset exceeds maxBytes')
+        }
+        await authority.validate(signal)
+        this.assertActive(generation, signal)
+        return this.readCoordinator.schedule({
+            owner: { principalId: this.context.principalId, instanceId: this.context.instanceId },
+            lane: variant,
+            signal,
+            run: async (physicalSignal) => {
+                await authority.validate(physicalSignal)
+                this.assertActive(generation, physicalSignal)
+                const data = await authority.read(physicalSignal)
+                this.assertActive(generation, physicalSignal)
+                if (!(data instanceof Uint8Array)) throw new PluginApiError('NOT_FOUND', 'Context asset bytes were not found')
+                if (data.byteLength > MAX_ASSET_READ_BYTES || variant === 'original' && data.byteLength > maxBytes) {
+                    throw new PluginApiError('RESOURCE_LIMIT', 'Context asset exceeds maxBytes')
+                }
+                let result = data
+                let mediaType = normalizedMediaType(authority.mediaType) ?? 'application/octet-stream'
+                if (variant === 'thumbnail') {
+                    if (!mediaType.startsWith('image/')) throw new PluginApiError('DECODE_FAILED', 'Only image assets can be thumbnailed')
+                    const source: ContextAssetSource = {
+                        identity: authority.assetId, storageKey: authority.assetId,
+                        storageRevision: authority.revision, name: authority.name,
+                        mediaType, byteLength: data.byteLength, role: 'additional',
+                    }
+                    const thumbnail = await this.adapter.createThumbnail(source, data, {
+                        longEdge: THUMBNAIL_LONG_EDGE, maxPixels: MAX_THUMBNAIL_PIXELS,
+                        maxOutputBytes: MAX_THUMBNAIL_OUTPUT_BYTES,
+                    }, physicalSignal)
+                    this.assertActive(generation, physicalSignal)
+                    if (!(thumbnail.data instanceof Uint8Array) || thumbnail.data.byteLength > maxBytes
+                        || thumbnail.data.byteLength > MAX_THUMBNAIL_OUTPUT_BYTES
+                        || thumbnail.decodedPixels > MAX_THUMBNAIL_PIXELS
+                        || Math.max(thumbnail.width, thumbnail.height) > THUMBNAIL_LONG_EDGE) {
+                        throw new PluginApiError('RESOURCE_LIMIT', 'Thumbnail exceeds the advertised bounds')
+                    }
+                    result = thumbnail.data
+                    mediaType = normalizedMediaType(thumbnail.mediaType) ?? 'application/octet-stream'
+                }
+                await authority.validate(physicalSignal)
+                this.assertActive(generation, physicalSignal)
+                return { data: result.slice(), revision: authority.revision, name: authority.name, mediaType }
+            },
+        })
     }
 
     private async authorizeAssetOrigin(
@@ -2255,13 +2313,22 @@ export class ContextResourceService {
         }
         const maxBytes = normalizeAssetReadBytes(options.maxBytes)
         validateAssetReadIdentifiers(assetId, options.ifRevision)
+        const authority = this.assetAuthorityRegistry.lookup(assetId, {
+            principalId: this.context.principalId,
+            instanceId: this.context.instanceId,
+        })
+        if (authority.authorityKind === 'studio-catalogue-portrait'
+            || authority.authorityKind === 'studio-card-capture') {
+            return this.readStudioAuthority(authority, options, generation, maxBytes, variant)
+        }
+        const currentAuthority = authority as CurrentContextAssetAuthority
         const preflight = await this.state(generation, signal)
         this.current(preflight)
         await this.permission('contextAssets', generation, signal)
         const state = await this.state(generation, signal)
         const selectors = this.resolveSelectors(state, {})
         const located = await this.locateAsset(
-            state, assetId, selectors, options.ifRevision, generation, signal,
+            state, currentAuthority, selectors, options.ifRevision, generation, signal,
         )
         await this.authorizeAssetOrigin(state, located, generation, signal)
         if (located.source.byteLength !== undefined && located.source.byteLength > MAX_ASSET_READ_BYTES) {
@@ -2350,6 +2417,7 @@ export class ContextResourceService {
                     { identity: located.source.identity, origin: located.origin },
                     MAX_ISSUED_HANDLES,
                 )
+                this.registerIssuedAuthority(assetId, { identity: located.source.identity, origin: located.origin })
                 if (variant === 'original') {
                     return {
                         data: data.slice(),

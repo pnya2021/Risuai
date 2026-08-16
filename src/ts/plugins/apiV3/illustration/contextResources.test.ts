@@ -187,6 +187,7 @@ function harness(options: {
     instanceId?: string
     queryCaptureCache?: QueryCaptureCache
     getPermissionGeneration?: () => number
+    assetAuthorityRegistry?: unknown
     adapterOverrides?: Partial<ContextResourceAdapter>
 } = {}) {
     let state = options.state ?? makeState()
@@ -238,7 +239,8 @@ function harness(options: {
             readCoordinator: options.readCoordinator,
             queryCaptureCache: options.queryCaptureCache,
             getPermissionGeneration: options.getPermissionGeneration,
-        },
+            assetAuthorityRegistry: options.assetAuthorityRegistry,
+        } as any,
     )
     return {
         service,
@@ -544,6 +546,32 @@ describe('module activation and module resources', () => {
 })
 
 describe('opaque context assets', () => {
+    it('dispatches a registered Studio handle without probing current-context state', async () => {
+        const authority = {
+            lookup: vi.fn(() => ({
+                principalId: 'registry-principal', instanceId: 'registry-instance',
+                assetId: `ctxasset_${'1'.repeat(64)}`,
+                authorityKind: 'studio-card-capture',
+                revision: `sha256:${'2'.repeat(64)}`,
+                name: 'selected.png', mediaType: 'image/png',
+                validate: vi.fn(async () => undefined),
+                read: vi.fn(async () => new Uint8Array([7, 8, 9])),
+            })),
+            clearInstance: vi.fn(),
+        }
+        const h = harness({
+            principalId: 'registry-principal', instanceId: 'registry-instance',
+            assetAuthorityRegistry: authority,
+        })
+        await expect(h.service.readContextAsset(`ctxasset_${'1'.repeat(64)}`)).resolves.toMatchObject({
+            data: new Uint8Array([7, 8, 9]),
+            revision: `sha256:${'2'.repeat(64)}`,
+        })
+        expect(authority.lookup).toHaveBeenCalledTimes(1)
+        expect(h.getState).not.toHaveBeenCalled()
+        expect(h.reads).not.toHaveBeenCalled()
+    })
+
     it('lists content-digest-bound opaque principal handles and caches unchanged digests', async () => {
         const h = harness()
         const first = await h.service.listContextAssets({ moduleScope: 'none' })
@@ -1256,7 +1284,7 @@ describe('opaque context assets', () => {
         await expect(active.service.readContextAsset(reference.assetId, { ifRevision: reference.revision }))
             .resolves.toMatchObject({ revision: reference.revision })
         expect(active.permissionCalls).toEqual([
-            'contextAssets', 'contextAssets', 'contextAssets', 'contextAssets',
+            'contextAssets', 'contextAssets', 'contextAssets',
         ])
 
         state.activeModules = []
@@ -1308,7 +1336,7 @@ describe('opaque context assets', () => {
         expect(h.reads).toHaveBeenCalledTimes(assetReads)
     })
 
-    it('cold-scans only authorized assets without enumerating unrelated asset metadata', async () => {
+    it('rejects unknown handles through one registry lookup without enumerating asset metadata', async () => {
         const state = makeState()
         Object.defineProperty(state.characters[2], 'assets', {
             enumerable: true,
@@ -1318,17 +1346,17 @@ describe('opaque context assets', () => {
 
         await expect(h.service.readContextAsset(`ctxasset_${'0'.repeat(64)}`))
             .rejects.toMatchObject({ code: 'NOT_FOUND' })
-        expect(h.reads.mock.calls.length).toBeGreaterThan(0)
-        expect(h.reads.mock.calls.every(([source]) => source.storageKey !== 'other-portrait')).toBe(true)
+        expect(h.reads).not.toHaveBeenCalled()
+        expect(h.getState).not.toHaveBeenCalled()
     })
 
-    it('allows repeated syntactically valid unknown handles without a completed-read quota', async () => {
+    it('allows repeated syntactically valid unknown handles without physical I/O', async () => {
         const h = harness()
         const unknownHandle = `ctxasset_${'0'.repeat(64)}`
         for (let index = 0; index < 65; index++) {
             expect(await errorCode(h.service.readContextAsset(unknownHandle))).toBe('NOT_FOUND')
         }
-        expect(h.reads.mock.calls.length).toBeGreaterThan(0)
+        expect(h.reads).not.toHaveBeenCalled()
     })
 
     it('recovers a persisted handle from its revision without reading unrelated asset bytes', async () => {
@@ -1349,7 +1377,7 @@ describe('opaque context assets', () => {
         expect(unknown.reads).not.toHaveBeenCalled()
     })
 
-    it('bounds digest and issued-handle metadata at 8192 while cold-resolving evicted handles', async () => {
+    it('bounds digest and issued-handle metadata at 8192 and fails closed for evicted handles', async () => {
         const state = makeState()
         state.characters[0].assets = Array.from({ length: 8_194 }, (_, index) => asset(
             `lru-${index}`,
@@ -1373,13 +1401,12 @@ describe('opaque context assets', () => {
 
         await expect(h.service.readContextAsset(references[0].assetId, {
             ifRevision: references[0].revision,
-        })).resolves.toMatchObject({ revision: references[0].revision })
-        expect(h.reads).toHaveBeenCalledOnce()
+        })).rejects.toMatchObject({ code: 'NOT_FOUND' })
+        expect(h.reads).not.toHaveBeenCalled()
 
-        await expect(h.service.readContextAsset(references[1].assetId)).resolves.toMatchObject({
-            revision: references[1].revision,
-        })
-        expect(h.reads).toHaveBeenCalledTimes(3)
+        await expect(h.service.readContextAsset(references[1].assetId))
+            .rejects.toMatchObject({ code: 'NOT_FOUND' })
+        expect(h.reads).not.toHaveBeenCalled()
     }, 60_000)
 
     it('rejects known and returned sources over 32 MiB before digest cache or handle publication', async () => {
