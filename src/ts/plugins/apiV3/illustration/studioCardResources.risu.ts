@@ -115,29 +115,48 @@ const textFields: Array<{ key: string; label: string; source: string }> = [
     { key: 'additionalText', label: 'Additional text', source: 'additionalText' },
 ]
 
-const utf8BytesAtMost = (value: string, maximum: number) => {
-    let bytes = 0
+const boundedCanonicalStringPayloadBytes = (value: string) => {
+    let rawBytes = 0
+    let canonicalBytes = 0
     for (let index = 0; index < value.length; index++) {
         const code = value.charCodeAt(index)
-        if (code <= 0x7f) bytes += 1
-        else if (code <= 0x7ff) bytes += 2
-        else if (code >= 0xd800 && code <= 0xdbff
+        if (code === 0x22 || code === 0x5c) {
+            rawBytes += 1
+            canonicalBytes += 2
+        } else if (code <= 0x1f) {
+            rawBytes += 1
+            canonicalBytes += code === 0x08 || code === 0x09 || code === 0x0a
+                || code === 0x0c || code === 0x0d ? 2 : 6
+        } else if (code <= 0x7f) {
+            rawBytes += 1
+            canonicalBytes += 1
+        } else if (code <= 0x7ff) {
+            rawBytes += 2
+            canonicalBytes += 2
+        } else if (code >= 0xd800 && code <= 0xdbff
             && index + 1 < value.length
             && value.charCodeAt(index + 1) >= 0xdc00
             && value.charCodeAt(index + 1) <= 0xdfff) {
-            bytes += 4
+            rawBytes += 4
+            canonicalBytes += 4
             index += 1
-        } else bytes += 3
-        if (bytes > maximum) return null
+        } else if (code >= 0xd800 && code <= 0xdfff) {
+            rawBytes += 3
+            canonicalBytes += 6
+        } else {
+            rawBytes += 3
+            canonicalBytes += 3
+        }
+        if (rawBytes > MAX_TEXT_FIELD_UTF8_BYTES) {
+            throw resourceLimit('Studio card text field exceeds the advertised limit')
+        }
     }
-    return bytes
+    return canonicalBytes
 }
 
 const boundedMetadataStringBytes = (value: unknown) => {
     if (typeof value !== 'string') return 0
-    const bytes = utf8BytesAtMost(value, MAX_TEXT_FIELD_UTF8_BYTES)
-    if (bytes === null) throw resourceLimit('Studio card text field exceeds the advertised limit')
-    return bytes
+    return boundedCanonicalStringPayloadBytes(value)
 }
 
 const preflightArrayLength = (value: unknown, label: string) => {

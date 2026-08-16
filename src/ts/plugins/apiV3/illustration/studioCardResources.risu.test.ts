@@ -476,6 +476,23 @@ describe('Risu Studio card native projection', () => {
         expect(h.readImage).not.toHaveBeenCalled()
     })
 
+    it('rejects JSON-escaped text beyond the snapshot limit before projecting later card fields', async () => {
+        const raw = character('alice', 'Alice')
+        raw.desc = '\0'.repeat(400_000)
+        let laterFieldReads = 0
+        const alice = new Proxy(raw, {
+            getOwnPropertyDescriptor(target, property) {
+                if (property === 'personality') laterFieldReads += 1
+                return Reflect.getOwnPropertyDescriptor(target, property)
+            },
+        })
+        const h = harness([alice], 0)
+
+        await expect(select(h, 'alice')).rejects.toMatchObject({ code: 'RESOURCE_LIMIT' })
+        expect(laterFieldReads).toBe(0)
+        expect(h.readImage).not.toHaveBeenCalled()
+    })
+
     it('rejects oversized lore metadata before copying later lore entries', async () => {
         const alice = character('alice', 'Alice')
         let laterLoreReads = 0
@@ -515,6 +532,31 @@ describe('Risu Studio card native projection', () => {
         expect(beyondBoundaryReads).toBe(0)
         expect(h.readImage).not.toHaveBeenCalled()
     }, 30_000)
+
+    it('rejects JSON-escaped asset-name metadata beyond 16 MiB before source projection', async () => {
+        const alice = character('alice', 'Alice')
+        const escapedName = '\\'.repeat(400_000)
+        let firstEntryReads = 0
+        alice.additionalAssets = new Proxy(
+            Array.from({ length: 40 }, (_, index) => [
+                escapedName, `assets/escaped-${index}.png`, 'png',
+            ]),
+            {
+                getOwnPropertyDescriptor(target, property) {
+                    if (property === '0') {
+                        firstEntryReads += 1
+                        if (firstEntryReads > 1) throw new Error('source projection entered')
+                    }
+                    return Reflect.getOwnPropertyDescriptor(target, property)
+                },
+            },
+        )
+        const h = harness([alice], 0)
+
+        await expect(select(h, 'alice')).rejects.toMatchObject({ code: 'RESOURCE_LIMIT' })
+        expect(firstEntryReads).toBe(1)
+        expect(h.readImage).not.toHaveBeenCalled()
+    })
 
     it('enumerates 4,902 logical descriptors without authority and reads only exact resolved batches', async () => {
         const alice = character('alice', 'Alice')
