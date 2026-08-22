@@ -13,6 +13,7 @@ vi.mock(
     ({
       appVer: '1234.5.67',
       getCurrentCharacter: () => ({}),
+      getCurrentChat: () => DBState.db.characters[0]?.chats?.[DBState.db.characters[0].chatPage],
       getDatabase: () => ({}),
     } as typeof import('../../storage/database.svelte'))
 )
