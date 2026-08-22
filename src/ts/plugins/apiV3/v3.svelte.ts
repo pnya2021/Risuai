@@ -902,6 +902,10 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
         },
         removeRisuReplacer: oldApis.removeRisuReplacer,
         addRisuChatListener: async (mode:'output', func:Function) => {
+            const conf = await getPluginPermission(context, 'replacer', 'periodically');
+            if(!conf){
+                return;
+            }
             if (!canRegisterResource()) return
             oldApis.addRisuChatListener(mode, func as any);
             addPluginUnloadCallback(context.instanceId, () => oldApis.removeRisuChatListener(mode, func as any));
@@ -915,6 +919,10 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
         },
         readImage: oldApis.readImage,
         readInlay: async (id: string) => {
+            const conf = await getPluginPermission(context, 'inlayRead', 'periodically');
+            if(!conf || !canRegisterResource()){
+                return null;
+            }
             return await getInlayAsset(id);
         },
         createInlay: (data, options) => inlayLifecycle.createInlay(data, options),

@@ -14,7 +14,7 @@ import { appDataDir, join } from "@tauri-apps/api/path";
 import { get } from "svelte/store";
 import { open } from '@tauri-apps/plugin-shell'
 import streamSaver from 'streamsaver';
-import { setDatabase, type Database, defaultSdDataFunc, getDatabase, appVer, getCurrentCharacter, type character, type groupChat } from "./storage/database.svelte";
+import { setDatabase, type Database, defaultSdDataFunc, getDatabase, appVer, getCurrentCharacter, type character, type groupChat, appSubVer } from "./storage/database.svelte";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { checkRisuUpdate } from "./update";
 import { MobileGUI, botMakerMode, selectedCharID, loadedStore, DBState, LoadingStatusState, selIdState, ReloadGUIPointer, bodyIntercepterStore } from "./stores.svelte";
@@ -2392,8 +2392,11 @@ export function getLanguageCodes() {
 
 export function getVersionString(): string {
     let versionString = appVer
-    if (window.location.hostname === 'nightly.risuai.xyz') {
-        versionString = 'Nightly Build'
+    if(appSubVer) {
+        versionString += '-' + appSubVer
+    }
+    if (import.meta.env.VITE_RISU_NIGHTLY_BUILD === 'TRUE') {
+        versionString = 'Nightly Build ' + import.meta.env.VITE_RISU_BUILD_TIME
     }
     if (window.location.hostname === 'stable.risuai.xyz') {
         versionString += ' (Stable)';
