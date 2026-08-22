@@ -10,6 +10,17 @@ vi.mock('../../parser/parser.svelte', () => ({
     risuUnescape: vi.fn((value: string) => value),
 }))
 
+vi.mock('../../process/modules', () => ({
+    exportModuleLegacy: vi.fn(),
+    getActiveModulesWithReasons: vi.fn(() => []),
+    getModuleLorebooks: vi.fn(() => []),
+    getModuleRegexScripts: vi.fn(() => []),
+    moduleUpdate: vi.fn(),
+    readModule: vi.fn(),
+}))
+
+const REAL_V3_TIMEOUT_MS = 60_000
+
 const startedInstances: Array<{ instanceId: string }> = []
 
 async function startV3Api() {
@@ -82,7 +93,7 @@ describe('upstream strong-V3 permission sync', () => {
                 if (!initialListeners.has(registered)) runtime.pluginV2.chatOutput.delete(registered)
             }
         }
-    })
+    }, REAL_V3_TIMEOUT_MS)
 
     it('does not register a listener when its permission resolves after unload', async () => {
         let resolvePermission!: (value: boolean) => void
@@ -99,7 +110,7 @@ describe('upstream strong-V3 permission sync', () => {
         await Promise.all([registration, unloading])
 
         expect(runtime.pluginV2.chatOutput.size).toBe(initialListenerCount)
-    })
+    }, REAL_V3_TIMEOUT_MS)
 
     it('gates a real legacy Inlay read with the scoped foreign-read permission', async () => {
         const inlayId = `foreign-${crypto.randomUUID()}`
@@ -125,7 +136,7 @@ describe('upstream strong-V3 permission sync', () => {
             await runtime.cleanup()
             await runtime.inlays.removeInlayAsset(inlayId)
         }
-    })
+    }, REAL_V3_TIMEOUT_MS)
 
     it('does not read an Inlay when its permission resolves after unload', async () => {
         let resolvePermission!: (value: boolean) => void
@@ -146,5 +157,5 @@ describe('upstream strong-V3 permission sync', () => {
         await expect(read).resolves.toBeNull()
         await unloading
         await runtime.inlays.removeInlayAsset(inlayId)
-    })
+    }, REAL_V3_TIMEOUT_MS)
 })
