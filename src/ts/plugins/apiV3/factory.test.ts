@@ -4,6 +4,7 @@ import { parse } from 'acorn'
 import { cancelSandboxCallbackInvocation, invokeSandboxCleanupCallback, SandboxHost } from './factory'
 import { serializePluginApiError } from './illustration/errors'
 import * as capabilityContract from './illustration/capabilityContract'
+import { registerStudioCardRpcFinalizer } from './studioCardRpcTransport'
 
 vi.stubGlobal('ImageBitmap', class ImageBitmap {})
 
@@ -34,6 +35,26 @@ const internalPluginError = {
   message: 'Internal plugin API error',
   retryable: false,
 } as const
+
+const studioResourceResults = [
+  ['catalogue', () => ({ catalogueRevision: 'catalogue-new', total: 0, items: [] })],
+  ['target/capture', () => ({
+    targetRevision: 'target-new', captureRevision: 'capture-new', sourceRevision: 'source-new',
+    card: {}, groupMembers: [],
+  })],
+  ['access', () => ({
+    captureRevision: 'capture-existing', accessRevision: 'access-new', purpose: 'selected', assets: [],
+  })],
+] as const
+
+function studioResourceResult(create: () => object) {
+  const value = create()
+  const retained = new Set(['pre-existing-authority', 'new-response-authority'])
+  const commit = vi.fn()
+  const rollback = vi.fn(() => { retained.delete('new-response-authority') })
+  registerStudioCardRpcFinalizer(value, { commit, rollback })
+  return { value, retained, commit, rollback }
+}
 
 function createHarness(
   apiFactory: Record<string, (...args: any[]) => any>,
@@ -511,6 +532,84 @@ describe('SandboxHost callback and teardown lifecycle', () => {
 
     expect((host as any).instanceRegistry.size).toBe(0)
     expect(posted.filter((entry) => entry.message.type === 'RESPONSE' && entry.message.reqId === 'late-result')).toHaveLength(0)
+  })
+
+  it.each(studioResourceResults)('rolls back an exact %s result that completes after its sandbox run is stale', async (_kind, create) => {
+    let resolveResult!: (value: object) => void
+    const called = vi.fn()
+    const pending = new Promise<object>((resolve) => { resolveResult = resolve })
+    const resource = studioResourceResult(create)
+    for (const key of Object.keys(resource.value)) {
+      if (key.endsWith('Revision')) (resource.value as Record<string, unknown>)[key] = 'pre-existing-authority'
+    }
+    const { dispatch, host, posted } = createHarness({
+      deferredResource: () => {
+        called()
+        return pending
+      },
+    })
+
+    dispatch({ type: 'CALL_ROOT', reqId: `stale-${_kind}`, method: 'deferredResource', args: [] })
+    expect(called).toHaveBeenCalledTimes(1)
+    host.terminate()
+    resolveResult(resource.value)
+
+    await vi.waitFor(() => expect(resource.rollback).toHaveBeenCalledTimes(1))
+    expect(resource.retained).toEqual(new Set(['pre-existing-authority']))
+    expect(posted.filter((entry) => entry.message.type === 'RESPONSE'
+      && entry.message.reqId === `stale-${_kind}`)).toHaveLength(0)
+  })
+
+  it.each(studioResourceResults)('rolls back an exact %s result when response postMessage fails', async (_kind, create) => {
+    const resource = studioResourceResult(create)
+    for (const key of Object.keys(resource.value)) {
+      if (key.endsWith('Revision')) (resource.value as Record<string, unknown>)[key] = 'pre-existing-authority'
+    }
+    const { contentWindow, dispatch } = createHarness({ produceResource: () => resource.value })
+    vi.mocked(contentWindow.postMessage).mockImplementationOnce(() => {
+      throw new DOMException('response transport lost', 'DataCloneError')
+    })
+
+    dispatch({ type: 'CALL_ROOT', reqId: `post-failure-${_kind}`, method: 'produceResource', args: [] })
+
+    await vi.waitFor(() => expect(resource.rollback).toHaveBeenCalledTimes(1))
+    expect(resource.retained).toEqual(new Set(['pre-existing-authority']))
+  })
+
+  it('cleans a bridged stream before rolling back its exact resource result', async () => {
+    const order: string[] = []
+    const stream = new ReadableStream()
+    vi.spyOn(stream, 'getReader').mockReturnValue({
+      cancel: () => {
+        order.push('stream')
+        return Promise.resolve()
+      },
+      read: () => new Promise(() => undefined),
+    } as ReadableStreamDefaultReader)
+    const value = { catalogueRevision: 'new-catalogue', stream }
+    registerStudioCardRpcFinalizer(value, {
+      commit: vi.fn(),
+      rollback: () => { order.push('resource') },
+    })
+    const { contentWindow, dispatch } = createHarness({ produceResource: () => value })
+    vi.mocked(contentWindow.postMessage).mockImplementationOnce(() => {
+      throw new DOMException('response transport lost', 'DataCloneError')
+    })
+
+    dispatch({ type: 'CALL_ROOT', reqId: 'stream-resource-order', method: 'produceResource', args: [] })
+
+    await vi.waitFor(() => expect(order).toEqual(['stream', 'resource']))
+  })
+
+  it.each(studioResourceResults)('commits an exact %s result once after a successful response post', async (_kind, create) => {
+    const resource = studioResourceResult(create)
+    const { dispatch, posted } = createHarness({ produceResource: () => resource.value })
+
+    dispatch({ type: 'CALL_ROOT', reqId: `success-${_kind}`, method: 'produceResource', args: [] })
+    await postedMessage(posted, 'RESPONSE', `success-${_kind}`)
+
+    expect(resource.commit).toHaveBeenCalledTimes(1)
+    expect(resource.rollback).not.toHaveBeenCalled()
   })
 
   it('orders bridged stream ports before unrelated MessagePort transferables', async () => {

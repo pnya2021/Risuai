@@ -50,7 +50,10 @@ import { isCurrentPluginRuntimeRecord } from '../pluginRuntimeReplacement';
 import { ContextResourceService } from './illustration/contextResources';
 import { createRisuContextResourceAdapter } from './illustration/contextResources.risu';
 import { createRisuStudioCardResourceAdapter } from './illustration/studioCardResources.risu';
-import { createStudioCardResourceService } from './illustration/studioCardResources';
+import {
+    createStudioCardResourceRpcApi,
+    createStudioCardResourceService,
+} from './illustration/studioCardResources';
 import { contextAssetAuthorityRegistry } from './illustration/contextAssetAuthorityRegistry';
 import { contextAssetReadCoordinator } from './illustration/contextAssetReadCoordinator';
 import { studioCardCapabilityIdsForApi } from './illustration/capabilityContract';
@@ -672,6 +675,7 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
             locale: DBState.db.language === 'ko' ? 'ko' : 'en',
         }),
     })
+    const studioCardRpcApi = createStudioCardResourceRpcApi(studioCardResources)
     addPluginUnloadCallback(context.instanceId, () => studioCardResources.dispose())
     const inlayLifecycle = new InlayLifecycleService(
         context,
@@ -1415,7 +1419,7 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
                     'context.current.v1',
                     'context.assets.v1',
                     'context.modules-installed.v1',
-                    ...studioCardCapabilityIdsForApi(studioCardResources),
+                    ...studioCardCapabilityIdsForApi(studioCardRpcApi),
                     'secrets.write-only.v1',
                     ...MESSAGE_EVENT_CAPABILITY_IDS,
                     ...MESSAGE_QUERY_CAPABILITY_IDS,
@@ -1430,7 +1434,7 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
                 permissionState: (principalId, permission) => pluginPermissionService.state(principalId, permission),
                 runtime: {
                     registeredServices,
-                    hasCurrentContext: Boolean(getCurrentCharacter() && getCurrentChat()),
+                    hasCurrentContext: Boolean(getCurrentCharacter()),
                     unavailableReasons: secretStatus.available ? {} : { 'secrets.write-only.v1': 'disabled' },
                 },
             })
@@ -1460,18 +1464,18 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
         getActiveModules: (options) => contextResources.getActiveModules(options),
         listContextModules: (options) => contextResources.listContextModules(options),
         readContextAsset: (assetId: string, options) => contextResources.readContextAsset(assetId, options),
-        listStudioCards: (options) => studioCardResources.listStudioCards(options),
+        listStudioCards: (options) => studioCardRpcApi.listStudioCards(options),
         releaseStudioCardCatalogue: (catalogueRevision: string) =>
-            studioCardResources.releaseStudioCardCatalogue(catalogueRevision),
-        captureStudioCardSource: (input) => studioCardResources.captureStudioCardSource(input),
+            studioCardRpcApi.releaseStudioCardCatalogue(catalogueRevision),
+        captureStudioCardSource: (input) => studioCardRpcApi.captureStudioCardSource(input),
         releaseStudioCardTarget: (targetRevision: string) =>
-            studioCardResources.releaseStudioCardTarget(targetRevision),
-        listStudioCardAssets: (options) => studioCardResources.listStudioCardAssets(options),
-        resolveStudioCardAssetHandles: (options) => studioCardResources.resolveStudioCardAssetHandles(options),
+            studioCardRpcApi.releaseStudioCardTarget(targetRevision),
+        listStudioCardAssets: (options) => studioCardRpcApi.listStudioCardAssets(options),
+        resolveStudioCardAssetHandles: (options) => studioCardRpcApi.resolveStudioCardAssetHandles(options),
         releaseStudioCardAssetAccess: (accessRevision: string) =>
-            studioCardResources.releaseStudioCardAssetAccess(accessRevision),
+            studioCardRpcApi.releaseStudioCardAssetAccess(accessRevision),
         releaseStudioCardSource: (captureRevision: string) =>
-            studioCardResources.releaseStudioCardSource(captureRevision),
+            studioCardRpcApi.releaseStudioCardSource(captureRevision),
         onMessageCommitted: async (
             listener: (event: MessageCommittedEvent) => void | Promise<void>,
             options?: MessageEventOptions,

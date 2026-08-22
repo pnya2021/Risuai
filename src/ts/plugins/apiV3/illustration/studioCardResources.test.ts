@@ -10,11 +10,13 @@ import { ContextAssetReadCoordinator } from './contextAssetReadCoordinator'
 import { ContextAssetAuthorityRegistry } from './contextAssetAuthorityRegistry'
 import { CursorRegistry } from './cursorRegistry'
 import {
+    createStudioCardResourceRpcApi,
     createStudioCardResourceService,
     type StudioCardNativeCatalogue,
     type StudioCardNativeSource,
     type StudioCardResourceService,
 } from './studioCardResources'
+import { takeStudioCardRpcFinalizer } from '../studioCardRpcTransport'
 
 const sha = (value: string) => `sha256:${value.padEnd(64, '0').slice(0, 64)}`
 
@@ -737,6 +739,23 @@ describe('Studio card review schedules', () => {
             .resolves.toBeDefined()
     }, 60_000)
 
+    it('accepts every catalogue page limit from 1 through 100 and rejects only values outside that range', async () => {
+        const h = studioHarness({
+            cardIds: Array.from({ length: 100 }, (_, index) => `card-${index.toString().padStart(3, '0')}`),
+        })
+        for (const limit of [1, 25, 100]) {
+            await expect(h.service.listStudioCards({ limit })).resolves.toMatchObject({
+                items: expect.any(Array),
+            })
+            const page = await h.service.listStudioCards({ limit })
+            expect(page.items).toHaveLength(limit)
+        }
+        for (const limit of [0, 101]) {
+            await expect(h.service.listStudioCards({ limit }))
+                .rejects.toMatchObject({ code: 'INVALID_ARGUMENT' })
+        }
+    })
+
     it('rejects exact-shape, accessor, dense-array, and mixed-union public inputs before Host work', async () => {
         const h = studioHarness()
         const inherited = Object.create({ limit: 24 })
@@ -748,7 +767,7 @@ describe('Studio card review schedules', () => {
             inherited,
             accessor,
             { limit: 24, extra: true },
-            { limit: 25 },
+            { limit: 101 },
             { search: 7 },
             { search: '\uFDFA'.repeat(80) },
             null,
@@ -1147,6 +1166,183 @@ describe('Studio card review schedules', () => {
             .toThrow(expect.objectContaining({ code: 'NOT_FOUND' }))
         await expect(h.service.listStudioCardAssets({ captureRevision: replacement.captureRevision }))
             .resolves.toMatchObject({ captureRevision: replacement.captureRevision })
+    })
+
+    it('rolls back exact opaque catalogue, target/capture, recapture, and access identities', async () => {
+        const h = studioHarness({
+            cardIds: Array.from({ length: 50 }, (_, index) => `card-${index.toString().padStart(2, '0')}`),
+        })
+        h.catalogue.hostActiveCardId = undefined
+        for (const [index, record] of h.catalogue.records.entries()) {
+            record.portrait = {
+                revision: sha(`portrait-${record.cardId}`),
+                name: `${record.cardId}.png`,
+                mediaType: 'image/png',
+                locator: {
+                    ownerCardId: record.cardId,
+                    ownerRevision: sha(`portrait-owner-${record.cardId}`),
+                    storageRevision: sha(`portrait-storage-${record.cardId}`),
+                    nativeSlot: index,
+                },
+            }
+        }
+        const rpc = createStudioCardResourceRpcApi(h.service)
+        const settle = (value: object, action: 'commit' | 'rollback') => {
+            const finalizer = takeStudioCardRpcFinalizer(value)
+            expect(finalizer).toBeDefined()
+            finalizer![action]()
+        }
+
+        const firstPage = await rpc.listStudioCards({ limit: 24 })
+        settle(firstPage, 'commit')
+        const retainedCursor = firstPage.nextCursor!
+        const secondPage = await rpc.listStudioCards({
+            limit: 24,
+            cursor: firstPage.nextCursor,
+            catalogueRevision: firstPage.catalogueRevision,
+        })
+        const lostPagePortrait = secondPage.items[0].portrait!.assetId
+        expect(secondPage.nextCursor).toBeDefined()
+        secondPage.catalogueRevision = 'tampered-pre-existing-catalogue'
+        secondPage.nextCursor = 'tampered-pre-existing-cursor'
+        settle(secondPage, 'rollback')
+        expect(h.registry.lookup(firstPage.items[0].portrait!.assetId, h.context)).toBeDefined()
+        expect(() => h.registry.lookup(lostPagePortrait, h.context))
+            .toThrow(expect.objectContaining({ code: 'NOT_FOUND' }))
+        const retriedPage = await h.service.listStudioCards({
+            limit: 24,
+            cursor: retainedCursor,
+            catalogueRevision: firstPage.catalogueRevision,
+        })
+        expect(retriedPage.items[0].cardId).toBe('card-24')
+
+        const adopted = await h.service.captureStudioCardSource({
+            cardId: firstPage.items[0].cardId,
+            expectedCatalogueItemRevision: firstPage.items[0].catalogueItemRevision,
+            catalogueRevision: firstPage.catalogueRevision,
+        })
+        const replacement = await rpc.captureStudioCardSource({
+            targetRevision: adopted.targetRevision,
+            acceptCurrentSourceRevision: true,
+        })
+        const replacementTargetRevision = replacement.targetRevision
+        const replacementCaptureRevision = replacement.captureRevision
+        replacement.targetRevision = adopted.targetRevision
+        replacement.captureRevision = adopted.captureRevision
+        settle(replacement, 'rollback')
+        await expect(h.service.listStudioCardAssets({ captureRevision: adopted.captureRevision }))
+            .resolves.toBeDefined()
+        await expect(h.service.listStudioCardAssets({ captureRevision: replacementCaptureRevision }))
+            .rejects.toMatchObject({ code: 'NOT_FOUND' })
+        await expect(h.service.captureStudioCardSource({
+            targetRevision: replacementTargetRevision,
+            expectedSourceRevision: adopted.sourceRevision,
+        })).rejects.toMatchObject({ code: 'NOT_FOUND' })
+
+        const descriptors = await h.service.listStudioCardAssets({ captureRevision: adopted.captureRevision })
+        const retainedAccess = await h.service.resolveStudioCardAssetHandles({
+            captureRevision: adopted.captureRevision,
+            logicalAssetIds: [descriptors.assets[0].logicalAssetId],
+            purpose: 'selected',
+        })
+        const recapture = await rpc.captureStudioCardSource({
+            targetRevision: adopted.targetRevision,
+            expectedSourceRevision: adopted.sourceRevision,
+        })
+        const recaptureRevision = recapture.captureRevision
+        recapture.targetRevision = replacementTargetRevision
+        recapture.captureRevision = adopted.captureRevision
+        settle(recapture, 'rollback')
+        await expect(h.service.listStudioCardAssets({ captureRevision: adopted.captureRevision }))
+            .resolves.toBeDefined()
+        await expect(h.service.listStudioCardAssets({ captureRevision: recaptureRevision }))
+            .rejects.toMatchObject({ code: 'NOT_FOUND' })
+        expect(h.registry.lookup(retainedAccess.assets[0].asset.assetId, h.context)).toBeDefined()
+
+        const lostAccess = await rpc.resolveStudioCardAssetHandles({
+            captureRevision: adopted.captureRevision,
+            logicalAssetIds: [descriptors.assets[0].logicalAssetId],
+            purpose: 'selected',
+        })
+        const lostAccessRevision = lostAccess.accessRevision
+        const lostAssetId = lostAccess.assets[0].asset.assetId
+        lostAccess.accessRevision = retainedAccess.accessRevision
+        lostAccess.assets[0].asset.assetId = retainedAccess.assets[0].asset.assetId
+        settle(lostAccess, 'rollback')
+        expect(h.registry.lookup(retainedAccess.assets[0].asset.assetId, h.context)).toBeDefined()
+        expect(() => h.registry.lookup(lostAssetId, h.context))
+            .toThrow(expect.objectContaining({ code: 'NOT_FOUND' }))
+        await expect(h.service.releaseStudioCardAssetAccess(lostAccessRevision))
+            .rejects.toMatchObject({ code: 'NOT_FOUND' })
+
+        const separate = studioHarness({ cardIds: Array.from({ length: 25 }, (_, index) => `lost-${index}`) })
+        separate.catalogue.hostActiveCardId = undefined
+        separate.catalogue.records.forEach((record, index) => {
+            record.portrait = {
+                revision: sha(`lost-portrait-${index}`), name: `${index}.png`, mediaType: 'image/png',
+                locator: {
+                    ownerCardId: record.cardId,
+                    ownerRevision: sha(`lost-owner-${index}`),
+                    storageRevision: sha(`lost-storage-${index}`),
+                    nativeSlot: index,
+                },
+            }
+        })
+        const separateRpc = createStudioCardResourceRpcApi(separate.service)
+        const lostCatalogue = await separateRpc.listStudioCards({ limit: 24 })
+        const lostCatalogueRevision = lostCatalogue.catalogueRevision
+        expect(lostCatalogue.nextCursor).toBeDefined()
+        expect(separate.registry.size()).toBe(24)
+        lostCatalogue.catalogueRevision = firstPage.catalogueRevision
+        settle(lostCatalogue, 'rollback')
+        expect(separate.registry.size()).toBe(0)
+        await expect(separate.service.releaseStudioCardCatalogue(lostCatalogueRevision))
+            .rejects.toMatchObject({ code: 'NOT_FOUND' })
+    })
+
+    it('defers four-target LRU retirement until transport commit and preserves the victim on rollback', async () => {
+        let now = 0
+        const h = studioHarness({
+            cardIds: Array.from({ length: 5 }, (_, index) => `target-${index}`),
+            now: () => now,
+        })
+        const page = await h.service.listStudioCards({ limit: 24 })
+        const retained: Array<{ targetRevision: string; sourceRevision: string }> = []
+        for (let index = 0; index < 4; index++) {
+            now = index * 10
+            const captured = await h.service.captureStudioCardSource({
+                cardId: page.items[index].cardId,
+                expectedCatalogueItemRevision: page.items[index].catalogueItemRevision,
+                catalogueRevision: page.catalogueRevision,
+            })
+            retained.push(captured)
+            await h.service.releaseStudioCardSource(captured.captureRevision)
+        }
+        const rpc = createStudioCardResourceRpcApi(h.service)
+        const captureFifth = () => rpc.captureStudioCardSource({
+            cardId: page.items[4].cardId,
+            expectedCatalogueItemRevision: page.items[4].catalogueItemRevision,
+            catalogueRevision: page.catalogueRevision,
+        })
+
+        now = 100
+        const lost = await captureFifth()
+        takeStudioCardRpcFinalizer(lost)!.rollback()
+        const preserved = await h.service.captureStudioCardSource({
+            targetRevision: retained[0].targetRevision,
+            expectedSourceRevision: retained[0].sourceRevision,
+        })
+        await h.service.releaseStudioCardSource(preserved.captureRevision)
+
+        now = 200
+        const delivered = await captureFifth()
+        takeStudioCardRpcFinalizer(delivered)!.commit()
+        await expect(h.service.captureStudioCardSource({
+            targetRevision: retained[1].targetRevision,
+            expectedSourceRevision: retained[1].sourceRevision,
+        })).rejects.toMatchObject({ code: 'NOT_FOUND' })
+        await expect(h.service.listStudioCardAssets({ captureRevision: delivered.captureRevision }))
+            .resolves.toBeDefined()
     })
 
     it('invalidates all descendants on unload and rejects source deletion or revision drift atomically', async () => {

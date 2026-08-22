@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { SvelteMap } from 'svelte/reactivity'
 import { proxy as deepState } from 'svelte/internal/client'
+import { get as getStoreValue } from 'svelte/store'
 import { ContextAssetAuthorityRegistry } from './contextAssetAuthorityRegistry'
 import { ContextAssetReadCoordinator } from './contextAssetReadCoordinator'
 import { ContextResourceService, type ContextHostState } from './contextResources'
@@ -8,6 +9,15 @@ import { CursorRegistry } from './cursorRegistry'
 import { createStudioCardCatalogueIndex } from './studioCardCatalogueIndex.svelte'
 import { createRisuStudioCardResourceAdapter } from './studioCardResources.risu'
 import { createStudioCardResourceService, type StudioCardResourceService } from './studioCardResources'
+
+vi.mock('../../../parser/parser.svelte', () => ({
+    applyMarkdownToNode: vi.fn(),
+    assetRegex: /$^/,
+    hasher: vi.fn().mockResolvedValue('hash'),
+    risuChatParser: vi.fn(),
+    risuEscape: vi.fn((value: string) => value),
+    risuUnescape: vi.fn((value: string) => value),
+}))
 
 type RawCard = Record<string, any>
 
@@ -235,7 +245,6 @@ describe('Risu Studio card native projection', () => {
         const cards = Array.from({ length: visibleCardCount }, (_, index) => {
             const id = `card-${index.toString().padStart(4, '0')}`
             const raw = character(id, `Card ${index.toString().padStart(4, '0')}`)
-            raw.image = ''
             return new Proxy(raw, {
                 getOwnPropertyDescriptor(target, property) {
                     if (scalarKeys.has(String(property))) scalarReads += 1
@@ -249,7 +258,7 @@ describe('Risu Studio card native projection', () => {
             })
         })
         const state = deepState({ characters: cards })
-        const h = harness(state.characters, 0, new Map(), { reactive: true })
+        const h = harness(state.characters, -1, new Map(), { reactive: true })
 
         const first = await h.studio.listStudioCards({ limit: 24 })
         expect(first.total).toBe(visibleCardCount)
@@ -257,10 +266,13 @@ describe('Risu Studio card native projection', () => {
         expect(scalarReads).toBe(visibleCardCount * scalarKeys.size * 4)
         expect(fullCardCloneReads).toBe(0)
         expect(projectedTextOrLore).toEqual(new Set())
+        expect(h.registry.size()).toBe(24)
 
         const coldScalarReads = scalarReads
         const coldGeneration = h.adapter.captureGeneration()
-        await h.studio.listStudioCards({ limit: 24 })
+        await h.studio.releaseStudioCardCatalogue(first.catalogueRevision)
+        expect(h.registry.size()).toBe(0)
+        await h.adapter.captureCatalogue()
         expect(scalarReads).toBe(coldScalarReads)
         expect(h.adapter.captureGeneration()).toBe(coldGeneration)
         expect(fullCardCloneReads).toBe(0)
@@ -273,19 +285,20 @@ describe('Risu Studio card native projection', () => {
         expect(rebuildScalarReads).toBeLessThanOrEqual(coldScalarReads)
         expect(rebuiltGeneration).not.toBe(coldGeneration)
         expect(rebuilt.items.some(({ name }) => name === 'Card 0001 renamed')).toBe(true)
-        await h.studio.listStudioCards({ limit: 24 })
+        await h.adapter.captureCatalogue()
         expect(scalarReads).toBe(coldScalarReads + rebuildScalarReads)
         expect(h.adapter.captureGeneration()).toBe(rebuiltGeneration)
         expect(fullCardCloneReads).toBe(0)
+        const retainedCatalogue = rebuilt
 
         state.characters[0].desc = 'selected text changed without rebuilding the catalogue'
         state.characters[0].globalLore[0].content = 'selected lore changed without rebuilding the catalogue'
-        const selectedSummary = rebuilt.items.find(({ cardId }) => cardId === 'card-0000')!
+        const selectedSummary = retainedCatalogue.items.find(({ cardId }) => cardId === 'card-0000')!
         const scalarReadsBeforeCapture = scalarReads
         const capture = await h.studio.captureStudioCardSource({
             cardId: selectedSummary.cardId,
             expectedCatalogueItemRevision: selectedSummary.catalogueItemRevision,
-            catalogueRevision: rebuilt.catalogueRevision,
+            catalogueRevision: retainedCatalogue.catalogueRevision,
         })
 
         expect(capture.card.textSections.find(({ key }) => key === 'description')?.content)
@@ -296,6 +309,42 @@ describe('Risu Studio card native projection', () => {
         expect(scalarReads - scalarReadsBeforeCapture).toBeLessThanOrEqual(64)
         expect(h.adapter.captureGeneration()).toBe(rebuiltGeneration)
         expect(fullCardCloneReads).toBe(0)
+
+        const reader = h.reader()
+        const firstPortraitId = retainedCatalogue.items[0].portrait!.assetId
+        const adjacent = await h.studio.listStudioCards({
+            limit: 24,
+            cursor: retainedCatalogue.nextCursor,
+            catalogueRevision: retainedCatalogue.catalogueRevision,
+        })
+        expect(h.registry.size()).toBe(48)
+        await expect(reader.readContextAsset(firstPortraitId, { variant: 'original' }))
+            .resolves.toMatchObject({ data: new Uint8Array([1, 2, 3, 4]) })
+        await expect(reader.readContextAsset(adjacent.items[0].portrait!.assetId, { variant: 'original' }))
+            .resolves.toMatchObject({ data: new Uint8Array([1, 2, 3, 4]) })
+        const readsBeforeReplacement = h.readImage.mock.calls.length
+
+        const replacement = await h.studio.listStudioCards({
+            limit: 24,
+            cursor: adjacent.nextCursor,
+            catalogueRevision: adjacent.catalogueRevision,
+        })
+        expect(h.registry.size()).toBe(48)
+        await expect(reader.readContextAsset(firstPortraitId, { variant: 'original' }))
+            .rejects.toMatchObject({ code: 'NOT_FOUND' })
+        expect(h.readImage).toHaveBeenCalledTimes(readsBeforeReplacement)
+        await expect(reader.readContextAsset(adjacent.items[1].portrait!.assetId, { variant: 'original' }))
+            .resolves.toBeDefined()
+        await expect(reader.readContextAsset(replacement.items[1].portrait!.assetId, { variant: 'original' }))
+            .resolves.toBeDefined()
+
+        await h.studio.releaseStudioCardCatalogue(retainedCatalogue.catalogueRevision)
+        expect(h.registry.size()).toBe(0)
+        const unloadPage = await h.studio.listStudioCards({ limit: 24 })
+        expect(unloadPage.items).toHaveLength(24)
+        expect(h.registry.size()).toBe(24)
+        h.studio.dispose()
+        expect(h.registry.size()).toBe(0)
     }, 60_000)
 
     it.each([
@@ -496,6 +545,43 @@ describe('Risu Studio card native projection', () => {
         }])
         expect(h.selected.value).toBe(0)
         expect(h.readImage).not.toHaveBeenCalled()
+    })
+
+    it('keeps retained A authority across Host navigation and unrelated C catalogue changes', async () => {
+        const sourceA = character('source-a', 'Source A')
+        const sourceB = character('source-b', 'Source B')
+        const unrelatedC = character('source-c', 'Source C')
+        const h = harness([sourceA, sourceB, unrelatedC], 0)
+        const adopted = await select(h, 'source-a')
+        const descriptors = await h.studio.listStudioCardAssets({ captureRevision: adopted.captureRevision })
+        const access = await h.studio.resolveStudioCardAssetHandles({
+            captureRevision: adopted.captureRevision,
+            logicalAssetIds: [descriptors.assets[0].logicalAssetId],
+            purpose: 'selected',
+        })
+
+        h.selected.value = 1
+        unrelatedC.name = 'Unrelated C renamed'
+
+        await expect(h.studio.listStudioCardAssets({ captureRevision: adopted.captureRevision }))
+            .resolves.toMatchObject({ captureRevision: adopted.captureRevision })
+        await expect(h.reader().readContextAsset(access.assets[0].asset.assetId, { variant: 'original' }))
+            .resolves.toMatchObject({ data: new Uint8Array([1, 2, 3, 4]) })
+        await expect(h.studio.captureStudioCardSource({
+            targetRevision: adopted.targetRevision,
+            expectedSourceRevision: adopted.sourceRevision,
+        })).resolves.toMatchObject({
+            targetRevision: adopted.targetRevision,
+            sourceRevision: adopted.sourceRevision,
+        })
+
+        sourceA.desc = 'Source A genuinely changed'
+        await expect(h.studio.captureStudioCardSource({
+            targetRevision: adopted.targetRevision,
+            expectedSourceRevision: adopted.sourceRevision,
+        })).rejects.toMatchObject({ code: 'CONFLICT' })
+        await expect(h.studio.listStudioCardAssets({ captureRevision: adopted.captureRevision }))
+            .rejects.toMatchObject({ code: 'CONFLICT' })
     })
 
     it.each([
@@ -806,4 +892,66 @@ describe('Risu Studio card native projection', () => {
         expect(recapture.captureRevision).not.toBe(capture.captureRevision)
         expect(h.registry.size()).toBe(51)
     }, 60_000)
+
+    it('discovers the Studio catalogue through the real V3 SandboxHost without touching chat state', async () => {
+        const stores = await import('../../../stores.svelte')
+        const v3 = await import('../v3.svelte')
+        const chatTouched = vi.fn(() => { throw new Error('capability discovery touched chat state') })
+        let discovering = false
+        const current = { ...character('capability-card', 'Capability Card') }
+        Object.defineProperties(current, {
+            chats: {
+                enumerable: true,
+                configurable: true,
+                get: () => discovering ? chatTouched() : [],
+            },
+            chatPage: {
+                enumerable: true,
+                configurable: true,
+                get: () => discovering ? chatTouched() : 0,
+            },
+        })
+        const plugin = {
+            name: `studio-capability-${crypto.randomUUID()}`,
+            displayName: 'Studio capability test',
+            script: '',
+            arguments: {},
+            realArg: {},
+            customLink: [],
+            argMeta: {},
+            version: '3.0' as const,
+            enabled: true,
+            principalId: crypto.randomUUID(),
+        }
+        const previousCharacters = stores.DBState.db.characters
+        const previousPlugins = stores.DBState.db.plugins
+        const previousSelected = stores.selIdState.selId
+        const previousSelectedStore = getStoreValue(stores.selectedCharID)
+        let instance: ReturnType<typeof v3.getV3PluginInstance>
+        try {
+            stores.DBState.db.characters = [current] as any
+            stores.DBState.db.plugins = [plugin] as any
+            stores.selectedCharID.set(0)
+            stores.selIdState.selId = 0
+            await v3.executePluginV3(plugin as any)
+            instance = v3.getV3PluginInstance(plugin.name)
+            expect(instance).toBeDefined()
+
+            discovering = true
+            const descriptors = await (instance!.host as any).apiFactory.getCapabilities(
+                ['context.cards-catalog.v1'],
+            ).finally(() => { discovering = false })
+            expect(descriptors['context.cards-catalog.v1']).toMatchObject({
+                supported: true,
+            })
+            expect(chatTouched).not.toHaveBeenCalled()
+        } finally {
+            discovering = false
+            if (instance) await v3.unloadV3Plugin(instance.instanceId)
+            stores.DBState.db.characters = previousCharacters
+            stores.DBState.db.plugins = previousPlugins
+            stores.selectedCharID.set(previousSelectedStore)
+            stores.selIdState.selId = previousSelected
+        }
+    }, 30_000)
 })
