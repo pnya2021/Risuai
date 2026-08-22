@@ -8,7 +8,11 @@ import {
 } from './contextResources'
 import type { PluginExecutionContext } from './permissions'
 import type { ContextAssetReadCoordinator } from './contextAssetReadCoordinator'
-import { CursorRegistry, illustrationCursorRegistry } from './cursorRegistry'
+import {
+    CursorRegistry,
+    illustrationCursorRegistry,
+    type CursorTransaction,
+} from './cursorRegistry'
 import type {
     ContextAssetAuthorityRegistry,
     StudioContextAssetAuthority,
@@ -664,6 +668,9 @@ interface CatalogueRecord {
     pages: Map<string, CataloguePageRecord>
     retainedPages: string[]
     activeHandles: Set<string>
+    pendingChildren: Set<object>
+    pendingAdmission?: object
+    retirementEpoch: number
     metadataBytes: number
     lastUsed: number
     expiresAt: number
@@ -690,6 +697,8 @@ interface TargetRecord {
     sourceRevision: string
     permission: string
     captures: Set<string>
+    pendingChildren: Set<object>
+    pendingAdmission?: object
     lastUsed: number
     expiresAt: number
 }
@@ -708,6 +717,10 @@ interface CaptureRecord {
     accesses: Set<string>
     candidateAccesses: string[]
     selectedAccess?: string
+    candidateClaims: AccessPurposeClaim[]
+    selectedClaim?: AccessPurposeClaim
+    pendingChildren: Set<object>
+    pendingAdmission?: object
     metadataBytes: number
     itemCount: number
     pinOwner: 'adopted-capture'
@@ -722,8 +735,15 @@ interface AccessRecord {
     purpose: 'candidate-page' | 'selected'
     permission: string
     handles: string[]
+    pendingAdmission?: object
     lastUsed: number
     expiresAt: number
+}
+
+interface AccessPurposeClaim {
+    token: object
+    access: AccessRecord
+    previousRevision?: string
 }
 
 interface CapacityReservation {
@@ -735,10 +755,12 @@ interface CapacityReservation {
     catalogue?: CatalogueRecord
     target?: TargetRecord
     pinOwner: 'provisional-capture' | 'catalogue-capture'
+    admitted: boolean
     catalogueVictims: Array<{
         service: StudioCardResourceServiceImpl
         revision: string
         record: CatalogueRecord
+        retirementEpoch: number
     }>
     targetVictims: Array<{
         service: StudioCardResourceServiceImpl
@@ -760,6 +782,7 @@ class StudioCardResourceServiceImpl implements StudioCardResourceService {
     private static readonly live = new Set<StudioCardResourceServiceImpl>()
     private readonly catalogues = new Map<string, CatalogueRecord>()
     private readonly cursors = new Map<string, CursorRecord>()
+    private readonly pendingCursors = new Set<string>()
     private readonly targets = new Map<string, TargetRecord>()
     private readonly captures = new Map<string, CaptureRecord>()
     private readonly accesses = new Map<string, AccessRecord>()
@@ -790,6 +813,7 @@ class StudioCardResourceServiceImpl implements StudioCardResourceService {
     private clearCursor(cursor: string) {
         this.cursorRegistry.clear(cursor)
         this.cursors.delete(cursor)
+        this.pendingCursors.delete(cursor)
     }
 
     private clearInstanceCursors() {
@@ -798,6 +822,7 @@ class StudioCardResourceServiceImpl implements StudioCardResourceService {
             this.input.context.instanceId,
         )
         this.cursors.clear()
+        this.pendingCursors.clear()
     }
 
     private assertActive(generation: number, signal?: AbortSignal) {
@@ -907,19 +932,22 @@ class StudioCardResourceServiceImpl implements StudioCardResourceService {
     private cleanup() {
         const now = this.now()
         for (const [revision, cursor] of this.cursors) {
-            if (cursor.expiresAt <= now) this.clearCursor(revision)
+            if (cursor.expiresAt <= now && !this.pendingCursors.has(revision)) this.clearCursor(revision)
         }
         for (const [revision, access] of this.accesses) {
-            if (access.expiresAt <= now) this.revokeAccess(revision)
+            if (access.expiresAt <= now && !this.accessPinnedByClaim(access)) this.revokeAccess(revision)
         }
         for (const [revision, capture] of this.captures) {
-            if (capture.expiresAt <= now) this.revokeCapture(revision)
+            if (capture.expiresAt <= now && !capture.pendingAdmission
+                && capture.pendingChildren.size === 0) this.revokeCapture(revision)
         }
         for (const [revision, target] of this.targets) {
-            if (target.expiresAt <= now) this.revokeTarget(revision)
+            if (target.expiresAt <= now && !this.targetPinned(target)) this.revokeTarget(revision)
         }
         for (const [revision, catalogue] of this.catalogues) {
-            if (catalogue.expiresAt <= now) this.revokeCatalogue(revision)
+            if (catalogue.expiresAt <= now && !this.cataloguePinned(catalogue)) {
+                this.revokeCatalogue(revision)
+            }
         }
     }
 
@@ -929,28 +957,58 @@ class StudioCardResourceServiceImpl implements StudioCardResourceService {
 
     private touchCatalogue(record: CatalogueRecord) {
         const now = this.now()
+        if (this.catalogueRetirementClaimed(record)) return
+        this.refreshCatalogue(record, now)
+    }
+
+    private refreshCatalogue(record: CatalogueRecord, now: number) {
+        if (this.catalogues.get(record.revision) !== record) return
         record.lastUsed = now
         record.expiresAt = now + TTL
+        record.retirementEpoch += 1
     }
 
     private touchTarget(record: TargetRecord) {
         const now = this.now()
+        this.refreshTarget(record, now)
+    }
+
+    private refreshTarget(record: TargetRecord, now: number) {
+        if (this.targets.get(record.revision) !== record) return
         record.lastUsed = now
         record.expiresAt = now + TARGET_TTL
     }
 
     private touchCapture(record: CaptureRecord) {
         const now = this.now()
+        this.refreshCapture(record, now)
+    }
+
+    private refreshCapture(record: CaptureRecord, now: number) {
+        if (this.captures.get(record.revision) !== record) return
         record.lastUsed = now
         record.expiresAt = now + TTL
-        if (this.targets.get(record.targetRevision) === record.target) this.touchTarget(record.target)
+        this.refreshTarget(record.target, now)
     }
 
     private touchAccess(record: AccessRecord) {
         const now = this.now()
+        this.refreshAccess(record, now)
+    }
+
+    private refreshAccess(record: AccessRecord, now: number) {
+        if (this.accesses.get(record.revision) !== record) return
         record.lastUsed = now
         record.expiresAt = now + TTL
-        if (this.captures.get(record.captureRevision) === record.capture) this.touchCapture(record.capture)
+        this.refreshCapture(record.capture, now)
+    }
+
+    private settlementNow() {
+        try {
+            return this.now()
+        } catch {
+            return undefined
+        }
     }
 
     private peekCatalogue(revision: string) {
@@ -1091,13 +1149,30 @@ class StudioCardResourceServiceImpl implements StudioCardResourceService {
     }
 
     private cataloguePinned(record: CatalogueRecord) {
+        if (record.pendingAdmission || record.pendingChildren.size > 0) return true
         return this.peers().some((service) => [...service.reservations].some((reservation) =>
             reservation.catalogue === record
             || reservation.catalogueVictims.some((victim) => victim.record === record)))
     }
 
+    private catalogueRetirementClaimed(record: CatalogueRecord) {
+        return this.peers().some((service) => [...service.reservations].some((reservation) =>
+            reservation.admitted
+            && reservation.catalogueVictims.some(({ service: owner, revision, record: victim }) =>
+                victim === record && owner.catalogues.get(revision) === victim)))
+    }
+
+    private targetHasPendingTransportChild(record: TargetRecord) {
+        if (record.pendingAdmission || record.pendingChildren.size > 0) return true
+        return [...record.captures].some((revision) => {
+            const capture = this.captures.get(revision)
+            return capture?.target === record
+                && (capture.pendingAdmission !== undefined || capture.pendingChildren.size > 0)
+        })
+    }
+
     private targetPinned(record: TargetRecord) {
-        if (record.captures.size > 0) return true
+        if (record.captures.size > 0 || record.pendingAdmission || record.pendingChildren.size > 0) return true
         return this.peers().some((service) => [...service.reservations].some((reservation) =>
             reservation.target === record
             || reservation.targetVictims.some((victim) => victim.record === record)))
@@ -1132,13 +1207,20 @@ class StudioCardResourceServiceImpl implements StudioCardResourceService {
             .filter((reservation) => reservation.kind === kind)
     }
 
+    private unadmittedReservationEntries(kind: CapacityReservation['kind']) {
+        return this.reservationEntries(kind).filter((reservation) => !reservation.admitted)
+    }
+
     private reserveCatalogueVictim(reservation: CapacityReservation, excluded?: CatalogueRecord) {
         const candidate = this.catalogueEntries()
             .filter(({ record }) => record !== excluded && !this.cataloguePinned(record))
             .sort((left, right) => left.record.lastUsed - right.record.lastUsed
                 || codePointCompare(left.revision, right.revision))[0]
         if (!candidate) throw limitError('All retained Studio card catalogues are pinned')
-        reservation.catalogueVictims.push(candidate)
+        reservation.catalogueVictims.push({
+            ...candidate,
+            retirementEpoch: candidate.record.retirementEpoch,
+        })
     }
 
     private reserveTargetVictim(reservation: CapacityReservation, excluded?: TargetRecord) {
@@ -1183,13 +1265,14 @@ class StudioCardResourceServiceImpl implements StudioCardResourceService {
             itemCount: 0,
             wantsTarget: false,
             pinOwner: 'catalogue-capture',
+            admitted: false,
             catalogueVictims: [],
             targetVictims: [],
         }
         this.reservations.add(reservation)
         try {
             while (this.effectiveCatalogueEntries().length
-                + this.reservationEntries('catalogue').length > MAX_RECORDS) {
+                + this.unadmittedReservationEntries('catalogue').length > MAX_RECORDS) {
                 this.reserveCatalogueVictim(reservation)
             }
             return reservation
@@ -1202,7 +1285,7 @@ class StudioCardResourceServiceImpl implements StudioCardResourceService {
     private adjustCatalogueReservation(reservation: CapacityReservation, metadataBytes: number) {
         reservation.metadataBytes = metadataBytes
         while (this.effectiveCatalogueEntries().reduce((sum, item) => sum + item.record.metadataBytes, 0)
-            + this.reservationEntries('catalogue').reduce((sum, item) => sum + item.metadataBytes, 0)
+            + this.unadmittedReservationEntries('catalogue').reduce((sum, item) => sum + item.metadataBytes, 0)
             > MAX_CATALOGUE_BYTES) {
             this.reserveCatalogueVictim(reservation)
         }
@@ -1229,17 +1312,18 @@ class StudioCardResourceServiceImpl implements StudioCardResourceService {
             catalogue: input.catalogue,
             target: input.target,
             pinOwner: 'provisional-capture',
+            admitted: false,
             catalogueVictims: [],
             targetVictims: [],
         }
         this.reservations.add(reservation)
         try {
-            if (this.captureEntries().length + this.reservationEntries('capture').length > MAX_RECORDS) {
+            if (this.captureEntries().length + this.unadmittedReservationEntries('capture').length > MAX_RECORDS) {
                 throw limitError('All retained Studio card captures are pinned')
             }
             if (input.wantsTarget) {
                 while (this.effectiveTargetEntries().length
-                    + this.reservationEntries('capture').filter((item) => item.wantsTarget).length > MAX_RECORDS) {
+                    + this.unadmittedReservationEntries('capture').filter((item) => item.wantsTarget).length > MAX_RECORDS) {
                     this.reserveTargetVictim(reservation, input.target)
                 }
             }
@@ -1258,9 +1342,9 @@ class StudioCardResourceServiceImpl implements StudioCardResourceService {
         reservation.metadataBytes = metadataBytes
         reservation.itemCount = itemCount
         const captureBytes = this.captureEntries().reduce((sum, item) => sum + item.record.metadataBytes, 0)
-            + this.reservationEntries('capture').reduce((sum, item) => sum + item.metadataBytes, 0)
+            + this.unadmittedReservationEntries('capture').reduce((sum, item) => sum + item.metadataBytes, 0)
         const captureItems = this.captureEntries().reduce((sum, item) => sum + item.record.itemCount, 0)
-            + this.reservationEntries('capture').reduce((sum, item) => sum + item.itemCount, 0)
+            + this.unadmittedReservationEntries('capture').reduce((sum, item) => sum + item.itemCount, 0)
         if (captureBytes > MAX_CAPTURE_BYTES || captureItems > MAX_CAPTURE_ITEMS) {
             throw limitError('Studio card capture aggregate limit exceeded')
         }
@@ -1270,13 +1354,43 @@ class StudioCardResourceServiceImpl implements StudioCardResourceService {
         reservation.service.reservations.delete(reservation)
     }
 
+    private catalogueVictimPinnedDuringAdmission(
+        reservation: CapacityReservation,
+        victim: CapacityReservation['catalogueVictims'][number],
+    ) {
+        const { record } = victim
+        return record.pendingAdmission !== undefined
+            || record.pendingChildren.size > 0
+            || record.retirementEpoch !== victim.retirementEpoch
+            || this.peers().some((service) => [...service.reservations].some((candidate) =>
+                candidate !== reservation && candidate.catalogue === record))
+    }
+
+    private targetVictimPinnedDuringAdmission(reservation: CapacityReservation, record: TargetRecord) {
+        return record.pendingAdmission !== undefined
+            || record.pendingChildren.size > 0
+            || record.captures.size > 0
+            || this.peers().some((service) => [...service.reservations].some((candidate) =>
+                candidate !== reservation && candidate.target === record))
+    }
+
+    private refreshReservationVictims(reservation: CapacityReservation, now: number) {
+        for (const { service, revision, record } of reservation.catalogueVictims) {
+            if (service.catalogues.get(revision) === record) service.refreshCatalogue(record, now)
+        }
+        for (const { service, revision, record } of reservation.targetVictims) {
+            if (service.targets.get(revision) === record) service.refreshTarget(record, now)
+        }
+    }
+
     private validateCatalogueReservation(reservation: CapacityReservation) {
         const liveVictims = reservation.catalogueVictims.filter(
             ({ service, revision, record }) => service.catalogues.get(revision) === record,
         )
-        if (liveVictims.some(({ record }) => this.peers().some((service) =>
-            [...service.reservations].some((candidate) => candidate !== reservation
-                && candidate.catalogue === record)))) {
+        if (liveVictims.some((victim) => this.catalogueVictimPinnedDuringAdmission(
+            reservation,
+            victim,
+        ))) {
             throw limitError('A retained Studio card catalogue became pinned during admission')
         }
     }
@@ -1285,8 +1399,12 @@ class StudioCardResourceServiceImpl implements StudioCardResourceService {
         const liveVictims = reservation.catalogueVictims.filter(
             ({ service, revision, record }) => service.catalogues.get(revision) === record,
         )
-        for (const { service, revision, record } of liveVictims) {
-            if (service.catalogues.get(revision) === record) service.revokeCatalogue(revision)
+        for (const victim of liveVictims) {
+            const { service, revision, record } = victim
+            if (service.catalogues.get(revision) === record
+                && !this.catalogueVictimPinnedDuringAdmission(reservation, victim)) {
+                service.revokeCatalogue(revision)
+            }
         }
     }
 
@@ -1294,9 +1412,10 @@ class StudioCardResourceServiceImpl implements StudioCardResourceService {
         const liveVictims = reservation.targetVictims.filter(
             ({ service, revision, record }) => service.targets.get(revision) === record,
         )
-        if (liveVictims.some(({ record }) => record.captures.size > 0
-            || this.peers().some((service) => [...service.reservations].some((candidate) =>
-                candidate !== reservation && candidate.target === record)))) {
+        if (liveVictims.some(({ record }) => this.targetVictimPinnedDuringAdmission(
+            reservation,
+            record,
+        ))) {
             throw limitError('A retained Studio card target became pinned during admission')
         }
     }
@@ -1306,7 +1425,10 @@ class StudioCardResourceServiceImpl implements StudioCardResourceService {
             ({ service, revision, record }) => service.targets.get(revision) === record,
         )
         for (const { service, revision, record } of liveVictims) {
-            if (service.targets.get(revision) === record) service.revokeTarget(revision)
+            if (service.targets.get(revision) === record
+                && !this.targetVictimPinnedDuringAdmission(reservation, record)) {
+                service.revokeTarget(revision)
+            }
         }
     }
 
@@ -1402,6 +1524,37 @@ class StudioCardResourceServiceImpl implements StudioCardResourceService {
         let reservation: CapacityReservation | undefined
         let unpublished = false
         let finalizerPending = false
+        const operationClaim = {}
+        let parentClaimed = false
+        let cursorTransaction: CursorTransaction | undefined
+        let nextCursorValue: string | undefined
+        let nextCursorRecordForTransaction: CursorRecord | undefined
+        const rollbackCursorTransaction = () => {
+            if (!cursorTransaction) return
+            const restored = cursorTransaction.rollback()
+            cursorTransaction = undefined
+            if (nextCursorValue) this.pendingCursors.delete(nextCursorValue)
+            if (nextCursorValue && this.cursors.get(nextCursorValue) === nextCursorRecordForTransaction) {
+                this.cursors.delete(nextCursorValue)
+            }
+            if (consumedCursor && restored && !this.disposed
+                && this.catalogues.get(consumedCursor[1].parentRevision) === catalogue
+                && !this.cursors.has(consumedCursor[0])) {
+                const now = this.settlementNow()
+                if (now !== undefined) consumedCursor[1].expiresAt = Math.max(
+                    consumedCursor[1].expiresAt,
+                    now + TTL,
+                )
+                this.cursors.set(consumedCursor[0], consumedCursor[1])
+            }
+        }
+        const releaseOperationClaim = () => {
+            if (parentClaimed) {
+                catalogue.pendingChildren.delete(operationClaim)
+                parentClaimed = false
+            }
+            if (catalogue?.pendingAdmission === operationClaim) delete catalogue.pendingAdmission
+        }
         try {
             if (options.cursor && options.catalogueRevision) {
                 catalogue = this.peekCatalogue(options.catalogueRevision)
@@ -1480,6 +1633,8 @@ class StudioCardResourceServiceImpl implements StudioCardResourceService {
                     pages: new Map(),
                     retainedPages: [],
                     activeHandles: new Set(),
+                    pendingChildren: new Set(),
+                    retirementEpoch: 0,
                     metadataBytes,
                     lastUsed: now,
                     expiresAt: now + TTL,
@@ -1550,6 +1705,28 @@ class StudioCardResourceServiceImpl implements StudioCardResourceService {
                     consumedCursor?.[0],
                 )
                 : undefined
+            if (consumedCursor) {
+                if (this.catalogueRetirementClaimed(catalogue)) {
+                    throw malformed('Studio card catalogue is pending retirement')
+                }
+                catalogue.pendingChildren.add(operationClaim)
+                parentClaimed = true
+            }
+            nextCursorRecordForTransaction = nextCursorRecord
+            if (nextCursorPreparation && nextCursorRecord && nextCursorCommit) {
+                cursorTransaction = this.cursorRegistry.beginPrepared(
+                    nextCursorPreparation,
+                    nextCursorRecord,
+                    nextCursorCommit,
+                )
+                nextCursorValue = cursorTransaction.cursor!
+                if (consumedCursor) this.cursors.delete(consumedCursor[0])
+                this.cursors.set(nextCursorValue, nextCursorRecord)
+                this.pendingCursors.add(nextCursorValue)
+            } else if (consumedCursor) {
+                cursorTransaction = this.cursorRegistry.beginRetire(consumedCursor[0], consumedCursor[1])
+                this.cursors.delete(consumedCursor[0])
+            }
             const authorities = [
                 ...pageSummaries.flatMap((item) => item.authority ? [item.authority] : []),
                 ...(activeSummary?.authority ? [activeSummary.authority] : []),
@@ -1560,6 +1737,8 @@ class StudioCardResourceServiceImpl implements StudioCardResourceService {
                     if (this.catalogues.has(catalogue.revision)) throw malformed('Studio catalogue revision collision')
                     if (reservation) this.validateCatalogueReservation(reservation)
                     this.catalogues.set(catalogue.revision, catalogue)
+                    catalogue.pendingAdmission = operationClaim
+                    if (reservation) reservation.admitted = true
                 }
                 catalogue.pages.set(pageRevision, pageRecord)
                 for (const item of pageSummaries) {
@@ -1582,12 +1761,14 @@ class StudioCardResourceServiceImpl implements StudioCardResourceService {
                     total: catalogue.filtered.length,
                     ...(activeSummary ? { hostActiveCard: activeSummary.summary } : {}),
                     items: pageSummaries.map((item) => item.summary),
-                    ...(nextCursorCommit ? { nextCursor: nextCursorCommit.cursor } : {}),
+                    ...(nextCursorValue ? { nextCursor: nextCursorValue } : {}),
                 }
                 let settled = false
                 const rollback = () => {
                     if (settled) return
                     settled = true
+                    const settledAt = this.settlementNow()
+                    rollbackCursorTransaction()
                     registration.rollback()
                     if (catalogue.pages.get(pageRevision) === pageRecord) {
                         catalogue.pages.delete(pageRevision)
@@ -1599,27 +1780,26 @@ class StudioCardResourceServiceImpl implements StudioCardResourceService {
                     if (unpublished && this.catalogues.get(catalogue.revision) === catalogue) {
                         this.catalogues.delete(catalogue.revision)
                     }
+                    if (settledAt !== undefined) {
+                        if (!unpublished) this.refreshCatalogue(catalogue, settledAt)
+                        if (reservation) this.refreshReservationVictims(reservation, settledAt)
+                    }
+                    releaseOperationClaim()
                     if (reservation) this.releaseReservation(reservation)
                 }
                 const commit = () => {
                     if (settled) return
-                    try {
-                        if (nextCursorPreparation && nextCursorRecord && nextCursorCommit) {
-                            const cursor = this.cursorRegistry.commitPrepared(
-                                nextCursorPreparation,
-                                nextCursorRecord,
-                                nextCursorCommit,
-                            )
-                            if (consumedCursor) this.cursors.delete(consumedCursor[0])
-                            this.cursors.set(cursor, nextCursorRecord)
-                        } else if (consumedCursor) {
-                            this.clearCursor(consumedCursor[0])
-                        }
-                    } catch (error) {
-                        rollback()
-                        throw error
-                    }
                     settled = true
+                    const settledAt = this.settlementNow()
+                    if (nextCursorRecordForTransaction && settledAt !== undefined) {
+                        nextCursorRecordForTransaction.expiresAt = Math.max(
+                            nextCursorRecordForTransaction.expiresAt,
+                            settledAt + TTL,
+                        )
+                    }
+                    cursorTransaction?.commit()
+                    cursorTransaction = undefined
+                    if (nextCursorValue) this.pendingCursors.delete(nextCursorValue)
                     if (reservation) {
                         this.commitCatalogueReservation(reservation)
                         this.releaseReservation(reservation)
@@ -1636,7 +1816,8 @@ class StudioCardResourceServiceImpl implements StudioCardResourceService {
                             expired,
                         )
                     }
-                    this.touchCatalogue(catalogue)
+                    releaseOperationClaim()
+                    if (settledAt !== undefined) this.refreshCatalogue(catalogue, settledAt)
                 }
                 if (transport === STUDIO_CARD_RPC_TRANSPORT) {
                     finalizerPending = true
@@ -1652,7 +1833,11 @@ class StudioCardResourceServiceImpl implements StudioCardResourceService {
                 throw error
             }
         } finally {
-            if (reservation && !finalizerPending) this.releaseReservation(reservation)
+            if (!finalizerPending) {
+                rollbackCursorTransaction()
+                releaseOperationClaim()
+                if (reservation) this.releaseReservation(reservation)
+            }
         }
     }
 
@@ -1660,6 +1845,9 @@ class StudioCardResourceServiceImpl implements StudioCardResourceService {
         const revision = normalizeReleaseRevision(revisionValue, 'catalogueRevision')
         const catalogue = this.peekCatalogue(revision)
         if (this.catalogues.get(revision) !== catalogue) throw notFound('Studio card catalogue')
+        if (catalogue.pendingAdmission || catalogue.pendingChildren.size > 0) {
+            throw malformed('Studio card catalogue has a pending transport child')
+        }
         this.revokeCatalogue(revision)
     }
 
@@ -1815,6 +2003,11 @@ class StudioCardResourceServiceImpl implements StudioCardResourceService {
             wantsTarget: !target || explicit,
         })
         let finalizerPending = false
+        const operationClaim = {}
+        const releaseParentClaims = () => {
+            catalogue?.pendingChildren.delete(operationClaim)
+            target?.pendingChildren.delete(operationClaim)
+        }
         try {
             const assertParent = () => {
                 this.assertPermission(generation, permission, signal)
@@ -1871,6 +2064,8 @@ class StudioCardResourceServiceImpl implements StudioCardResourceService {
                 sourceRevision: materialized.sourceRevision,
                 permission,
                 captures: new Set(),
+                pendingChildren: new Set(),
+                pendingAdmission: operationClaim,
                 lastUsed: now,
                 expiresAt: now + TARGET_TTL,
             } : target
@@ -1890,6 +2085,9 @@ class StudioCardResourceServiceImpl implements StudioCardResourceService {
                 ])),
                 accesses: new Set(),
                 candidateAccesses: [],
+                candidateClaims: [],
+                pendingChildren: new Set(),
+                pendingAdmission: operationClaim,
                 metadataBytes: retainedMetadataBytes,
                 itemCount: materialized.itemCount,
                 pinOwner: 'adopted-capture',
@@ -1897,6 +2095,8 @@ class StudioCardResourceServiceImpl implements StudioCardResourceService {
                 expiresAt: now + TTL,
             }
             assertParent()
+            if (catalogue) catalogue.pendingChildren.add(operationClaim)
+            if (target) target.pendingChildren.add(operationClaim)
             const createdTarget = !target || explicit
             if (this.captures.has(capture.revision)) throw malformed('Studio capture revision collision')
             if (createdTarget) {
@@ -1908,6 +2108,7 @@ class StudioCardResourceServiceImpl implements StudioCardResourceService {
             }
             this.captures.set(capture.revision, capture)
             committedTarget.captures.add(capture.revision)
+            reservation.admitted = true
             const result: StudioCardSourceCapture = {
                 targetRevision: committedTarget.revision,
                 captureRevision: capture.revision,
@@ -1919,20 +2120,33 @@ class StudioCardResourceServiceImpl implements StudioCardResourceService {
             const rollback = () => {
                 if (settled) return
                 settled = true
+                const settledAt = this.settlementNow()
                 if (this.captures.get(capture.revision) === capture) {
                     this.revokeCapture(capture.revision)
                 }
                 if (createdTarget && this.targets.get(committedTarget.revision) === committedTarget) {
                     this.revokeTarget(committedTarget.revision)
                 }
+                if (settledAt !== undefined) {
+                    if (catalogue) this.refreshCatalogue(catalogue, settledAt)
+                    if (target) this.refreshTarget(target, settledAt)
+                    this.refreshReservationVictims(reservation, settledAt)
+                }
+                releaseParentClaims()
                 this.releaseReservation(reservation)
             }
             const commit = () => {
                 if (settled) return
                 settled = true
+                const settledAt = this.settlementNow()
                 if (createdTarget) this.commitTargetReservation(reservation)
+                if (capture.pendingAdmission === operationClaim) delete capture.pendingAdmission
+                if (createdTarget && committedTarget.pendingAdmission === operationClaim) {
+                    delete committedTarget.pendingAdmission
+                }
+                releaseParentClaims()
                 this.releaseReservation(reservation)
-                this.touchCapture(capture)
+                if (settledAt !== undefined) this.refreshCapture(capture, settledAt)
             }
             if (transport === STUDIO_CARD_RPC_TRANSPORT) {
                 finalizerPending = true
@@ -1941,7 +2155,10 @@ class StudioCardResourceServiceImpl implements StudioCardResourceService {
             commit()
             return result
         } finally {
-            if (!finalizerPending) this.releaseReservation(reservation)
+            if (!finalizerPending) {
+                releaseParentClaims()
+                this.releaseReservation(reservation)
+            }
         }
     }
 
@@ -1949,6 +2166,9 @@ class StudioCardResourceServiceImpl implements StudioCardResourceService {
         const revision = normalizeReleaseRevision(revisionValue, 'targetRevision')
         const target = this.peekTarget(revision)
         if (this.targets.get(revision) !== target) throw notFound('Studio card target')
+        if (this.targetHasPendingTransportChild(target)) {
+            throw malformed('Studio card target has a pending transport child')
+        }
         this.revokeTarget(revision)
     }
 
@@ -1963,6 +2183,9 @@ class StudioCardResourceServiceImpl implements StudioCardResourceService {
         const revision = normalizeReleaseRevision(revisionValue, 'captureRevision')
         const capture = this.peekCapture(revision)
         if (this.captures.get(revision) !== capture) throw notFound('Studio card capture')
+        if (capture.pendingAdmission || capture.pendingChildren.size > 0) {
+            throw malformed('Studio card capture has a pending transport child')
+        }
         this.revokeCapture(revision)
     }
 
@@ -2070,6 +2293,54 @@ class StudioCardResourceServiceImpl implements StudioCardResourceService {
         }
     }
 
+    private claimAccessPurpose(capture: CaptureRecord, access: AccessRecord): AccessPurposeClaim {
+        const token = {}
+        let claim: AccessPurposeClaim
+        if (access.purpose === 'candidate-page') {
+            let previousRevision: string | undefined
+            if (capture.candidateAccesses.length + capture.candidateClaims.length >= 2) {
+                const claimed = new Set(capture.candidateClaims.flatMap((candidate) =>
+                    candidate.previousRevision ? [candidate.previousRevision] : []))
+                previousRevision = capture.candidateAccesses.find((revision) => !claimed.has(revision))
+                if (!previousRevision) {
+                    throw malformed('Studio candidate access slots are pending transport delivery')
+                }
+            }
+            claim = { token, access, ...(previousRevision ? { previousRevision } : {}) }
+            capture.candidateClaims.push(claim)
+        } else {
+            if (capture.selectedClaim) {
+                throw malformed('Studio selected access slot is pending transport delivery')
+            }
+            claim = {
+                token,
+                access,
+                ...(capture.selectedAccess ? { previousRevision: capture.selectedAccess } : {}),
+            }
+            capture.selectedClaim = claim
+        }
+        capture.pendingChildren.add(token)
+        access.pendingAdmission = token
+        return claim
+    }
+
+    private releaseAccessPurposeClaim(capture: CaptureRecord, claim: AccessPurposeClaim) {
+        if (claim.access.purpose === 'candidate-page') {
+            capture.candidateClaims = capture.candidateClaims.filter((candidate) => candidate !== claim)
+        } else if (capture.selectedClaim === claim) {
+            capture.selectedClaim = undefined
+        }
+        capture.pendingChildren.delete(claim.token)
+        if (claim.access.pendingAdmission === claim.token) delete claim.access.pendingAdmission
+    }
+
+    private accessPinnedByClaim(record: AccessRecord) {
+        if (record.pendingAdmission) return true
+        const capture = record.capture
+        return capture.candidateClaims.some((claim) => claim.previousRevision === record.revision)
+            || capture.selectedClaim?.previousRevision === record.revision
+    }
+
     async resolveStudioCardAssetHandles(
         optionsValue: StudioCardAssetAccessOptions,
         transport?: typeof STUDIO_CARD_RPC_TRANSPORT,
@@ -2130,15 +2401,13 @@ class StudioCardResourceServiceImpl implements StudioCardResourceService {
         })
         this.assertCaptureCurrent(capture, generation, permission, options.signal)
         const registration = this.input.assetAuthorityRegistry.registerBatch(authorities)
+        let purposeClaim: AccessPurposeClaim | undefined
         try {
             this.assertCaptureCurrent(capture, generation, permission, options.signal)
             if (this.accesses.has(accessRevision)) throw malformed('Studio access revision collision')
+            purposeClaim = this.claimAccessPurpose(capture, access)
             this.accesses.set(accessRevision, access)
             capture.accesses.add(accessRevision)
-            const previousSelectedAccess = capture.selectedAccess
-            const candidateVictims = options.purpose === 'candidate-page'
-                ? [...capture.candidateAccesses, accessRevision].slice(0, -2)
-                : []
             const result: StudioCardAssetAccessBatch = {
                 captureRevision: capture.revision,
                 accessRevision,
@@ -2162,24 +2431,37 @@ class StudioCardResourceServiceImpl implements StudioCardResourceService {
             const rollback = () => {
                 if (settled) return
                 settled = true
+                const settledAt = this.settlementNow()
                 registration.rollback()
                 if (this.accesses.get(accessRevision) === access) this.revokeAccess(accessRevision)
+                if (settledAt !== undefined) {
+                    const previous = purposeClaim!.previousRevision
+                        ? this.accesses.get(purposeClaim!.previousRevision)
+                        : undefined
+                    if (previous) this.refreshAccess(previous, settledAt)
+                    else this.refreshCapture(capture, settledAt)
+                }
+                this.releaseAccessPurposeClaim(capture, purposeClaim!)
             }
             const commit = () => {
                 if (settled) return
                 settled = true
+                const settledAt = this.settlementNow()
                 if (options.purpose === 'candidate-page') {
-                    capture.candidateAccesses.push(accessRevision)
-                    for (const victim of candidateVictims) {
-                        if (victim !== accessRevision && capture.candidateAccesses.includes(victim)) {
-                            this.revokeAccess(victim)
-                        }
+                    if (purposeClaim!.previousRevision
+                        && capture.candidateAccesses.includes(purposeClaim!.previousRevision)) {
+                        this.revokeAccess(purposeClaim!.previousRevision)
                     }
-                } else if (capture.selectedAccess === previousSelectedAccess) {
-                    if (previousSelectedAccess) this.revokeAccess(previousSelectedAccess)
+                    capture.candidateAccesses.push(accessRevision)
+                } else {
+                    if (purposeClaim!.previousRevision
+                        && capture.selectedAccess === purposeClaim!.previousRevision) {
+                        this.revokeAccess(purposeClaim!.previousRevision)
+                    }
                     capture.selectedAccess = accessRevision
                 }
-                this.touchAccess(access)
+                this.releaseAccessPurposeClaim(capture, purposeClaim!)
+                if (settledAt !== undefined) this.refreshAccess(access, settledAt)
             }
             if (transport === STUDIO_CARD_RPC_TRANSPORT) {
                 return registerStudioCardRpcFinalizer(result, { commit, rollback })
@@ -2187,6 +2469,7 @@ class StudioCardResourceServiceImpl implements StudioCardResourceService {
             commit()
             return result
         } catch (error) {
+            if (purposeClaim) this.releaseAccessPurposeClaim(capture, purposeClaim)
             registration.rollback()
             if (this.accesses.get(accessRevision) === access) this.accesses.delete(accessRevision)
             capture.accesses.delete(accessRevision)
@@ -2198,6 +2481,9 @@ class StudioCardResourceServiceImpl implements StudioCardResourceService {
         const revision = normalizeReleaseRevision(revisionValue, 'accessRevision')
         const access = this.peekAccess(revision)
         if (this.accesses.get(revision) !== access) throw notFound('Studio card access')
+        if (this.accessPinnedByClaim(access)) {
+            throw malformed('Studio card access has a pending transport replacement')
+        }
         this.revokeAccess(revision)
     }
 

@@ -8,6 +8,7 @@ interface CursorRecord<T = unknown> {
     queryDigest: string
     value: T
     expiresAt: number
+    pending?: object
 }
 
 export interface CursorPreparation {
@@ -24,6 +25,13 @@ export interface CursorCommitPreparation<T> {
     readonly value: T
     readonly expiresAt: number
     readonly replacement?: { readonly cursor: string; readonly record: object }
+}
+
+export interface CursorTransaction {
+    readonly cursor?: string
+    commit(): void
+    /** Returns whether an exact replaced cursor was restored, or true when there was none. */
+    rollback(): boolean
 }
 
 export class CursorRegistry {
@@ -113,6 +121,16 @@ export class CursorRegistry {
         value: T,
         commit = this.prepareCommit(preparation, value),
     ) {
+        const transaction = this.beginPrepared(preparation, value, commit)
+        transaction.commit()
+        return transaction.cursor!
+    }
+
+    beginPrepared<T>(
+        preparation: CursorPreparation,
+        value: T,
+        commit = this.prepareCommit(preparation, value),
+    ): CursorTransaction {
         if (commit.preparation !== preparation || commit.value !== value) {
             throw new PluginApiError('INVALID_ARGUMENT', 'Cursor commit does not match its preparation')
         }
@@ -129,28 +147,78 @@ export class CursorRegistry {
             || active - (replacement ? 1 : 0) >= this.maxPerPrincipal) {
             throw new PluginApiError('RESOURCE_LIMIT', 'Too many active cursors', { retryable: true })
         }
-        this.records.set(commit.cursor, {
+        const pending = {}
+        const record: CursorRecord<T> = {
             principalId: preparation.principalId,
             service: preparation.service,
             instanceId: preparation.instanceId,
             queryDigest: preparation.queryDigest,
             value,
             expiresAt: commit.expiresAt,
-        })
+            pending,
+        }
+        this.records.set(commit.cursor, record)
         if (replacement) this.records.delete(replacement.cursor)
-        return commit.cursor
+        let settled = false
+        return Object.freeze({
+            cursor: commit.cursor,
+            commit: () => {
+                if (settled) return
+                settled = true
+                if (this.records.get(commit.cursor) === record && record.pending === pending) {
+                    record.expiresAt = this.refreshExpiry(record.expiresAt)
+                    delete record.pending
+                }
+            },
+            rollback: () => {
+                if (settled) return !replacement
+                settled = true
+                if (this.records.get(commit.cursor) === record) this.records.delete(commit.cursor)
+                if (!replacement) return true
+                if (!this.isLifecycleCurrent(preparation.lifecycle)
+                    || this.records.has(replacement.cursor)) return false
+                const replacementRecord = replacement.record as CursorRecord
+                replacementRecord.expiresAt = this.refreshExpiry(replacementRecord.expiresAt)
+                this.records.set(replacement.cursor, replacementRecord)
+                return true
+            },
+        })
+    }
+
+    beginRetire(cursor: string, value: unknown): CursorTransaction {
+        this.removeExpired()
+        const record = this.records.get(cursor)
+        if (!record || record.pending || record.value !== value) {
+            throw new PluginApiError('INVALID_ARGUMENT', 'Invalid or expired cursor')
+        }
+        const lifecycle = this.captureLifecycle(record.principalId, record.service, record.instanceId)
+        this.records.delete(cursor)
+        let settled = false
+        return Object.freeze({
+            commit: () => { settled = true },
+            rollback: () => {
+                if (settled) return false
+                settled = true
+                if (!this.isLifecycleCurrent(lifecycle) || this.records.has(cursor)) return false
+                record.expiresAt = this.refreshExpiry(record.expiresAt)
+                this.records.set(cursor, record)
+                return true
+            },
+        })
     }
 
     async read<T>(cursor: string, principalId: string, service: string, instanceId: string, query: unknown): Promise<T> {
         const record = this.records.get(cursor)
-        if (!record || record.expiresAt < this.now() || record.principalId !== principalId
+        if (!record || record.pending || record.expiresAt < this.now() || record.principalId !== principalId
             || record.service !== service || record.instanceId !== instanceId) {
-            if (record?.expiresAt !== undefined && record.expiresAt < this.now()) this.records.delete(cursor)
+            if (record && !record.pending && record.expiresAt < this.now()
+                && this.records.get(cursor) === record) this.records.delete(cursor)
             throw new PluginApiError('INVALID_ARGUMENT', 'Invalid or expired cursor')
         }
         const queryDigest = await this.digest(query)
         if (this.records.get(cursor) !== record || record.expiresAt < this.now() || record.queryDigest !== queryDigest) {
-            if (record?.expiresAt !== undefined && record.expiresAt < this.now()) this.records.delete(cursor)
+            if (!record.pending && record.expiresAt < this.now()
+                && this.records.get(cursor) === record) this.records.delete(cursor)
             throw new PluginApiError('INVALID_ARGUMENT', 'Invalid or expired cursor')
         }
         return record.value as T
@@ -178,7 +246,16 @@ export class CursorRegistry {
         return [...this.records.values()].filter((record) => record.principalId === principalId).length
     }
     private removeExpired() {
-        for (const [cursor, record] of this.records) if (record.expiresAt < this.now()) this.records.delete(cursor)
+        for (const [cursor, record] of this.records) {
+            if (!record.pending && record.expiresAt < this.now()) this.records.delete(cursor)
+        }
+    }
+    private refreshExpiry(expiresAt: number) {
+        try {
+            return Math.max(expiresAt, this.now() + this.ttlMs)
+        } catch {
+            return expiresAt
+        }
     }
     private bumpLifecycle(key: string) {
         this.lifecycleEpochs.set(key, (this.lifecycleEpochs.get(key) ?? 0) + 1)

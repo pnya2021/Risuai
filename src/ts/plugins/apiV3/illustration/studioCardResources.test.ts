@@ -1345,6 +1345,635 @@ describe('Studio card review schedules', () => {
             .resolves.toBeDefined()
     })
 
+    it('claims one later-page cursor before transport delivery and publishes only live page authority', async () => {
+        const h = studioHarness({
+            cardIds: Array.from({ length: 73 }, (_, index) => `cursor-${index.toString().padStart(2, '0')}`),
+        })
+        h.catalogue.hostActiveCardId = undefined
+        h.catalogue.records.forEach((record, index) => {
+            record.portrait = {
+                revision: sha(`cursor-portrait-${index}`),
+                name: `${index}.png`,
+                mediaType: 'image/png',
+                locator: {
+                    ownerCardId: record.cardId,
+                    ownerRevision: sha(`cursor-owner-${index}`),
+                    storageRevision: sha(`cursor-storage-${index}`),
+                    nativeSlot: index,
+                },
+            }
+        })
+        const rpc = createStudioCardResourceRpcApi(h.service)
+        const first = await rpc.listStudioCards({ limit: 24 })
+        takeStudioCardRpcFinalizer(first)!.commit()
+        const request = {
+            limit: 24,
+            cursor: first.nextCursor,
+            catalogueRevision: first.catalogueRevision,
+        }
+
+        const outcomes = await Promise.allSettled([
+            rpc.listStudioCards(request),
+            rpc.listStudioCards(request),
+        ])
+        const pages = outcomes.flatMap((outcome) => outcome.status === 'fulfilled' ? [outcome.value] : [])
+        const failures = outcomes.flatMap((outcome) => outcome.status === 'rejected' ? [outcome.reason] : [])
+
+        expect(pages).toHaveLength(1)
+        expect(failures).toHaveLength(1)
+        expect(failures[0]).toMatchObject({ code: 'INVALID_ARGUMENT' })
+        const page = pages[0]
+        const portraitId = page.items[0].portrait!.assetId
+        expect(() => takeStudioCardRpcFinalizer(page)!.commit()).not.toThrow()
+        expect(h.registry.lookup(portraitId, h.context)).toBeDefined()
+        const third = await h.service.listStudioCards({
+            limit: 24,
+            cursor: page.nextCursor,
+            catalogueRevision: page.catalogueRevision,
+        })
+        expect(third.items[0].cardId).toBe('cursor-48')
+    })
+
+    it('claims one terminal-page cursor before producing a transport result', async () => {
+        const h = studioHarness({
+            cardIds: Array.from({ length: 25 }, (_, index) => `terminal-${index.toString().padStart(2, '0')}`),
+        })
+        const rpc = createStudioCardResourceRpcApi(h.service)
+        const first = await rpc.listStudioCards({ limit: 24 })
+        takeStudioCardRpcFinalizer(first)!.commit()
+        const request = {
+            limit: 24,
+            cursor: first.nextCursor,
+            catalogueRevision: first.catalogueRevision,
+        }
+
+        const outcomes = await Promise.allSettled([
+            rpc.listStudioCards(request),
+            rpc.listStudioCards(request),
+        ])
+        const pages = outcomes.flatMap((outcome) => outcome.status === 'fulfilled' ? [outcome.value] : [])
+        const failures = outcomes.flatMap((outcome) => outcome.status === 'rejected' ? [outcome.reason] : [])
+
+        expect(pages).toHaveLength(1)
+        expect(pages[0].nextCursor).toBeUndefined()
+        expect(failures).toHaveLength(1)
+        expect(failures[0]).toMatchObject({ code: 'INVALID_ARGUMENT' })
+        expect(() => takeStudioCardRpcFinalizer(pages[0])!.commit()).not.toThrow()
+    })
+
+    it('reserves both candidate-page slots while transport results are pending', async () => {
+        const h = studioHarness({ sourceFor: (cardId) => nativeSource(cardId, 4) })
+        const capture = await selectCard(h)
+        const descriptors = await h.service.listStudioCardAssets({ captureRevision: capture.captureRevision })
+        const access = (logicalAssetId: string) => ({
+            captureRevision: capture.captureRevision,
+            logicalAssetIds: [logicalAssetId],
+            purpose: 'candidate-page' as const,
+        })
+        const old = [
+            await h.service.resolveStudioCardAssetHandles(access(descriptors.assets[0].logicalAssetId)),
+            await h.service.resolveStudioCardAssetHandles(access(descriptors.assets[1].logicalAssetId)),
+        ]
+        const rpc = createStudioCardResourceRpcApi(h.service)
+
+        const pending = await Promise.all([
+            rpc.resolveStudioCardAssetHandles(access(descriptors.assets[2].logicalAssetId)),
+            rpc.resolveStudioCardAssetHandles(access(descriptors.assets[3].logicalAssetId)),
+        ])
+        for (const batch of old) expect(h.registry.lookup(batch.assets[0].asset.assetId, h.context)).toBeDefined()
+        for (const batch of pending) takeStudioCardRpcFinalizer(batch)!.commit()
+
+        for (const batch of old) {
+            expect(() => h.registry.lookup(batch.assets[0].asset.assetId, h.context))
+                .toThrow(expect.objectContaining({ code: 'NOT_FOUND' }))
+        }
+        for (const batch of pending) {
+            expect(h.registry.lookup(batch.assets[0].asset.assetId, h.context)).toBeDefined()
+        }
+    })
+
+    it('claims the selected access slot before transport delivery and preserves its old authority until commit', async () => {
+        const h = studioHarness({ sourceFor: (cardId) => nativeSource(cardId, 3) })
+        const capture = await selectCard(h)
+        const descriptors = await h.service.listStudioCardAssets({ captureRevision: capture.captureRevision })
+        const access = (logicalAssetId: string) => ({
+            captureRevision: capture.captureRevision,
+            logicalAssetIds: [logicalAssetId],
+            purpose: 'selected' as const,
+        })
+        const old = await h.service.resolveStudioCardAssetHandles(access(descriptors.assets[0].logicalAssetId))
+        const rpc = createStudioCardResourceRpcApi(h.service)
+
+        const outcomes = await Promise.allSettled([
+            rpc.resolveStudioCardAssetHandles(access(descriptors.assets[1].logicalAssetId)),
+            rpc.resolveStudioCardAssetHandles(access(descriptors.assets[2].logicalAssetId)),
+        ])
+        const selected = outcomes.flatMap((outcome) => outcome.status === 'fulfilled' ? [outcome.value] : [])
+        const failures = outcomes.flatMap((outcome) => outcome.status === 'rejected' ? [outcome.reason] : [])
+
+        expect(selected).toHaveLength(1)
+        expect(failures).toHaveLength(1)
+        expect(failures[0]).toMatchObject({ code: 'CONFLICT' })
+        expect(h.registry.lookup(old.assets[0].asset.assetId, h.context)).toBeDefined()
+        expect(() => takeStudioCardRpcFinalizer(selected[0])!.commit()).not.toThrow()
+        expect(() => h.registry.lookup(old.assets[0].asset.assetId, h.context))
+            .toThrow(expect.objectContaining({ code: 'NOT_FOUND' }))
+        expect(h.registry.lookup(selected[0].assets[0].asset.assetId, h.context)).toBeDefined()
+    })
+
+    it('counts each pending first-page admission once and retires only the required catalogue victim', async () => {
+        let now = 0
+        const h = studioHarness({ now: () => now })
+        const retained: Array<{ catalogueRevision: string }> = []
+        for (let index = 0; index < 3; index++) {
+            now = index * 10
+            retained.push(await h.service.listStudioCards({ limit: 24 }))
+        }
+        const rpc = createStudioCardResourceRpcApi(h.service)
+
+        now = 100
+        const firstPending = await rpc.listStudioCards({ limit: 24 })
+        now = 110
+        const secondPending = await rpc.listStudioCards({ limit: 24 })
+        takeStudioCardRpcFinalizer(firstPending)!.commit()
+        takeStudioCardRpcFinalizer(secondPending)!.commit()
+
+        const oldReleases = await Promise.allSettled(retained.map((page) =>
+            h.service.releaseStudioCardCatalogue(page.catalogueRevision)))
+        expect(oldReleases.filter((outcome) => outcome.status === 'fulfilled')).toHaveLength(2)
+        await expect(h.service.releaseStudioCardCatalogue(firstPending.catalogueRevision)).resolves.toBeUndefined()
+        await expect(h.service.releaseStudioCardCatalogue(secondPending.catalogueRevision)).resolves.toBeUndefined()
+    })
+
+    it('keeps transport-pending page and access parents alive until their exact commit', async () => {
+        const h = studioHarness({
+            cardIds: Array.from({ length: 25 }, (_, index) => `parent-${index.toString().padStart(2, '0')}`),
+            sourceFor: (cardId) => nativeSource(cardId, 1),
+        })
+        h.catalogue.hostActiveCardId = undefined
+        h.catalogue.records.forEach((record, index) => {
+            record.portrait = {
+                revision: sha(`parent-portrait-${index}`), name: `${index}.png`, mediaType: 'image/png',
+                locator: {
+                    ownerCardId: record.cardId,
+                    ownerRevision: sha(`parent-owner-${index}`),
+                    storageRevision: sha(`parent-storage-${index}`),
+                    nativeSlot: index,
+                },
+            }
+        })
+        const rpc = createStudioCardResourceRpcApi(h.service)
+        const first = await rpc.listStudioCards({ limit: 24 })
+        takeStudioCardRpcFinalizer(first)!.commit()
+        const pendingPage = await rpc.listStudioCards({
+            limit: 24,
+            cursor: first.nextCursor,
+            catalogueRevision: first.catalogueRevision,
+        })
+
+        await expect(h.service.releaseStudioCardCatalogue(first.catalogueRevision))
+            .rejects.toMatchObject({ code: 'CONFLICT' })
+        takeStudioCardRpcFinalizer(pendingPage)!.commit()
+        expect(h.registry.lookup(pendingPage.items[0].portrait!.assetId, h.context)).toBeDefined()
+
+        const capture = await h.service.captureStudioCardSource({
+            cardId: first.items[0].cardId,
+            expectedCatalogueItemRevision: first.items[0].catalogueItemRevision,
+            catalogueRevision: first.catalogueRevision,
+        })
+        const descriptors = await h.service.listStudioCardAssets({ captureRevision: capture.captureRevision })
+        const pendingAccess = await rpc.resolveStudioCardAssetHandles({
+            captureRevision: capture.captureRevision,
+            logicalAssetIds: [descriptors.assets[0].logicalAssetId],
+            purpose: 'selected',
+        })
+
+        await expect(h.service.releaseStudioCardSource(capture.captureRevision))
+            .rejects.toMatchObject({ code: 'CONFLICT' })
+        takeStudioCardRpcFinalizer(pendingAccess)!.commit()
+        expect(h.registry.lookup(pendingAccess.assets[0].asset.assetId, h.context)).toBeDefined()
+        await expect(h.service.releaseStudioCardSource(capture.captureRevision)).resolves.toBeUndefined()
+    })
+
+    it('pins a catalogue with a transport-pending later page against LRU retirement', async () => {
+        let now = 0
+        const h = studioHarness({
+            cardIds: Array.from({ length: 25 }, (_, index) => `lru-parent-${index.toString().padStart(2, '0')}`),
+            now: () => now,
+        })
+        h.catalogue.hostActiveCardId = undefined
+        h.catalogue.records.forEach((record, index) => {
+            record.portrait = {
+                revision: sha(`lru-parent-portrait-${index}`), name: `${index}.png`, mediaType: 'image/png',
+                locator: {
+                    ownerCardId: record.cardId,
+                    ownerRevision: sha(`lru-parent-owner-${index}`),
+                    storageRevision: sha(`lru-parent-storage-${index}`),
+                    nativeSlot: index,
+                },
+            }
+        })
+        const catalogues: Array<{ catalogueRevision: string; nextCursor?: string }> = []
+        for (let index = 0; index < 4; index++) {
+            now = index * 10
+            catalogues.push(await h.service.listStudioCards({ limit: 24 }))
+        }
+        const rpc = createStudioCardResourceRpcApi(h.service)
+        const pendingPage = await rpc.listStudioCards({
+            limit: 24,
+            cursor: catalogues[0].nextCursor,
+            catalogueRevision: catalogues[0].catalogueRevision,
+        })
+
+        now = 100
+        const replacement = await rpc.listStudioCards({ limit: 24 })
+        takeStudioCardRpcFinalizer(replacement)!.commit()
+        takeStudioCardRpcFinalizer(pendingPage)!.commit()
+
+        expect(h.registry.lookup(pendingPage.items[0].portrait!.assetId, h.context)).toBeDefined()
+        await expect(h.service.releaseStudioCardCatalogue(catalogues[0].catalogueRevision))
+            .resolves.toBeUndefined()
+    })
+
+    it('rejects a reserved LRU retirement when its victim gains a pending page before admission', async () => {
+        let now = 0
+        const h = studioHarness({
+            cardIds: Array.from({ length: 25 }, (_, index) => `late-pin-${index.toString().padStart(2, '0')}`),
+            now: () => now,
+        })
+        h.catalogue.hostActiveCardId = undefined
+        h.catalogue.records.forEach((record, index) => {
+            record.portrait = {
+                revision: sha(`late-pin-portrait-${index}`), name: `${index}.png`, mediaType: 'image/png',
+                locator: {
+                    ownerCardId: record.cardId,
+                    ownerRevision: sha(`late-pin-owner-${index}`),
+                    storageRevision: sha(`late-pin-storage-${index}`),
+                    nativeSlot: index,
+                },
+            }
+        })
+        const catalogues: Array<{ catalogueRevision: string; nextCursor?: string }> = []
+        for (let index = 0; index < 4; index++) {
+            now = index * 10
+            catalogues.push(await h.service.listStudioCards({ limit: 24 }))
+        }
+        const gate = deferred<StudioCardNativeCatalogue>()
+        h.captureCatalogue.mockImplementationOnce(() => gate.promise)
+        const rpc = createStudioCardResourceRpcApi(h.service)
+        now = 100
+        const competingAdmission = rpc.listStudioCards({ limit: 24 })
+        await waitFor(() => h.captureCatalogue.mock.calls.length === 5)
+        const pendingPage = await rpc.listStudioCards({
+            limit: 24,
+            cursor: catalogues[0].nextCursor,
+            catalogueRevision: catalogues[0].catalogueRevision,
+        })
+
+        gate.resolve(structuredClone(h.catalogue))
+        await expect(competingAdmission).rejects.toMatchObject({ code: 'RESOURCE_LIMIT' })
+        takeStudioCardRpcFinalizer(pendingPage)!.commit()
+        expect(h.registry.lookup(pendingPage.items[0].portrait!.assetId, h.context)).toBeDefined()
+    })
+
+    it('rejects a stale LRU retirement after its victim page commits during admission', async () => {
+        let now = 0
+        const h = studioHarness({
+            cardIds: Array.from({ length: 25 }, (_, index) => `committed-use-${index.toString().padStart(2, '0')}`),
+            now: () => now,
+        })
+        const catalogues: Array<{ catalogueRevision: string; nextCursor?: string }> = []
+        for (let index = 0; index < 4; index++) {
+            now = index * 10
+            catalogues.push(await h.service.listStudioCards({ limit: 24 }))
+        }
+        const gate = deferred<StudioCardNativeCatalogue>()
+        h.captureCatalogue.mockImplementationOnce(() => gate.promise)
+        const rpc = createStudioCardResourceRpcApi(h.service)
+        now = 100
+        const competingAdmission = rpc.listStudioCards({ limit: 24 })
+        await waitFor(() => h.captureCatalogue.mock.calls.length === 5)
+        const deliveredPage = await rpc.listStudioCards({
+            limit: 24,
+            cursor: catalogues[0].nextCursor,
+            catalogueRevision: catalogues[0].catalogueRevision,
+        })
+        takeStudioCardRpcFinalizer(deliveredPage)!.commit()
+
+        gate.resolve(structuredClone(h.catalogue))
+        await expect(competingAdmission).rejects.toMatchObject({ code: 'RESOURCE_LIMIT' })
+        await expect(h.service.captureStudioCardSource({
+            cardId: deliveredPage.items[0].cardId,
+            expectedCatalogueItemRevision: deliveredPage.items[0].catalogueItemRevision,
+            catalogueRevision: deliveredPage.catalogueRevision,
+        })).resolves.toBeDefined()
+    })
+
+    it('rejects a stale LRU retirement after its victim portrait is touched during admission', async () => {
+        let now = 0
+        const h = studioHarness({ now: () => now })
+        h.catalogue.records[0].portrait = {
+            revision: sha('retirement-touch-portrait'), name: 'portrait.png', mediaType: 'image/png',
+            locator: {
+                ownerCardId: h.catalogue.records[0].cardId,
+                ownerRevision: sha('retirement-touch-owner'),
+                storageRevision: sha('retirement-touch-storage'),
+                nativeSlot: 0,
+            },
+        }
+        let oldest: Awaited<ReturnType<StudioCardResourceService['listStudioCards']>> | undefined
+        for (let index = 0; index < 4; index++) {
+            now = index * 10
+            const page = await h.service.listStudioCards({ limit: 24 })
+            if (index === 0) oldest = page
+        }
+        const gate = deferred<StudioCardNativeCatalogue>()
+        h.captureCatalogue.mockImplementationOnce(() => gate.promise)
+        const rpc = createStudioCardResourceRpcApi(h.service)
+        now = 100
+        const competingAdmission = rpc.listStudioCards({ limit: 24 })
+        await waitFor(() => h.captureCatalogue.mock.calls.length === 5)
+        const authority = h.registry.lookup(oldest!.items[0].portrait!.assetId, h.context)
+        if (authority.authorityKind !== 'studio-catalogue-portrait') {
+            throw new Error('Expected Studio portrait authority')
+        }
+        authority.touch?.()
+
+        gate.resolve(structuredClone(h.catalogue))
+        await expect(competingAdmission).rejects.toMatchObject({ code: 'RESOURCE_LIMIT' })
+        await expect(authority.validate()).resolves.toBeUndefined()
+    })
+
+    it('rejects a later page when a posted admission already owns its parent LRU retirement', async () => {
+        let now = 0
+        const h = studioHarness({
+            cardIds: Array.from({ length: 25 }, (_, index) => `claimed-lru-${index.toString().padStart(2, '0')}`),
+            now: () => now,
+        })
+        const catalogues: Array<{ catalogueRevision: string; nextCursor?: string }> = []
+        for (let index = 0; index < 4; index++) {
+            now = index * 10
+            catalogues.push(await h.service.listStudioCards({ limit: 24 }))
+        }
+        const rpc = createStudioCardResourceRpcApi(h.service)
+        now = 100
+        const pendingReplacement = await rpc.listStudioCards({ limit: 24 })
+
+        await expect(rpc.listStudioCards({
+            limit: 24,
+            cursor: catalogues[0].nextCursor,
+            catalogueRevision: catalogues[0].catalogueRevision,
+        })).rejects.toMatchObject({ code: 'CONFLICT' })
+
+        takeStudioCardRpcFinalizer(pendingReplacement)!.rollback()
+        await expect(h.service.listStudioCards({
+            limit: 24,
+            cursor: catalogues[0].nextCursor,
+            catalogueRevision: catalogues[0].catalogueRevision,
+        })).resolves.toMatchObject({ items: [expect.objectContaining({ cardId: 'claimed-lru-24' })] })
+    })
+
+    it('keeps an LRU reservation victim through TTL cleanup until replacement rollback', async () => {
+        let now = 0
+        const h = studioHarness({
+            cardIds: Array.from({ length: 25 }, (_, index) => `victim-ttl-${index.toString().padStart(2, '0')}`),
+            now: () => now,
+        })
+        const oldest = await h.service.listStudioCards({ limit: 24 })
+        for (let index = 1; index < 4; index++) {
+            now = index * 10
+            await h.service.listStudioCards({ limit: 24 })
+        }
+        const rpc = createStudioCardResourceRpcApi(h.service)
+        now = 100
+        const pendingReplacement = await rpc.listStudioCards({ limit: 24 })
+
+        now = 300_001
+        await expect(h.service.releaseStudioCardCatalogue(sha('missing-catalogue')))
+            .rejects.toMatchObject({ code: 'NOT_FOUND' })
+        takeStudioCardRpcFinalizer(pendingReplacement)!.rollback()
+
+        await expect(h.service.captureStudioCardSource({
+            cardId: oldest.items[0].cardId,
+            expectedCatalogueItemRevision: oldest.items[0].catalogueItemRevision,
+            catalogueRevision: oldest.catalogueRevision,
+        })).resolves.toBeDefined()
+    })
+
+    it('blocks target release while one of its captures has a pending access result', async () => {
+        const h = studioHarness({ sourceFor: (cardId) => nativeSource(cardId, 1) })
+        const capture = await selectCard(h)
+        const descriptors = await h.service.listStudioCardAssets({ captureRevision: capture.captureRevision })
+        const rpc = createStudioCardResourceRpcApi(h.service)
+        const pendingAccess = await rpc.resolveStudioCardAssetHandles({
+            captureRevision: capture.captureRevision,
+            logicalAssetIds: [descriptors.assets[0].logicalAssetId],
+            purpose: 'selected',
+        })
+
+        await expect(h.service.releaseStudioCardTarget(capture.targetRevision))
+            .rejects.toMatchObject({ code: 'CONFLICT' })
+        takeStudioCardRpcFinalizer(pendingAccess)!.commit()
+        expect(h.registry.lookup(pendingAccess.assets[0].asset.assetId, h.context)).toBeDefined()
+        await expect(h.service.releaseStudioCardTarget(capture.targetRevision)).resolves.toBeUndefined()
+    })
+
+    it('keeps all posted transport commits nonthrowing when the injected clock fails', async () => {
+        let throwClock = false
+        const h = studioHarness({
+            cardIds: Array.from({ length: 25 }, (_, index) => `clock-${index.toString().padStart(2, '0')}`),
+            sourceFor: (cardId) => nativeSource(cardId, 1),
+            now: () => {
+                if (throwClock) throw new Error('clock failed')
+                return 0
+            },
+        })
+        const rpc = createStudioCardResourceRpcApi(h.service)
+        const page = await rpc.listStudioCards({ limit: 24 })
+        throwClock = true
+        expect(() => takeStudioCardRpcFinalizer(page)!.commit()).not.toThrow()
+        throwClock = false
+        await expect(h.service.listStudioCards({
+            limit: 24,
+            cursor: page.nextCursor,
+            catalogueRevision: page.catalogueRevision,
+        })).resolves.toMatchObject({ items: [expect.objectContaining({ cardId: 'clock-24' })] })
+
+        const capture = await rpc.captureStudioCardSource({
+            cardId: page.items[0].cardId,
+            expectedCatalogueItemRevision: page.items[0].catalogueItemRevision,
+            catalogueRevision: page.catalogueRevision,
+        })
+        throwClock = true
+        expect(() => takeStudioCardRpcFinalizer(capture)!.commit()).not.toThrow()
+        throwClock = false
+        const descriptors = await h.service.listStudioCardAssets({ captureRevision: capture.captureRevision })
+        const access = await rpc.resolveStudioCardAssetHandles({
+            captureRevision: capture.captureRevision,
+            logicalAssetIds: [descriptors.assets[0].logicalAssetId],
+            purpose: 'selected',
+        })
+        throwClock = true
+        expect(() => takeStudioCardRpcFinalizer(access)!.commit()).not.toThrow()
+        throwClock = false
+        await expect(h.service.releaseStudioCardAssetAccess(access.accessRevision)).resolves.toBeUndefined()
+        await expect(h.service.releaseStudioCardSource(capture.captureRevision)).resolves.toBeUndefined()
+    })
+
+    it('refreshes a delayed page rollback so its exact cursor and parent can be retried', async () => {
+        let now = 0
+        const h = studioHarness({
+            cardIds: Array.from({ length: 25 }, (_, index) => `rollback-page-${index.toString().padStart(2, '0')}`),
+            now: () => now,
+        })
+        const first = await h.service.listStudioCards({ limit: 24 })
+        const rpc = createStudioCardResourceRpcApi(h.service)
+        const pendingPage = await rpc.listStudioCards({
+            limit: 24,
+            cursor: first.nextCursor,
+            catalogueRevision: first.catalogueRevision,
+        })
+
+        now = 300_001
+        takeStudioCardRpcFinalizer(pendingPage)!.rollback()
+
+        await expect(h.service.listStudioCards({
+            limit: 24,
+            cursor: first.nextCursor,
+            catalogueRevision: first.catalogueRevision,
+        })).resolves.toMatchObject({ items: [expect.objectContaining({ cardId: 'rollback-page-24' })] })
+    })
+
+    it('refreshes prior access authority and ancestors after a delayed replacement rollback', async () => {
+        let now = 0
+        const h = studioHarness({ now: () => now, sourceFor: (cardId) => nativeSource(cardId, 2) })
+        const capture = await selectCard(h)
+        const descriptors = await h.service.listStudioCardAssets({ captureRevision: capture.captureRevision })
+        const oldAccess = await h.service.resolveStudioCardAssetHandles({
+            captureRevision: capture.captureRevision,
+            logicalAssetIds: [descriptors.assets[0].logicalAssetId],
+            purpose: 'selected',
+        })
+        const rpc = createStudioCardResourceRpcApi(h.service)
+        const pendingAccess = await rpc.resolveStudioCardAssetHandles({
+            captureRevision: capture.captureRevision,
+            logicalAssetIds: [descriptors.assets[1].logicalAssetId],
+            purpose: 'selected',
+        })
+
+        now = 300_001
+        takeStudioCardRpcFinalizer(pendingAccess)!.rollback()
+
+        const authority = h.registry.lookup(oldAccess.assets[0].asset.assetId, h.context)
+        if (authority.authorityKind !== 'studio-card-capture') throw new Error('Expected Studio authority')
+        await expect(authority.validate()).resolves.toBeUndefined()
+        await expect(h.service.listStudioCardAssets({ captureRevision: capture.captureRevision }))
+            .resolves.toBeDefined()
+    })
+
+    it('does not let a premature read evict a transport-pending cursor after TTL', async () => {
+        let now = 0
+        const h = studioHarness({
+            cardIds: Array.from({ length: 49 }, (_, index) => `pending-read-${index.toString().padStart(2, '0')}`),
+            now: () => now,
+            cursorRegistry: new CursorRegistry({ now: () => now }),
+        })
+        const first = await h.service.listStudioCards({ limit: 24 })
+        const rpc = createStudioCardResourceRpcApi(h.service)
+        const pendingPage = await rpc.listStudioCards({
+            limit: 24,
+            cursor: first.nextCursor,
+            catalogueRevision: first.catalogueRevision,
+        })
+
+        now = 300_001
+        await expect(h.service.listStudioCards({
+            limit: 24,
+            cursor: pendingPage.nextCursor,
+            catalogueRevision: pendingPage.catalogueRevision,
+        })).rejects.toMatchObject({ code: 'INVALID_ARGUMENT' })
+        takeStudioCardRpcFinalizer(pendingPage)!.commit()
+
+        await expect(h.service.listStudioCards({
+            limit: 24,
+            cursor: pendingPage.nextCursor,
+            catalogueRevision: pendingPage.catalogueRevision,
+        })).resolves.toMatchObject({ items: [expect.objectContaining({ cardId: 'pending-read-48' })] })
+    })
+
+    it('pins a transport-pending page and cursor through TTL cleanup until delivery', async () => {
+        let now = 0
+        const h = studioHarness({
+            cardIds: Array.from({ length: 49 }, (_, index) => `ttl-parent-${index.toString().padStart(2, '0')}`),
+            now: () => now,
+        })
+        h.catalogue.hostActiveCardId = undefined
+        h.catalogue.records.forEach((record, index) => {
+            record.portrait = {
+                revision: sha(`ttl-parent-portrait-${index}`), name: `${index}.png`, mediaType: 'image/png',
+                locator: {
+                    ownerCardId: record.cardId,
+                    ownerRevision: sha(`ttl-parent-owner-${index}`),
+                    storageRevision: sha(`ttl-parent-storage-${index}`),
+                    nativeSlot: index,
+                },
+            }
+        })
+        const rpc = createStudioCardResourceRpcApi(h.service)
+        const first = await rpc.listStudioCards({ limit: 24 })
+        takeStudioCardRpcFinalizer(first)!.commit()
+        const pendingPage = await rpc.listStudioCards({
+            limit: 24,
+            cursor: first.nextCursor,
+            catalogueRevision: first.catalogueRevision,
+        })
+
+        now = 300_001
+        await expect(h.service.releaseStudioCardCatalogue(first.catalogueRevision))
+            .rejects.toMatchObject({ code: 'CONFLICT' })
+        takeStudioCardRpcFinalizer(pendingPage)!.commit()
+
+        expect(h.registry.lookup(pendingPage.items[0].portrait!.assetId, h.context)).toBeDefined()
+        await expect(h.service.listStudioCards({
+            limit: 24,
+            cursor: pendingPage.nextCursor,
+            catalogueRevision: pendingPage.catalogueRevision,
+        })).resolves.toMatchObject({ items: [expect.objectContaining({ cardId: 'ttl-parent-48' })] })
+    })
+
+    it('pins a transport-pending access through capture and target TTL cleanup until delivery', async () => {
+        let now = 0
+        const h = studioHarness({
+            now: () => now,
+            sourceFor: (cardId) => nativeSource(cardId, 2),
+        })
+        const capture = await selectCard(h)
+        const descriptors = await h.service.listStudioCardAssets({ captureRevision: capture.captureRevision })
+        const old = await h.service.resolveStudioCardAssetHandles({
+            captureRevision: capture.captureRevision,
+            logicalAssetIds: [descriptors.assets[0].logicalAssetId],
+            purpose: 'selected',
+        })
+        const rpc = createStudioCardResourceRpcApi(h.service)
+        const pendingAccess = await rpc.resolveStudioCardAssetHandles({
+            captureRevision: capture.captureRevision,
+            logicalAssetIds: [descriptors.assets[1].logicalAssetId],
+            purpose: 'selected',
+        })
+
+        now = 1_800_001
+        await expect(h.service.releaseStudioCardSource(capture.captureRevision))
+            .rejects.toMatchObject({ code: 'CONFLICT' })
+        expect(h.registry.lookup(old.assets[0].asset.assetId, h.context)).toBeDefined()
+        takeStudioCardRpcFinalizer(pendingAccess)!.commit()
+
+        expect(() => h.registry.lookup(old.assets[0].asset.assetId, h.context))
+            .toThrow(expect.objectContaining({ code: 'NOT_FOUND' }))
+        expect(h.registry.lookup(pendingAccess.assets[0].asset.assetId, h.context)).toBeDefined()
+        await expect(h.service.listStudioCardAssets({ captureRevision: capture.captureRevision }))
+            .resolves.toBeDefined()
+    })
+
     it('invalidates all descendants on unload and rejects source deletion or revision drift atomically', async () => {
         const h = studioHarness()
         const capture = await selectCard(h)
