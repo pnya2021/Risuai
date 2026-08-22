@@ -1,6 +1,7 @@
 import fc from 'fast-check'
 import { writable } from 'svelte/store'
 import { afterEach, describe, expect, test, vi } from 'vitest'
+import { DBState } from '../../../stores.svelte'
 import { risuChatParser } from '../../parser.svelte'
 import { trimVarPrefix, validCBSArgProp } from './lib'
 
@@ -12,6 +13,7 @@ vi.mock(
     ({
       appVer: '1234.5.67',
       getCurrentCharacter: () => ({}),
+      getCurrentChat: () => DBState.db.characters[0]?.chats?.[DBState.db.characters[0].chatPage],
       getDatabase: () => ({}),
     }) as typeof import('../../../storage/database.svelte'),
 )
