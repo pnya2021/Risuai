@@ -120,7 +120,7 @@ test('Docker dependency caches are scoped to their execution architecture', () =
 
 test('publication workflow runs the Docker contract before building images', () => {
   const contract = workflow.indexOf(
-    'node --test .github/scripts/docker-build-contract.test.mjs',
+    'node --test .github/scripts/docker-build-contract.mjs',
   )
   const build = workflow.indexOf('- name: Build Docker images')
 
