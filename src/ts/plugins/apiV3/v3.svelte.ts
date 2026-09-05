@@ -17,8 +17,10 @@ import { registerMCPModule, registeredCustomPluginMCPs, unregisterMCPModule } fr
 import { getInlayAsset, getInlayAssetBlob, getInlayAssetRecord, listInlayAssets, removeInlayAsset, writeInlayImageFromBytes } from "src/ts/process/files/inlays";
 import { coldStorageHeader, getColdStorageItem, listColdDataKeys, preLoadChat } from "src/ts/process/coldstorage.svelte";
 import { getLLMCache, searchLLMCache } from "src/ts/translator/translator";
+import { risuChatParser, type CbsConditions } from "src/ts/parser/parser.svelte";
 import { LLMFlags, LLMFormat, LLMProvider, LLMTokenizer, type LLMModel } from "src/ts/model/types";
 import { sendChat as processSendChat, doingChat } from "src/ts/process/index.svelte";
+import { processScriptFull } from "src/ts/process/scripts";
 import { getModelInfo } from "src/ts/model/modellist";
 import type { ModelModeExtended } from "src/ts/process/request/shared";
 import { requestChatDataMain } from "src/ts/process/request/request";
@@ -1076,6 +1078,49 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin, context: Pl
                 }
             }
             return null;
+        },
+        parseRisuChat: async (text:string, options?:{
+            messageIndex?: number
+            role?: string
+            processRegex?: boolean
+            runVar?: boolean
+            rmVar?: boolean
+            tokenizeAccurate?: boolean
+            cbsConditions?: CbsConditions
+        }) => {
+            const db = DBState.db
+            const char = db.characters[get(selectedCharID)];
+            if(!char){
+                throw new Error('No character selected');
+            }
+            const chat = char.chats?.[char.chatPage];
+            if(!chat){
+                throw new Error('No active chat found');
+            }
+            const chatID = options?.messageIndex ?? -1;
+            if(!Number.isInteger(chatID) || chatID < -1 || chatID >= chat.message.length){
+                throw new Error(`Invalid messageIndex: ${chatID}`);
+            }
+            const role = options?.role;
+            const cbsConditions:CbsConditions = {
+                ...(role ? { chatRole: role } : {}),
+                ...(options?.cbsConditions ?? {}),
+            };
+            const parsed = risuChatParser(text ?? '', {
+                chara: char,
+                chatID,
+                role,
+                runVar: options?.runVar,
+                rmVar: options?.rmVar,
+                tokenizeAccurate: options?.tokenizeAccurate,
+                cbsConditions,
+            });
+
+            if(!options?.processRegex){
+                return parsed;
+            }
+
+            return (await processScriptFull(char, parsed, 'editprocess', chatID, cbsConditions)).data;
         },
         setChatToIndex: (characterIndex:number, chatIndex:number, chat:any) => {
             const db = DBState.db

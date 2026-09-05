@@ -49,6 +49,7 @@ async function startV3Api() {
     startedInstances.push(instance)
     return {
         api: (instance.host as any).apiFactory,
+        stores,
         instance,
         inlays,
         pluginV2,
@@ -68,6 +69,92 @@ afterEach(async () => {
     for (const instance of startedInstances.splice(0)) {
         await v3.unloadV3Plugin(instance.instanceId)
     }
+})
+
+describe('upstream CBS parser API sync', () => {
+    async function withParserContext(run: (runtime: Awaited<ReturnType<typeof startV3Api>>, char: any) => Promise<void>) {
+        const runtime = await startV3Api()
+        const previousCharacters = runtime.stores.DBState.db.characters
+        const previousSelection = runtime.stores.selIdState.selId
+        runtime.stores.DBState.db.characters = [{
+            chaId: 'parser-card', type: 'character', name: 'Parser card', chatPage: 0,
+            chats: [{ id: 'parser-chat', message: [{ role: 'user', data: 'existing' }] }],
+        }] as any
+        runtime.stores.selectedCharID.set(0)
+        try {
+            await run(runtime, runtime.stores.DBState.db.characters[0])
+        } finally {
+            runtime.stores.DBState.db.characters = previousCharacters
+            runtime.stores.selectedCharID.set(previousSelection)
+            await runtime.cleanup()
+        }
+    }
+
+    it('registers CBS parsing on the live V3 API and forwards the active context and options', async () => {
+        await withParserContext(async (runtime, char) => {
+            expect(runtime.api.parseRisuChat).toBeTypeOf('function')
+            const parser = await import('../../parser/parser.svelte')
+            const parse = vi.mocked(parser.risuChatParser).mockReturnValue('parsed CBS')
+            await expect(runtime.api.parseRisuChat('input', {
+                messageIndex: 0, role: 'user', runVar: true, rmVar: true, tokenizeAccurate: true,
+                cbsConditions: { firstmsg: true, chatRole: 'char' },
+            })).resolves.toBe('parsed CBS')
+            expect(parse).toHaveBeenLastCalledWith('input', {
+                chara: char, chatID: 0, role: 'user', runVar: true, rmVar: true,
+                tokenizeAccurate: true, cbsConditions: { firstmsg: true, chatRole: 'char' },
+            })
+        })
+    }, REAL_V3_TIMEOUT_MS)
+
+    it('defaults to no message context and no editprocess pipeline', async () => {
+        await withParserContext(async (runtime, char) => {
+            expect(runtime.api.parseRisuChat).toBeTypeOf('function')
+            const parser = await import('../../parser/parser.svelte')
+            const scripts = await import('../../process/scripts')
+            const process = vi.spyOn(scripts, 'processScriptFull')
+            const parse = vi.mocked(parser.risuChatParser).mockReturnValue('plain CBS')
+            await expect(runtime.api.parseRisuChat(null)).resolves.toBe('plain CBS')
+            expect(parse).toHaveBeenLastCalledWith('', {
+                chara: char, chatID: -1, role: undefined, runVar: undefined, rmVar: undefined,
+                tokenizeAccurate: undefined, cbsConditions: {},
+            })
+            expect(process).not.toHaveBeenCalled()
+        })
+    }, REAL_V3_TIMEOUT_MS)
+
+    it('rejects invalid message indexes before parsing', async () => {
+        await withParserContext(async (runtime) => {
+            expect(runtime.api.parseRisuChat).toBeTypeOf('function')
+            const parser = await import('../../parser/parser.svelte')
+            const parse = vi.mocked(parser.risuChatParser).mockClear()
+            for (const messageIndex of [-2, 1, 0.5, Number.NaN]) {
+                await expect(runtime.api.parseRisuChat('input', { messageIndex })).rejects.toThrow('Invalid messageIndex')
+            }
+            expect(parse).not.toHaveBeenCalled()
+        })
+    }, REAL_V3_TIMEOUT_MS)
+
+    it('rejects missing active chat or selected character', async () => {
+        await withParserContext(async (runtime, char) => {
+            expect(runtime.api.parseRisuChat).toBeTypeOf('function')
+            char.chatPage = 2
+            await expect(runtime.api.parseRisuChat('input')).rejects.toThrow('No active chat found')
+            runtime.stores.selectedCharID.set(-1)
+            await expect(runtime.api.parseRisuChat('input')).rejects.toThrow('No character selected')
+        })
+    }, REAL_V3_TIMEOUT_MS)
+
+    it('passes parsed CBS text through the requested editprocess pipeline', async () => {
+        await withParserContext(async (runtime, char) => {
+            expect(runtime.api.parseRisuChat).toBeTypeOf('function')
+            const parser = await import('../../parser/parser.svelte')
+            const scripts = await import('../../process/scripts')
+            vi.mocked(parser.risuChatParser).mockReturnValue('parsed CBS')
+            const process = vi.spyOn(scripts, 'processScriptFull').mockResolvedValue({ data: 'edited CBS', emoChanged: false })
+            await expect(runtime.api.parseRisuChat('input', { messageIndex: 0, role: 'user', processRegex: true })).resolves.toBe('edited CBS')
+            expect(process).toHaveBeenCalledWith(char, 'parsed CBS', 'editprocess', 0, { chatRole: 'user' })
+        })
+    }, REAL_V3_TIMEOUT_MS)
 })
 
 describe('upstream strong-V3 permission sync', () => {
