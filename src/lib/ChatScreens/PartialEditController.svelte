@@ -355,7 +355,9 @@
     function handleSave() {
         if (!matchingState.selectedRange) return;
 
-        const newData = replaceRange(matchingState.sourceData, matchingState.selectedRange, editText);
+        // Original messages may gain Inlays while the modal is open; translations use their captured cache entry.
+        const sourceData = matchingState.sourceType === 'translation' ? matchingState.sourceData : messageData;
+        const newData = replaceRange(sourceData, matchingState.selectedRange, editText);
         dispatch('save', {
             newData,
             target: matchingState.sourceType,
@@ -391,7 +393,8 @@
     function handleConfirmDelete() {
         if (!matchingState.selectedRange) return;
 
-        let newData = replaceRange(matchingState.sourceData, matchingState.selectedRange, '');
+        const sourceData = matchingState.sourceType === 'translation' ? matchingState.sourceData : messageData;
+        let newData = replaceRange(sourceData, matchingState.selectedRange, '');
         newData = newData.replace(/\n{3,}/g, '\n\n').trim();
 
         dispatch('save', {
